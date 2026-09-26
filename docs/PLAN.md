@@ -12,12 +12,12 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md); th
 
 ## Milestone B — Distributed execution
 
-- [ ] Phase 4 — Aura Actor binding (`crates/actor`): the same execution function registered as an Actor type; one turn event = one execution; streaming via high-frequency emit events. CLI becomes a for-loop over the same function; Actor is its single call.
+- [ ] Phase 4 — Aura Booth binding (`crates/booth`): the same execution function registered as a Booth type; one turn event = one execution; streaming via high-frequency emit events. CLI becomes a for-loop over the same function; Booth is its single call.
 - [ ] Phase 4.5 — Unified call model adoption: tool calls go through `ctx.invoke()` (Aura CallSlot) — target = user namespace + node alias + capability (e.g. `probe:home-pc:read_file`); two-tier waiting handled by the runtime behind one `await` per call-site (hot: park on oneshot; cold: entry-split — no park, transcript flush, task ends, re-entry on result). Retention-window residency: executor stays in memory between calls/turns of the same session, session persisted at turn end or expiry; crash within window rebuilds from event stream. Multi-machine orchestration (e.g. "send the file from home PC to office PC") = two invokes composed in the turn loop — no remote/local branching in Gravity code.
 - [ ] Phase 5 — Skill pull-through: on each tool call, fetch skill spec from Krystallizer via the pull-through path (Probe → Gravity → Krystallizer, never direct); view processing + `tool_invoke_count` weight write-back at this data gate.
 - [ ] Phase 6 — CLI over Prism WS: wrap the WS protocol for remote sessions; local CLI (direct Krystallizer) and remote CLI (via Prism) share one protocol surface.
 
 Deferred gates:
 
-- FaaS driver: same execution function on serverless platforms — only after the Aura Actor path is stable; no new code, just another driver of the function.
+- FaaS driver: same execution function on serverless platforms — only after the Aura Booth path is stable; no new code, just another driver of the function.
 - Multi-model routing: model selection per turn/session — after the single-model path is proven; LLM identity stays Gravity-side (cache binding), Krystallizer never learns it.

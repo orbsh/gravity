@@ -18,6 +18,6 @@ Stateless between turns: no resident loop, no session state in memory. Compressi
 
 - `crates/core` — turn executor: LLM loop, tool-call dispatch, SSE streaming
 - `crates/cli` — local driver: for-loop over turns (local/single-machine mode)
-- `crates/actor` — Aura Actor binding: one turn event per execution (distributed mode)
+- `crates/booth` — Aura Booth binding: one turn event per execution (distributed mode)
 
-Same execution function, three drivers: CLI (local), Aura Actor (distributed), FaaS (serverless).
+Same execution function, three drivers: CLI (local), Aura Booth (distributed), FaaS (serverless).
