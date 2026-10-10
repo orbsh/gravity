@@ -1,0 +1,16 @@
+[package]
+name = "gravity-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gravity"
+path = "src/main.rs"
+
+[dependencies]
+gravity-core = { path = "../core" }
+gravity-config = { path = "../config" }
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

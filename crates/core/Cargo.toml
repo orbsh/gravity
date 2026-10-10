@@ -1,0 +1,22 @@
+[package]
+name = "gravity-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gravity-config = { path = "../config" }
+mem-core = { path = "../../../krystallizer/crates/mem-core" }
+async-trait = "0.1"
+fjall = "3"
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+mem-server = { path = "../../../krystallizer/crates/mem-server" }
+axum = "0.8"
+async-trait = "0.1"
