@@ -1,56 +1,45 @@
-//! gravity-booth — the aura booth binding (PLAN Phase 4's first
-//! landing): the turn execution registered as a Booth type.
+//! gravity-booth — the aura booth binding (PLAN Phase 4): the turn
+//! execution as a Booth type, streaming end to end.
 //!
-//! Two booths, one seam:
+//! One python booth (`turn` handler, generator): fetch the session
+//! view from mem-server (HTTP — the booth's own code decides its
+//! access method, ADR-0031), assemble the prompt, pull tokens from the
+//! provider booth through `ctx_iterate` (ADR-0034's native pull loop —
+//! the provider is a sibling citizen, not gravity-internal plumbing),
+//! `yield {"delta": ...}` per token, then append the one-ts-two-subs
+//! exchange and return. The instance key IS the session (partition =
+//! session_id per aura PLAN Phase 6's contract).
 //!
-//! - `provider_booth()` — the LLM provider as a SEPARATE booth type
-//!   (aura ADR-0034; ADR-0031's ruling applied: outbound access lives
-//!   in a booth's own code). Python, `httpx.stream` against any
-//!   OpenAI-compatible endpoint, SSE parsed into a generator, `yield`
-//!   per token event. Key custody via env injection (the env var NAME
-//!   rides the args, the key itself never in the module). Transport
-//!   retry/backoff lives here.
-//! - `turn_booth()` — the turn function as a Rust closure booth
-//!   (`Body::Rust`): fetch the session view → assemble the prompt →
-//!   `ctx.iterate(provider, ...)` pulling tokens → append the delta →
-//!   return the reply. The closure captures the caller-opened
-//!   `MemorySurface` + `LlmClient` (compile-time constructs, not
-//!   persistable — aura's boot reload skips Rust bodies, so the host
-//!   registers this booth explicitly on every start; that is the
-//!   deployment shape, not a gap).
+//! Streaming note: the whole turn is the generator — every token
+//! crosses as an envelope item while the stream is live, the terminal
+//! value carries the full reply. prism's `turn.delta` contract rides
+//! this unchanged (the stub this booth replaces had the same shape).
 //!
-//! Streaming note (the structural residual): a Rust booth body carries
-//! no stream state (aura instance.rs, ADR-0034 residual) — the turn
-//! booth is an INVOKE: it consumes the provider's token stream
-//! internally and answers once. The per-token delta stream to the
-//! connection plane (prism `turn.delta`) needs the producer to be a
-//! session-backed booth; that is the next work unit, recorded in the
-//! PLAN, not silently missing here.
-
-use gravity_core::llm::{LlmClient, WireMessage};
-use gravity_core::surface::MemorySurface;
-use gravity_core::{TurnInput, TurnOutput, now_ms};
-use mem_core::channel::{kind, role};
-use std::sync::Arc;
-
-/// The provider booth's type name (the `ctx.iterate` target).
-pub const PROVIDER_TYPE: &str = "llm_provider";
+//! Custody: the LLM key is read from the env var NAMED in the args
+//! (the value never in the module or args, rotation without reload);
+//! the store URL rides the args the same way (a deployment fact the
+//! caller supplies per call — the booth holds no connection state).
+//!
+//! Naming note (ADR-0043): the iterate face is called through the
+//! current injected wrapper `ctx_iterate`; ADR-0043 renames it to
+//! `ctx.iterate` with no compatibility layer — this source follows at
+//! that landing (one call site, mechanical rename).
 
 /// The turn booth's type name.
 pub const TURN_TYPE: &str = "gravity_turn";
 
-/// The handler the turn booth invokes on the provider.
+/// The provider booth's type name (the `ctx_iterate` target).
+pub const PROVIDER_TYPE: &str = "llm_provider";
+
+/// The handler the turn generator invokes on the provider.
 pub const PROVIDER_HANDLER: &str = "stream";
 
-/// The provider booth source: `stream(args)` yields
-/// `{"delta": "..."}` per token event and returns the terminal value
-/// `{"done": true}`. SSE parsing is inline (httpx's line iterator —
-/// no extra dependency); errors raise (the pull fails as a value).
+/// The provider booth source: `stream(args)` yields `{"delta": "..."}`
+/// per token event. SSE parsing is inline (httpx's line iterator — no
+/// extra dependency); errors raise (the pull fails as a value).
 ///
 /// Args: `{"endpoint", "model", "key_env", "messages": [{role,
-/// content}, ...]}`. The key is read from the environment PER CALL —
-/// the module body never sees it, rotation takes effect without a
-/// reload, and the args can be logged without leaking.
+/// content}, ...]}`. The key is read from the environment PER CALL.
 pub const PROVIDER_SOURCE: &str = r#"
 import httpx, json, os
 
@@ -73,162 +62,95 @@ def stream(args):
                 yield {"delta": delta}
 "#;
 
-/// The provider booth type (python). Registered into the same realm as
-/// the turn booth; the turn closure addresses it by name.
+/// The turn booth source. `turn(args)` is a generator:
+///
+/// 1. `GET {store_url}/channels/{c}/members/{m}/session` — the
+///    projection (summary + increment), the mem-server wire shape.
+/// 2. Prompt assembly: summary preamble (system) + increment (wire
+///    roles) + the user message.
+/// 3. `ctx_iterate(PROVIDER_TYPE, "", "stream", provider_args)` —
+///    each item's `delta` is yielded straight through (the stream IS
+///    the turn; nothing buffers).
+/// 4. Append user + assistant with one shared `ts_ms`, subs 0/1 —
+///    ONLY after a successful stream (a failed turn appends nothing;
+///    the user re-sends next turn). `time.time()*1000` from the
+///    booth's own clock (gravity's clock IS the channel's time,
+///    ADR-0008 §3).
+///
+/// The provider pull failing raises → the generator dies → the pull
+/// that observed it fails as a value → the turn fails through. The
+/// python wrapper's `finally` disposes the provider stream (the
+/// mandatory dual) — abandonment is governed, not leaked.
+///
+/// Args: `{"channel_id", "member_id", "user_message", "store_url",
+/// "endpoint", "model", "key_env"}`.
+pub const TURN_SOURCE: &str = r#"
+import httpx, json, time
+
+def turn(args):
+    base = args["store_url"].rstrip("/")
+    channel_id = args["channel_id"]
+    member_id = args["member_id"]
+    user_message = args["user_message"]
+
+    # 1. Fetch the session projection (mem-server's SessionDto shape).
+    r = httpx.get(
+        f"{base}/channels/{channel_id}/members/{member_id}/session", timeout=30
+    )
+    r.raise_for_status()
+    view = r.json()
+
+    # 2. Prompt assembly: summary preamble + increment + user message.
+    # Role bytes -> wire strings (the storage layer stores the byte,
+    # this function interprets it: 1=assistant, 2=tool, 3=system,
+    # else user — mem-core's channel role constants).
+    role_wire = {1: "assistant", 2: "tool", 3: "system"}
+    messages = []
+    if view.get("summary"):
+        messages.append({
+            "role": "system",
+            "content": f"Conversation summary so far:\n{view['summary']}",
+        })
+    for entry in view.get("increment", []):
+        row = entry["row"]
+        messages.append({"role": role_wire.get(row["role"], "user"), "content": row["content"]})
+    messages.append({"role": "user", "content": user_message})
+
+    # 3. The LLM stream THROUGH the provider booth. Each token yields
+    # straight through — the stream IS the turn. Reply text accumulates
+    # for the append (step 4) and the terminal value.
+    provider_args = {
+        "endpoint": args["endpoint"],
+        "model": args["model"],
+        "key_env": args["key_env"],
+        "messages": messages,
+    }
+    reply_parts = []
+    for item in ctx_iterate("llm_provider", "", "stream", provider_args):
+        delta = item.get("delta", "")
+        reply_parts.append(delta)
+        yield {"delta": delta}
+    reply = "".join(reply_parts)
+    if not reply:
+        raise RuntimeError("provider stream yielded no tokens")
+
+    # 4. Append the exchange: one ts, subs 0/1 — only on success.
+    ts = int(time.time() * 1000)
+    base_append = f"{base}/channels/{channel_id}/messages"
+    for sub, role, content in ((0, 0, user_message), (1, 1, reply)):
+        r = httpx.post(base_append, json={
+            "ts_ms": ts, "sub": sub, "role": role, "kind": 0, "content": content,
+        }, timeout=30)
+        r.raise_for_status()
+"#;
+
+/// The provider booth type (python).
 pub fn provider_booth() -> aura_booth::BoothType {
     aura_booth::BoothType::script(PROVIDER_TYPE, "python", PROVIDER_SOURCE)
 }
 
-/// The turn booth: the gravity turn function wearing a booth body. The
-/// closure captures the memory surface and the LLM client — the SAME
-/// two arguments `gravity_core::turn::turn` takes, captured instead of
-/// passed (booth handlers receive only Ctx + args). One turn event =
-/// one execution; the instance key addresses the session (partition =
-/// session_id per aura PLAN Phase 6's contract).
-///
-/// Args: `{"channel_id", "member_id", "user_message"}` — TurnInput's
-/// field set verbatim (the wire form of the stable contract).
-pub fn turn_booth(
-    surface: Arc<dyn MemorySurface>,
-    client: LlmClient,
-) -> aura_booth::BoothType {
-    aura_booth::BoothType {
-        name: TURN_TYPE.into(),
-        body: aura_booth::Body::Rust(Arc::new(move |ctx, args| {
-            let surface = Arc::clone(&surface);
-            let client = client.clone();
-            Box::pin(async move {
-                let channel_id = args
-                    .get("channel_id")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| anyhow::anyhow!("channel_id required"))?;
-                let member_id = args
-                    .get("member_id")
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| anyhow::anyhow!("member_id required"))?;
-                let user_message = args
-                    .get("user_message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let input = TurnInput { channel_id, member_id, user_message };
-
-                // 1. Fetch the session projection.
-                let view = surface.fetch_session(channel_id, member_id).await?;
-
-                // 2. Assemble the prompt (the turn function's shape —
-                // summary preamble + increment + user message).
-                let mut messages: Vec<WireMessage> = Vec::new();
-                if let Some(summary) = &view.summary {
-                    messages.push(WireMessage {
-                        role: "system".into(),
-                        content: format!("Conversation summary so far:\n{summary}"),
-                    });
-                }
-                for (_, row) in &view.increment {
-                    messages.push(WireMessage {
-                        role: wire_role(row.role).to_string(),
-                        content: row.content.clone(),
-                    });
-                }
-                messages.push(WireMessage { role: "user".into(), content: input.user_message.clone() });
-
-                // 3. The LLM call THROUGH the provider booth
-                // (ctx.iterate — the native pull loop; the provider is
-                // a sibling citizen, not gravity-internal plumbing).
-                // The Rust body has no stream state, so the tokens are
-                // consumed here and the reply returns once (the
-                // streaming residual recorded in the module doc).
-                let provider_args = serde_json::json!({
-                    "endpoint": client.endpoint(),
-                    "model": client.model(),
-                    "key_env": client.api_key_env(),
-                    "messages": messages,
-                });
-                let mut cursor = ctx.iterate(
-                    aura_booth::InstanceId {
-                        booth_type: PROVIDER_TYPE.into(),
-                        key: aura_booth::InstanceKey::Singleton,
-                    },
-                    PROVIDER_HANDLER,
-                    provider_args,
-                );
-                let mut reply = String::new();
-                // The stream-state flag: exhaustion (done) releases the
-                // stream carrier-side; anything else needs the dispose
-                // dual below. The initial value is never read (every
-                // loop exit either sets it or bails) — hence the
-                // `#[allow]`.
-                #[allow(unused_assignments)]
-                let mut stream_released = false;
-                loop {
-                    match cursor.next().await {
-                        Ok(env) if env.done => {
-                            // Exhaustion — the carrier released the
-                            // stream itself.
-                            stream_released = true;
-                            break;
-                        }
-                        Ok(env) => {
-                            if let Some(delta) = env
-                                .item
-                                .as_ref()
-                                .and_then(|i| i.get("delta"))
-                                .and_then(|d| d.as_str())
-                            {
-                                reply.push_str(delta);
-                            }
-                        }
-                        // A failed pull fails the turn — the oldest
-                        // rule (a failed LLM call appends nothing), now
-                        // carried by the booth form. Swallowing it
-                        // would append an empty exchange.
-                        Err(e) => {
-                            let _ = cursor.dispose().await;
-                            anyhow::bail!("provider pull failed: {e}");
-                        }
-                    }
-                }
-                // The mandatory dual (ADR-0034 §3): an abnormal exit
-                // leaves the stream live carrier-side. Idempotent — a
-                // released stream disposes nothing.
-                if !stream_released {
-                    let _ = cursor.dispose().await;
-                }
-                if reply.is_empty() {
-                    anyhow::bail!("provider stream yielded no tokens (turn fails through)");
-                }
-
-                // 4. Append the delta: one exchange, one timestamp
-                // (sub 0/1) — only on success.
-                let ts = now_ms();
-                surface
-                    .append_message(channel_id, ts, 0, role::USER, kind::TEXT, &input.user_message)
-                    .await?;
-                surface
-                    .append_message(channel_id, ts, 1, role::ASSISTANT, kind::TEXT, &reply)
-                    .await?;
-
-                let out = TurnOutput { reply };
-                Ok(serde_json::to_value(out)?)
-            })
-        })),
-        idle_ttl: None,
-        max_exec: None,
-        on_sleep: None,
-        on_wake: None,
-        receives: Vec::new(),
-    }
-}
-
-/// Storage role byte → wire role string (gravity_core::turn's mapping —
-/// duplicated here because the closure cannot call the private fn; one
-/// mapping per seam crossing, kept in sync by the contract tests).
-fn wire_role(role: u8) -> &'static str {
-    match role {
-        mem_core::channel::role::ASSISTANT => "assistant",
-        mem_core::channel::role::TOOL => "tool",
-        mem_core::channel::role::SYSTEM => "system",
-        _ => "user",
-    }
+/// The turn booth type (python, generator — session-backed, the
+/// carrier holds the stream state).
+pub fn turn_booth() -> aura_booth::BoothType {
+    aura_booth::BoothType::script(TURN_TYPE, "python", TURN_SOURCE)
 }

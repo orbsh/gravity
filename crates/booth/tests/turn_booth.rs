@@ -1,28 +1,28 @@
-//! The booth binding contract (PLAN Phase 4, first landing): the turn
-//! execution registered as a Rust booth, the provider as a python
-//! booth — one realm, the turn closure pulling tokens through
-//! `ctx.iterate`. The LLM wire is stubbed by a local SSE server (the
-//! same shape the real provider booth will parse against), the memory
-//! seam rides a real mem-server. What is pinned:
+//! The booth binding contract (PLAN Phase 4): the turn execution as a
+//! python generator booth, the provider as a sibling python booth —
+//! one realm, the turn generator pulling tokens through `ctx_iterate`
+//! and yielding straight through. The LLM wire is stubbed by a local
+//! SSE server, the memory seam rides a real mem-server. What is
+//! pinned:
 //!
-//! - the turn booth's round trip: fetch → prompt → provider stream →
-//!   append (user + assistant, one ts two subs) → reply value;
+//! - the STREAMING round trip: each token arrives as an envelope item
+//!   while the stream is live (not one buffered answer), the deltas
+//!   assemble the reply, and the memory seam sees the one-ts-two-subs
+//!   exchange after the stream ends;
 //! - a failed provider pull appends nothing (the turn function's
 //!   oldest rule, through the booth form);
-//! - the provider booth's arg contract: endpoint/model/key_env +
-//!   messages; the key NEVER in the args, only its env name.
+//! - key custody: the key value never in the module source — only the
+//!   env var NAME crosses.
 
-use aura_booth::{InstanceId, InstanceKey};
+use aura_booth::{call::CallSlot, InstanceId, InstanceKey, IterateOp};
 use aura_engine::Engine;
-use gravity_booth::{provider_booth, turn_booth, PROVIDER_HANDLER, PROVIDER_TYPE, TURN_TYPE};
-use gravity_core::llm::LlmClient;
-use gravity_core::surface::{HttpSurface, MemorySurface};
+use aura_realm::Realm;
+use gravity_booth::{provider_booth, turn_booth, PROVIDER_SOURCE, TURN_SOURCE, TURN_TYPE};
+use gravity_core::surface::MemorySurface;
 use mem_core::channel::role;
-use std::sync::Arc;
 
 /// A minimal OpenAI-compatible SSE endpoint: answers one streamed
-/// reply assembled from `CHUNKS`, then `[DONE]`. Axum (already a
-/// dev-dep of gravity-core) serving raw SSE bodies.
+/// reply assembled from `CHUNKS`, then `[DONE]`.
 async fn sse_server(body_chunks: Vec<&'static str>) -> String {
     let app = axum::Router::new().route(
         "/chat/completions",
@@ -50,117 +50,177 @@ async fn sse_server(body_chunks: Vec<&'static str>) -> String {
     format!("http://{addr}")
 }
 
-async fn boot_realm(
-    surface: Arc<dyn MemorySurface>,
-    client: LlmClient,
-) -> anyhow::Result<Engine> {
-    let engine = Engine::start(&Default::default()).await?;
-    engine.register(provider_booth()).await?;
-    engine.register(turn_booth(surface, client)).await?;
-    Ok(engine)
-}
-
-fn llm_client(endpoint: &str) -> LlmClient {
-    // LlmClient resolves the key from an env var — point it at a var
-    // the test sets (the booth form re-reads it python-side).
+async fn boot() -> Engine {
     std::env::set_var("GRAVITY_TEST_KEY", "test-key");
-    LlmClient::from_config(&gravity_config::GravityConfig {
-        endpoint: endpoint.to_string(),
-        model: "test-model".into(),
-        api_key_env: "GRAVITY_TEST_KEY".into(),
-        store_path: None,
-        store_url: None,
-    })
-    .unwrap()
+    let engine = Engine::start(&Default::default()).await.expect("engine boot");
+    engine.register(provider_booth()).await.unwrap();
+    engine.register(turn_booth()).await.unwrap();
+    engine
 }
 
-async fn mem_surface() -> (Arc<dyn MemorySurface>, tempfile::TempDir) {
+async fn mem_server() -> String {
     let dir = tempfile::TempDir::new().unwrap();
     let app = mem_server::open(dir.path().to_path_buf()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let surface: Arc<dyn MemorySurface> =
-        Arc::new(HttpSurface::new(&format!("http://{addr}")));
-    (surface, dir)
+    // Leak the guard: the store files must outlive the test (the same
+    // discipline identity_e2e's registry boot uses).
+    std::mem::forget(dir);
+    format!("http://{addr}")
+}
+
+fn turn_args(store_url: &str, endpoint: &str, msg: &str) -> serde_json::Value {
+    serde_json::json!({
+        "channel_id": 7,
+        "member_id": 1,
+        "user_message": msg,
+        "store_url": store_url,
+        "endpoint": endpoint,
+        "model": "test-model",
+        "key_env": "GRAVITY_TEST_KEY",
+    })
+}
+
+/// The gateway's shape (prism turn.submit does exactly this): Start,
+/// then Next pulls in a loop, collecting `item.delta` per envelope.
+/// Returns (deltas, session_id alive after done — should be gone).
+async fn drain_turn(
+    engine: &Engine,
+    store_url: &str,
+    endpoint: &str,
+    msg: &str,
+) -> Vec<String> {
+    let slot = Realm::iterate(
+        &engine.realm,
+        IterateOp::Start {
+            target: InstanceId {
+                booth_type: TURN_TYPE.into(),
+                key: InstanceKey::Named("s1".into()),
+            },
+            handler: "turn".into(),
+            args: turn_args(store_url, endpoint, msg),
+        },
+    )
+    .await
+    .unwrap();
+    let (mut rx, mut stream_id) = match slot {
+        CallSlot::Hot { rx, .. } => (rx, None),
+        _ => panic!("iterate is hot-only"),
+    };
+    let mut deltas = Vec::new();
+    loop {
+        let v = match rx.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => panic!("pull failed: {e}"),
+            Err(_) => panic!("reply dropped"),
+        };
+        if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+            return deltas;
+        }
+        if stream_id.is_none() {
+            stream_id =
+                Some(v.get("stream_id").and_then(|s| s.as_str()).unwrap().to_string());
+        }
+        if let Some(d) = v.get("item").and_then(|i| i.get("delta")).and_then(|d| d.as_str()) {
+            deltas.push(d.to_string());
+        }
+        let id = stream_id.clone().unwrap();
+        match Realm::iterate(&engine.realm, IterateOp::Next { stream_id: id })
+            .await
+            .unwrap()
+        {
+            CallSlot::Hot { rx: next, .. } => rx = next,
+            _ => panic!("iterate is hot-only"),
+        }
+    }
 }
 
 #[tokio::test]
-async fn turn_booth_round_trip() {
-    let chunks = vec!["hel", "lo ", "wor", "ld"];
-    let endpoint = sse_server(chunks).await;
-    let (surface, _dir) = mem_surface().await;
-    let engine = boot_realm(Arc::clone(&surface), llm_client(&endpoint))
-        .await
-        .unwrap();
+async fn turn_booth_streams_deltas() {
+    let endpoint = sse_server(vec!["hel", "lo ", "wor", "ld"]).await;
+    let store_url = mem_server().await;
+    let engine = boot().await;
 
-    let out = engine
-        .invoke(
-            InstanceId { booth_type: TURN_TYPE.into(), key: InstanceKey::Named("s1".into()) },
-            "turn",
-            serde_json::json!({"channel_id": 7, "member_id": 1, "user_message": "hi"}),
-        )
-        .await
-        .unwrap();
-    assert_eq!(out["reply"], "hello world", "the streamed tokens assemble the reply");
+    let deltas = drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    assert_eq!(deltas.join(""), "hello world", "tokens stream one per envelope");
+}
 
-    // The memory seam saw the exchange: user + assistant, one ts two subs.
+#[tokio::test]
+async fn stream_appends_the_exchange_after_done() {
+    let endpoint = sse_server(vec!["hel", "lo"]).await;
+    let store_url = mem_server().await;
+    let engine = boot().await;
+
+    let deltas = drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    assert_eq!(deltas.join(""), "hello");
+
+    // The memory seam saw the exchange: user + assistant, one ts, subs
+    // 0/1. Read through gravity's own HTTP surface (the same wire the
+    // booth posted through).
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
     let view = surface.fetch_session(7, 1).await.unwrap();
     assert_eq!(view.increment.len(), 2);
     assert_eq!(view.increment[0].1.role, role::USER);
     assert_eq!(view.increment[0].1.content, "hi");
     assert_eq!(view.increment[1].1.role, role::ASSISTANT);
-    assert_eq!(view.increment[1].1.content, "hello world");
-    assert_eq!(view.increment[0].0.ts_ms, view.increment[1].0.ts_ms, "one exchange one timestamp");
+    assert_eq!(view.increment[1].1.content, "hello");
+    assert_eq!(
+        view.increment[0].0.ts_ms, view.increment[1].0.ts_ms,
+        "one exchange one timestamp"
+    );
     assert_eq!(view.increment[0].0.sub, 0);
     assert_eq!(view.increment[1].0.sub, 1);
 }
 
 #[tokio::test]
 async fn failed_provider_pull_appends_nothing() {
-    // A server that rejects the request — the pull fails, the turn
-    // appends nothing (the failed attempt never enters the log).
+    // A server that rejects the request — the provider generator
+    // raises, the turn generator dies with it, the pull that observed
+    // the death fails as a value, and nothing appends.
     let app = axum::Router::new().route(
         "/chat/completions",
-        axum::routing::post(|| async {
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR
-        }),
+        axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
+    let store_url = mem_server().await;
+    let engine = boot().await;
 
-    let (surface, _dir) = mem_surface().await;
-    let engine = boot_realm(Arc::clone(&surface), llm_client(&endpoint))
-        .await
-        .unwrap();
+    let slot = Realm::iterate(
+        &engine.realm,
+        IterateOp::Start {
+            target: InstanceId {
+                booth_type: TURN_TYPE.into(),
+                key: InstanceKey::Named("s1".into()),
+            },
+            handler: "turn".into(),
+            args: turn_args(&store_url, &endpoint, "hi"),
+        },
+    )
+    .await
+    .unwrap();
+    // The failure surfaces as a pull error value (the terminal-first
+    // invoke shape — the generator died before opening a stream).
+    let failed = match slot {
+        CallSlot::Hot { rx, .. } => matches!(rx.await, Ok(Err(_))),
+        _ => panic!("hot-only"),
+    };
+    assert!(failed, "the turn fails through (no silent swallow)");
 
-    let out = engine
-        .invoke(
-            InstanceId { booth_type: TURN_TYPE.into(), key: InstanceKey::Named("s1".into()) },
-            "turn",
-            serde_json::json!({"channel_id": 7, "member_id": 1, "user_message": "hi"}),
-        )
-        .await;
-    assert!(out.is_err(), "the turn fails through (no silent single-shot)");
-
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
     let view = surface.fetch_session(7, 1).await.unwrap();
     assert!(view.increment.is_empty(), "a failed turn appends nothing");
 }
 
 #[test]
-fn provider_booth_source_never_carries_the_key() {
+fn provider_source_never_carries_the_key() {
     // Key custody: the module source reads the env var named in the
     // args — the key value appears nowhere in the source (the args
     // carry `key_env`, the NAME).
-    let src = provider_booth_source();
-    assert!(src.contains("os.environ"), "the provider reads the env per call");
-    assert!(!src.contains("sk-"), "no literal key in the module");
-    let _ = (PROVIDER_HANDLER, PROVIDER_TYPE);
-}
-
-fn provider_booth_source() -> String {
-    // Re-exported source (gravity-booth embeds it as a const).
-    gravity_booth::PROVIDER_SOURCE.into()
+    assert!(PROVIDER_SOURCE.contains("os.environ"), "env read per call");
+    assert!(!PROVIDER_SOURCE.contains("sk-"), "no literal key in the module");
+    assert!(!TURN_SOURCE.contains("sk-"), "no literal key in the turn module");
 }
