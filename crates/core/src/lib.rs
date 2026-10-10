@@ -27,8 +27,9 @@ pub struct TurnInput {
 }
 
 /// One turn's output: the assistant reply (Phase 0 — no tool calls, no
-/// stream; the envelope grows with Phase 2's tool loop).
-#[derive(Clone, Debug)]
+/// stream; the envelope grows with Phase 2's tool loop). Serializable:
+/// the booth binding returns it as the handler's value.
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct TurnOutput {
     pub reply: String,
 }

@@ -22,6 +22,9 @@ pub struct LlmClient {
     endpoint: String,
     model: String,
     api_key: String,
+    /// The env var NAME the key was resolved from (kept so the
+    /// provider booth can re-read per call — rotation without reload).
+    api_key_env_name: String,
     http: reqwest::Client,
 }
 
@@ -33,8 +36,26 @@ impl LlmClient {
             endpoint: config.endpoint.trim_end_matches('/').to_string(),
             model: config.model.clone(),
             api_key: config.api_key()?,
+            api_key_env_name: config.api_key_env.clone(),
             http: reqwest::Client::new(),
         })
+    }
+
+    /// The endpoint URL (the provider booth's arg — the key itself
+    /// never crosses back out of this handle).
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// The model id (the provider booth's arg).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The env var NAME the key was resolved from (the provider booth
+    /// re-reads it per call — rotation without a reload).
+    pub fn api_key_env(&self) -> &str {
+        &self.api_key_env_name
     }
 
     /// One chat completion: send the full message list, return the

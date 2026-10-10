@@ -1,0 +1,27 @@
+[package]
+name = "gravity-booth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gravity-core = { path = "../core" }
+gravity-config = { path = "../config" }
+mem-core = { path = "../../../krystallizer/crates/mem-core" }
+aura-booth = { path = "../../../aura/crates/booth" }
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+mem-server = { path = "../../../krystallizer/crates/mem-server" }
+axum = "0.8"
+aura-engine = { path = "../../../aura/crates/engine", features = ["python"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[features]
+default = []
+# The dev tests boot a real engine with the python carrier; feature
+# parity with aura-engine's python feature (pyo3 links="python" pins
+# the version across the graph).
+python = ["aura-engine/python"]
