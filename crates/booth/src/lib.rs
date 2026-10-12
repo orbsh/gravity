@@ -142,6 +142,9 @@ def turn(args):
             "ts_ms": ts, "sub": sub, "role": role, "kind": 0, "content": content,
         }, timeout=30)
         r.raise_for_status()
+
+def interface_schema(args):
+    return {"auth": {"turn": True}}
 "#;
 
 /// The provider booth type (python).
