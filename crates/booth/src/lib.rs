@@ -19,11 +19,6 @@
 //! (the value never in the module or args, rotation without reload);
 //! the store URL rides the args the same way (a deployment fact the
 //! caller supplies per call — the booth holds no connection state).
-//!
-//! Naming note (ADR-0043): the iterate face is called through the
-//! current injected wrapper `ctx_iterate`; ADR-0043 renames it to
-//! `ctx.iterate` with no compatibility layer — this source follows at
-//! that landing (one call site, mechanical rename).
 
 /// The turn booth's type name.
 pub const TURN_TYPE: &str = "gravity_turn";
