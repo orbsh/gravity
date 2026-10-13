@@ -12,7 +12,7 @@
 use crate::llm::{LlmClient, WireMessage};
 use crate::surface::MemorySurface;
 use crate::{now_ms, TurnInput, TurnOutput};
-use mem_core::channel::{role, kind};
+use mem_core::channel::{kind, role};
 
 /// Run one turn. `store` is the caller-opened memory surface (in-process
 /// or HTTP — the seam is `MemorySurfaceObj`, ADR-0007 as revised). The
@@ -63,7 +63,14 @@ pub async fn turn(
     // 4. Append the delta: one exchange, one timestamp, sub 0/1.
     let ts = now_ms();
     store
-        .append_message(channel_id, ts, 0, role::USER, kind::TEXT, &input.user_message)
+        .append_message(
+            channel_id,
+            ts,
+            0,
+            role::USER,
+            kind::TEXT,
+            &input.user_message,
+        )
         .await?;
     store
         .append_message(channel_id, ts, 1, role::ASSISTANT, kind::TEXT, &reply)

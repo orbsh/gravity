@@ -23,7 +23,9 @@ async fn turn_with(
     fail: bool,
     input: TurnInput,
 ) -> anyhow::Result<String> {
-    let view = store.fetch_session(input.channel_id, input.member_id).await?;
+    let view = store
+        .fetch_session(input.channel_id, input.member_id)
+        .await?;
 
     let mut messages: Vec<WireMessage> = Vec::new();
     if let Some(summary) = &view.summary {
@@ -38,7 +40,10 @@ async fn turn_with(
             content: row.content.clone(),
         });
     }
-    messages.push(WireMessage { role: "user".into(), content: input.user_message.clone() });
+    messages.push(WireMessage {
+        role: "user".into(),
+        content: input.user_message.clone(),
+    });
     assert!(!messages.is_empty());
 
     if fail {
@@ -48,7 +53,14 @@ async fn turn_with(
 
     let ts = gravity_core::now_ms();
     store
-        .append_message(input.channel_id, ts, 0, role::USER, kind::TEXT, &input.user_message)
+        .append_message(
+            input.channel_id,
+            ts,
+            0,
+            role::USER,
+            kind::TEXT,
+            &input.user_message,
+        )
         .await?;
     store
         .append_message(input.channel_id, ts, 1, role::ASSISTANT, kind::TEXT, &reply)
@@ -73,11 +85,16 @@ async fn seam_contract(store: &dyn MemorySurface) {
     let m = gravity_core::surface::DEFAULT_MEMBER;
 
     // A failed turn leaves no trace.
-    let err = turn_with(store, "unused", true, TurnInput {
-        channel_id: ch,
-        member_id: m,
-        user_message: "ghost".into(),
-    })
+    let err = turn_with(
+        store,
+        "unused",
+        true,
+        TurnInput {
+            channel_id: ch,
+            member_id: m,
+            user_message: "ghost".into(),
+        },
+    )
     .await
     .unwrap_err();
     assert!(err.to_string().contains("LLM down"));
@@ -85,16 +102,24 @@ async fn seam_contract(store: &dyn MemorySurface) {
     assert!(view.increment.is_empty(), "failed turn must not append");
 
     // A successful turn appends user+assistant under one ts.
-    turn_with(store, "hello!", false, TurnInput {
-        channel_id: ch,
-        member_id: m,
-        user_message: "hi".into(),
-    })
+    turn_with(
+        store,
+        "hello!",
+        false,
+        TurnInput {
+            channel_id: ch,
+            member_id: m,
+            user_message: "hi".into(),
+        },
+    )
     .await
     .unwrap();
     let view = store.fetch_session(ch, m).await.unwrap();
     assert_eq!(view.increment.len(), 2);
-    assert_eq!(view.increment[0].0.ts_ms, view.increment[1].0.ts_ms, "one exchange, one ts");
+    assert_eq!(
+        view.increment[0].0.ts_ms, view.increment[1].0.ts_ms,
+        "one exchange, one ts"
+    );
     assert_eq!(view.increment[0].0.sub, 0);
     assert_eq!(view.increment[1].0.sub, 1);
     assert_eq!(view.increment[0].1.role, role::USER);
@@ -103,7 +128,11 @@ async fn seam_contract(store: &dyn MemorySurface) {
     assert_eq!(view.increment[1].1.content, "hello!");
 
     // The projection feeds prompt assembly: roles map to wire strings.
-    let roles: Vec<&str> = view.increment.iter().map(|(_, r)| wire_role(r.role)).collect();
+    let roles: Vec<&str> = view
+        .increment
+        .iter()
+        .map(|(_, r)| wire_role(r.role))
+        .collect();
     assert_eq!(roles, vec!["user", "assistant"]);
 }
 
@@ -141,7 +170,10 @@ async fn checkpoint_flows_through_surface() {
     store.append_checkpoint(3, gravity_core::surface::DEFAULT_MEMBER, 100, "compressed");
 
     let surface = InProcessSurface::wrap(store);
-    let view = surface.fetch_session(3, gravity_core::surface::DEFAULT_MEMBER).await.unwrap();
+    let view = surface
+        .fetch_session(3, gravity_core::surface::DEFAULT_MEMBER)
+        .await
+        .unwrap();
     assert_eq!(view.coverage_ts, 100);
     assert_eq!(view.summary.as_deref(), Some("compressed"));
     assert_eq!(view.increment.len(), 1);

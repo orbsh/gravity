@@ -5,6 +5,12 @@
 //!
 //! Model identity stays gravity-side (ADR-0007): the endpoint, model,
 //! and key live in gravity's config/env, never in krystallizer's data.
+//!
+//! Submodules:
+//! - [`sse`] — the SSE wire decoder (the one home for the framing and
+//!   chunk shape; the provider guest and any streaming consumer ride it).
+
+pub mod sse;
 
 use anyhow::Context;
 

@@ -20,11 +20,7 @@ pub use mem_core::channel::DEFAULT_MEMBER;
 #[async_trait::async_trait]
 pub trait MemorySurface: Send + Sync {
     /// The projection read (checkpoint + increment).
-    async fn fetch_session(
-        &self,
-        channel_id: u64,
-        member_id: u64,
-    ) -> anyhow::Result<SessionView>;
+    async fn fetch_session(&self, channel_id: u64, member_id: u64) -> anyhow::Result<SessionView>;
 
     /// Append one log entry; returns the full key (the delta record).
     async fn append_message(
@@ -56,17 +52,15 @@ impl InProcessSurface {
     /// takes over a store its host opened; Fjall locks per directory,
     /// so a second `open` of the same path is an error, not a handle.
     pub fn wrap(store: ChannelStore) -> Self {
-        Self { store: tokio::sync::Mutex::new(store) }
+        Self {
+            store: tokio::sync::Mutex::new(store),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl MemorySurface for InProcessSurface {
-    async fn fetch_session(
-        &self,
-        channel_id: u64,
-        member_id: u64,
-    ) -> anyhow::Result<SessionView> {
+    async fn fetch_session(&self, channel_id: u64, member_id: u64) -> anyhow::Result<SessionView> {
         Ok(self.store.lock().await.fetch_full(channel_id, member_id))
     }
 
@@ -116,11 +110,7 @@ impl HttpSurface {
 
 #[async_trait::async_trait]
 impl MemorySurface for HttpSurface {
-    async fn fetch_session(
-        &self,
-        channel_id: u64,
-        member_id: u64,
-    ) -> anyhow::Result<SessionView> {
+    async fn fetch_session(&self, channel_id: u64, member_id: u64) -> anyhow::Result<SessionView> {
         // Wire shape mirrors mem-server's SessionDto; keys are not
         // needed by the prompt assembly, so the response is decoded
         // loosely (increment rows only).
@@ -215,6 +205,10 @@ impl MemorySurface for HttpSurface {
             .context("mem-server append rejected (HTTP status)")?
             .status();
         let _ = status;
-        Ok(MessageKey { channel_id, ts_ms, sub })
+        Ok(MessageKey {
+            channel_id,
+            ts_ms,
+            sub,
+        })
     }
 }

@@ -11,10 +11,16 @@
 //! guard's `total` is unknown for a live network stream, so the Start
 //! reply carries none (the guard defaults to u64::MAX and exhaustion
 //! rides the producer's own `done: true`).
+//!
+//! The SSE framing and chunk shape come from gravity-core's `llm::sse`
+//! (the one home for the wire decoding — the CLI's LLM path and this
+//! guest share it).
 
 use anyhow::Context;
+use gravity_core::llm::sse::{SseDecoder, SseEvent};
 use induction_guest::{Ctx, Guest};
 use serde_json::{json, Value};
+use std::io::Read;
 use std::sync::Mutex;
 
 fn main() -> anyhow::Result<()> {
@@ -25,27 +31,29 @@ fn main() -> anyhow::Result<()> {
         // replies the first envelope (`{done:false, item:{delta}}`).
         .on("stream", |_ctx: &mut Ctx, args: Value| {
             let conn = open_stream(&args)?;
-            *STREAM.lock().unwrap() = Some(conn);
             let mut slot = STREAM.lock().unwrap();
-            let stream = slot.as_mut().unwrap();
-            loop {
-                if let Some(ev) = next_event(stream)? {
-                    return Ok(match ev {
-                        Event::Delta(delta) => {
-                            json!({ "done": false, "item": { "delta": delta } })
-                        }
-                        Event::Done => {
-                            *slot = None;
-                            json!({ "done": true })
-                        }
-                    });
-                }
-                stream.fill()?;
+            let mut stream = conn;
+            let reply = next_envelope(&mut stream)?;
+            // Done already dropped the stream (next_envelope signals it
+            // by leaving None here); otherwise the connection persists.
+            if reply.get("done").and_then(Value::as_bool) != Some(true) {
+                *slot = Some(stream);
             }
+            Ok(reply)
         })
         // The pull handler: `__next__` is the reserved binding the
         // guest guard table routes every pull round to.
-        .producer(|_ctx: &mut Ctx, args: Value| stream_round(args))
+        .producer(|_ctx: &mut Ctx, _args: Value| {
+            let mut slot = STREAM.lock().unwrap();
+            let Some(mut stream) = slot.take() else {
+                anyhow::bail!("provider: pull with no live stream");
+            };
+            let reply = next_envelope(&mut stream)?;
+            if reply.get("done").and_then(Value::as_bool) != Some(true) {
+                *slot = Some(stream);
+            }
+            Ok(reply)
+        })
         .run()
 }
 
@@ -56,38 +64,42 @@ fn main() -> anyhow::Result<()> {
 static STREAM: Mutex<Option<Stream>> = Mutex::new(None);
 
 struct Stream {
-    /// Buffered, undecoded SSE text left over from the last read.
-    buf: String,
+    /// The SSE decoder (buffer + framing), gravity-core's shared wire
+    /// module.
+    sse: SseDecoder,
     reader: Box<dyn std::io::Read + Send>,
 }
 
-/// One pull round: yield one decoded event per round until the
-/// terminal `[DONE]` sentinel (round 0 never arrives here — the Start
-/// handler opened the stream and consumed the first event).
-fn stream_round(_args: Value) -> anyhow::Result<Value> {
-    let mut slot = STREAM.lock().unwrap();
-    let stream = slot
-        .as_mut()
-        .ok_or_else(|| anyhow::anyhow!("provider: pull with no live stream"))?;
-    loop {
-        if let Some(ev) = next_event(stream)? {
-            return Ok(match ev {
-                Event::Delta(delta) => json!({ "done": false, "item": { "delta": delta } }),
-                Event::Done => {
-                    *slot = None; // the connection closes with the stream
-                    json!({ "done": true })
-                }
-            });
+impl Stream {
+    /// Pull more bytes into the decoder (blocking read — the pull IS
+    /// the backpressure; a slow upstream stalls its own pull).
+    fn fill(&mut self) -> anyhow::Result<()> {
+        let mut chunk = [0u8; 8192];
+        let n = self
+            .reader
+            .read(&mut chunk)
+            .context("provider: stream read failed")?;
+        if n == 0 {
+            anyhow::bail!("provider: upstream closed before [DONE]");
         }
-        // Buffer exhausted: refill from the socket (blocking read — the
-        // pull IS the backpressure; a slow upstream stalls its own pull).
-        stream.fill()?;
+        self.sse.feed(&chunk[..n]);
+        Ok(())
     }
 }
 
-enum Event {
-    Delta(String),
-    Done,
+/// Decode the next envelope out of the stream, refilling as needed.
+/// The caller owns the stream (taken from the slot); a non-terminal
+/// reply means the caller puts it back (the connection persists).
+fn next_envelope(stream: &mut Stream) -> anyhow::Result<Value> {
+    loop {
+        if let Some(ev) = stream.sse.decode()? {
+            return Ok(match ev {
+                SseEvent::Delta(delta) => json!({ "done": false, "item": { "delta": delta } }),
+                SseEvent::Done => json!({ "done": true }),
+            });
+        }
+        stream.fill()?;
+    }
 }
 
 fn open_stream(args: &Value) -> anyhow::Result<Stream> {
@@ -115,59 +127,11 @@ fn open_stream(args: &Value) -> anyhow::Result<Stream> {
     let body = json!({ "model": model, "messages": messages, "stream": true });
     let resp = ureq::post(&url)
         .set("Authorization", &format!("Bearer {key}"))
+        .set("Content-Type", "application/json")
         .send_string(&body.to_string())
         .context("provider: LLM endpoint request failed")?;
     Ok(Stream {
-        buf: String::new(),
+        sse: SseDecoder::new(),
         reader: resp.into_reader(),
     })
-}
-
-/// Pull more bytes into the buffer.
-impl Stream {
-    fn fill(&mut self) -> anyhow::Result<()> {
-        let mut chunk = [0u8; 8192];
-        let n = self
-            .reader
-            .read(&mut chunk)
-            .context("provider: stream read failed")?;
-        if n == 0 {
-            anyhow::bail!("provider: upstream closed before [DONE]");
-        }
-        self.buf.push_str(&String::from_utf8_lossy(&chunk[..n]));
-        Ok(())
-    }
-}
-
-use std::io::Read;
-
-/// Decode the next complete SSE event out of the buffer, if one is
-/// present. SSE frames are `data: <json>\n\n`; the terminal sentinel is
-/// `data: [DONE]`.
-fn next_event(stream: &mut Stream) -> anyhow::Result<Option<Event>> {
-    while let Some(pos) = stream.buf.find("\n\n") {
-        let frame = stream.buf.drain(..pos + 2).collect::<String>();
-        for line in frame.lines() {
-            let Some(data) = line.strip_prefix("data: ") else {
-                continue;
-            };
-            if data.trim() == "[DONE]" {
-                return Ok(Some(Event::Done));
-            }
-            let chunk: Value = serde_json::from_str(data)
-                .with_context(|| format!("provider: bad SSE payload: {data}"))?;
-            if let Some(delta) = chunk
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("delta"))
-                .and_then(|d| d.get("content"))
-                .and_then(Value::as_str)
-            {
-                if !delta.is_empty() {
-                    return Ok(Some(Event::Delta(delta.to_string())));
-                }
-            }
-        }
-    }
-    Ok(None)
 }

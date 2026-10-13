@@ -15,6 +15,7 @@ path = "src/bin/turn.rs"
 [dependencies]
 aura-booth = { path = "../../../aura/crates/booth" }
 aura-engine = { path = "../../../aura/crates/engine", default-features = false }
+gravity-core = { path = "../core" }
 induction-guest = { path = "../../../induction/crates/induction-guest" }
 anyhow.workspace = true
 serde_json.workspace = true
@@ -22,7 +23,6 @@ ureq = "2"
 
 [dev-dependencies]
 tempfile.workspace = true
-gravity-core = { path = "../core" }
 mem-core = { path = "../../../krystallizer/crates/mem-core" }
 mem-server = { path = "../../../krystallizer/crates/mem-server" }
 axum = "0.8"
