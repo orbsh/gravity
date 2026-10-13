@@ -55,6 +55,14 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
     if round == 0 {
         anyhow::bail!("turn: pull round 0 is the Start handler's job");
     }
+    // Tool results from the Start-face dispatch loop surface first (the
+    // consumer sees the loop's progress before the content deltas).
+    {
+        let mut results = TOOL_RESULTS.lock().unwrap();
+        if !results.is_empty() {
+            return Ok(json!({ "done": false, "item": results.remove(0) }));
+        }
+    }
     // Rounds ≥ 1: pull the provider, re-emit the delta.
     let guard = PROVIDER_STREAM.lock().unwrap();
     let Some(sid) = guard.as_ref() else {
@@ -77,41 +85,6 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
     let Some(item) = env.get("item") else {
         anyhow::bail!("turn: non-terminal envelope carried no item");
     };
-    // Tool calls from the LLM: parse, dispatch through ctx.invoke (the
-    // target rides the call verbatim — the tool list is the caller's),
-    // and surface each result as this stream's own envelope item. The
-    // transcript accounting is Phase 2.5's split — the loop keeps the
-    // wire flowing; the NEXT provider stream (opened by the finish
-    // path's next-turn cycle) carries the fed-back messages.
-    if let Some(calls) = item.get("tool_calls") {
-        let parsed = gravity_core::tool::parse_tool_calls(&json!({ "tool_calls": calls }))
-            .context("turn: malformed tool calls from the provider")?;
-        let mut out = Vec::new();
-        for call in parsed {
-            let result = ctx.invoke(
-                "effector",
-                "",
-                &call.function.name,
-                json!({
-                    "target": format!("effector:local:{}", call.function.name),
-                    "args": call.function.arguments,
-                }),
-            );
-            let content = match result {
-                Ok(v) => v.to_string(),
-                // Failure is a value into the next inference (the tool
-                // failed, not the turn — the loop continues).
-                Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
-            };
-            out.push(json!({
-                "tool_result": {
-                    "tool_call_id": call.id,
-                    "content": content,
-                }
-            }));
-        }
-        return Ok(json!({ "done": false, "item": out[0] }));
-    }
     let delta = item
         .get("delta")
         .and_then(Value::as_str)
@@ -196,30 +169,103 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
     messages.push(json!({ "role": "user", "content": user_message }));
 
     // 3. Open the provider stream; its first reply carries the first
-    // envelope (with the realm-minted stream_id merged in).
-    let provider_args = json!({
-        "endpoint": args.get("endpoint"),
-        "model": args.get("model"),
-        "key_env": args.get("key_env"),
-        "messages": messages,
-    });
-    let first = ctx
-        .iterate_start("llm_provider", "", "stream", provider_args)
+    // envelope (with the realm-minted stream_id merged in). A
+    // tool_calls-first reply = the LLM wants tools BEFORE any prose:
+    // dispatch them, append the results to the message list, and
+    // reopen — the "next inference round" of the loop (Phase 2). The
+    // results ALSO surface as this stream's own items (the consumer
+    // sees the loop's progress), re-emitted by the pull face.
+    let mut first = ctx
+        .iterate_start(
+            "llm_provider",
+            "",
+            "stream",
+            json!({
+                "endpoint": args.get("endpoint"),
+                "model": args.get("model"),
+                "key_env": args.get("key_env"),
+                "messages": messages,
+            }),
+        )
         .context("turn: provider stream failed to open")?;
-    // A string reply = the provider handler's error value surfaced through
-    // the host bridge (errors cross as values, ADR-0012).
-    if let Some(msg) = first.as_str() {
-        anyhow::bail!("turn: provider stream failed to open: {msg}");
-    }
-    if first.get("done").and_then(Value::as_bool) == Some(true) {
-        // Terminal-first = the provider failed to open (its error rides
-        // the terminal value) or yielded nothing.
-        let msg = first
-            .get("value")
+    for _round in 0..8 {
+        // A string reply = the provider handler's error value surfaced
+        // through the host bridge (errors cross as values, ADR-0012).
+        if let Some(msg) = first.as_str() {
+            anyhow::bail!("turn: provider stream failed to open: {msg}");
+        }
+        if first.get("done").and_then(Value::as_bool) == Some(true) {
+            anyhow::bail!(
+                "turn: provider stream failed to open: {}",
+                first
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no tokens")
+            );
+        }
+        let Some(calls) = first.get("item").and_then(|i| i.get("tool_calls")) else {
+            break; // a content stream — the pull face takes over
+        };
+        // Dispatch every call; feed the messages back; surface each
+        // result (the consumer's tool_result items ride the loop rounds
+        // through TOOL_RESULTS).
+        let parsed = gravity_core::tool::parse_tool_calls(&json!({ "tool_calls": calls }))
+            .context("turn: malformed tool calls from the provider")?;
+        let target_type = args
+            .get("tool_target")
             .and_then(Value::as_str)
-            .unwrap_or("no tokens");
-        anyhow::bail!("turn: provider stream failed to open: {msg}");
+            .unwrap_or("effector")
+            .to_string();
+        for call in parsed {
+            let result = ctx.invoke(
+                &target_type,
+                "",
+                &call.function.name,
+                call.function.arguments.clone(),
+            );
+            let content = match result {
+                Ok(v) => v.to_string(),
+                Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
+            };
+            let entry = json!({
+                "tool_result": { "tool_call_id": call.id, "content": content }
+            });
+            TOOL_RESULTS.lock().unwrap().push(entry);
+            // The fed-back wire shape: the assistant's call + the tool's
+            // result (OpenAI's loop contract).
+            messages.push(json!({ "role": "assistant", "tool_calls": calls }));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": content,
+            }));
+        }
+        // Reopen the provider with the fed-back messages (the next
+        // inference round); loop until it emits content.
+        first = ctx
+            .iterate_start(
+                "llm_provider",
+                "",
+                "stream",
+                json!({
+                    "endpoint": args.get("endpoint"),
+                    "model": args.get("model"),
+                    "key_env": args.get("key_env"),
+                    "messages": messages,
+                }),
+            )
+            .context("turn: provider re-open failed")?;
     }
+    // The loop must have ENDED on a content stream: the cap is the
+    // runaway stop, and a provider still asking for tools after it is a
+    // failed turn — never an empty first token.
+    anyhow::ensure!(
+        first
+            .get("item")
+            .and_then(|i| i.get("tool_calls"))
+            .is_none(),
+        "turn: the tool loop did not converge in 8 rounds — the provider kept requesting tools"
+    );
     let sid = first
         .get("stream_id")
         .and_then(Value::as_str)
@@ -245,6 +291,11 @@ static REPLY_PARTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::n
 /// The turn's own args, captured at Start (the pull handler's args are
 /// the guard's `{stream_id, round}` — the addressing rides state).
 static TURN_ARGS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+/// Tool results from the Start-face dispatch loop (the consumer sees
+/// the loop's progress — each surfaces as an envelope item before the
+/// content deltas).
+static TOOL_RESULTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
 
 /// The terminal round: append the one-ts-two-subs exchange, return the
 /// terminal envelope (the full reply as the value).

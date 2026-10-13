@@ -135,7 +135,6 @@ async fn drain_turn(engine: &Engine, store_url: &str, endpoint: &str, msg: &str)
             Err(_) => panic!("reply dropped"),
         };
         if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-            eprintln!("DEBUG terminal envelope: {v}");
             return deltas;
         }
         if stream_id.is_none() {
@@ -358,4 +357,208 @@ async fn client_errors_fail_through_without_retry() {
         1,
         "exactly one attempt — a 401 is not transient"
     );
+}
+
+/// Phase 2 e2e: the provider's stream carries a tool_call — the turn
+/// parses it and dispatches through ctx.invoke to a SIBLING booth (the
+/// tool target type, here effector's induction_loop fixture speaking
+/// the same pipe), and the tool result surfaces as the stream's own
+/// envelope item. The cross-repo fixture path is the standing
+/// convention (aura's exec_booth.rs does the same).
+#[tokio::test]
+async fn tool_call_dispatches_to_the_sibling_booth() {
+    // The provider answers the loop's TWO inference rounds the way a
+    // real endpoint does: the first request asks for the tool, the
+    // SECOND (the loop's re-open, carrying the fed-back result) answers
+    // content. A stub answering tool calls to every request can never
+    // converge — the dispatch loop would burn its whole round budget
+    // and the turn would die on an empty reply.
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_for_route = hits.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move || {
+            let n = hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                let mut sse = String::new();
+                if n == 0 {
+                    sse.push_str(
+                        r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"echo","arguments":"{\"x\":42}"}}]}}]}"#,
+                    );
+                } else {
+                    sse.push_str(r#"data: {"choices":[{"delta":{"content":"all good"}}]}"#);
+                }
+                sse.push_str("\n\ndata: [DONE]\n\n");
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{addr}");
+    let store_url = mem_server().await;
+    let engine = boot().await;
+    // The tool target's TYPE is the caller's declaration (the deployment
+    // fact) — registered under a non-default name so a turn that
+    // ignored `tool_target` would dispatch into nothing and answer an
+    // error instead of the echo.
+    register_tool_target(&engine, "tool_booth").await;
+
+    let mut args = turn_args(&store_url, &endpoint, "hi");
+    args["tool_target"] = serde_json::json!("tool_booth");
+    let slot = Realm::iterate(
+        &engine.realm,
+        IterateOp::Start {
+            target: InstanceId {
+                booth_type: TURN_TYPE.into(),
+                key: InstanceKey::Named("s1".into()),
+            },
+            handler: "turn".into(),
+            args,
+        },
+    )
+    .await
+    .unwrap();
+    let (mut rx, mut stream_id) = match slot {
+        CallSlot::Hot { rx, .. } => (rx, None),
+        _ => panic!("iterate is hot-only"),
+    };
+    let mut saw_tool_result = None;
+    loop {
+        let v = match rx.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => panic!("pull failed: {e}"),
+            Err(_) => panic!("reply dropped"),
+        };
+        if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+            break;
+        }
+        if stream_id.is_none() {
+            stream_id = Some(
+                v.get("stream_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        if let Some(tr) = v.get("item").and_then(|i| i.get("tool_result")) {
+            saw_tool_result = Some(tr.clone());
+        }
+        let id = stream_id.clone().unwrap();
+        match Realm::iterate(&engine.realm, IterateOp::Next { stream_id: id })
+            .await
+            .unwrap()
+        {
+            CallSlot::Hot { rx: next, .. } => rx = next,
+            _ => panic!("iterate is hot-only"),
+        }
+    }
+    let tr = saw_tool_result.expect("the tool result surfaced as an envelope item");
+    assert_eq!(tr["tool_call_id"], "c1");
+    // The fixture's echo handler wraps args: {"echoed": {"x": 42}}.
+    assert!(
+        tr["content"].to_string().contains("42"),
+        "the sibling booth answered through ctx.invoke: {tr}"
+    );
+    // One dispatch loop round: the provider saw the first request (the
+    // tool call) and exactly one re-open carrying the fed-back result —
+    // the second round answered content and let the pull face take over.
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the loop re-opened the provider exactly once"
+    );
+}
+
+/// Register the sibling tool target: effector's `induction_loop` fixture
+/// (its `echo` handler answers `{"echoed": args}`), speaking the same
+/// pipe. The cross-repo fixture path is the standing convention (aura's
+/// exec_booth.rs does the same) — built in ~/world/effector. The booth
+/// TYPE is the caller's declaration; the registered name is whatever the
+/// turn's `tool_target` arg names.
+async fn register_tool_target(engine: &Engine, booth_type: &str) {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../effector/target/debug/examples/induction_loop"
+    );
+    engine
+        .register(aura_booth::BoothType::script(
+            booth_type,
+            "induction",
+            fixture.to_string(),
+        ))
+        .await
+        .unwrap();
+}
+
+/// The dispatch loop's cap is a runaway stop, not a budget to spend
+/// quietly: a provider that answers tool calls to EVERY inference round
+/// never hands the turn a content stream, and the turn fails with a
+/// NAMED error — never an empty first token, never a stream that opens
+/// and then dies on an empty reply.
+#[tokio::test]
+async fn a_provider_that_never_stops_asking_for_tools_fails_the_turn() {
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(|| async {
+            let mut sse = String::new();
+            sse.push_str(
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"echo","arguments":"{\"x\":42}"}}]}}]}"#,
+            );
+            sse.push_str("\n\ndata: [DONE]\n\n");
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{addr}");
+    let store_url = mem_server().await;
+    let engine = boot().await;
+    // The default deployment fact: `tool_target` absent names `effector`.
+    register_tool_target(&engine, "effector").await;
+
+    let slot = Realm::iterate(
+        &engine.realm,
+        IterateOp::Start {
+            target: InstanceId {
+                booth_type: TURN_TYPE.into(),
+                key: InstanceKey::Named("s1".into()),
+            },
+            handler: "turn".into(),
+            args: turn_args(&store_url, &endpoint, "hi"),
+        },
+    )
+    .await
+    .unwrap();
+    // The failure rides the Start face's terminal envelope (ADR-0036
+    // §2: a handler that never opens a stream answers the invoke shape).
+    let v = match slot {
+        CallSlot::Hot { rx, .. } => match rx.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => panic!("the failure must ride as a value: {e}"),
+            Err(_) => panic!("reply dropped"),
+        },
+        _ => panic!("iterate is hot-only"),
+    };
+    assert!(
+        v.get("value")
+            .and_then(|s| s.as_str())
+            .map(|s| s.contains("did not converge"))
+            .unwrap_or(false),
+        "the round cap names itself: {v}"
+    );
+
+    // Nothing appended: a turn that never produced content is not an
+    // exchange (the oldest rule, through the loop's failure path).
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    let view = surface.fetch_session(7, 1).await.unwrap();
+    assert!(view.increment.is_empty(), "a failed turn appends nothing");
 }
