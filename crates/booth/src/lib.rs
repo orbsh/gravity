@@ -36,29 +36,43 @@ pub const PROVIDER_TYPE: &str = "llm_provider";
 /// The provider handler the turn stream opens.
 pub const PROVIDER_HANDLER: &str = "stream";
 
+/// The provider booth's default spawn spec (the source IS the argv for
+/// the `induction` language — ADR-0035 §2, the shellish-spawn contract).
+const PROVIDER_SPEC: &str = "gravity-provider";
+
+/// The turn booth's default spawn spec.
+const TURN_SPEC: &str = "gravity-turn";
+
 /// The provider booth spawn spec (the source IS the argv for the
 /// `induction` language — ADR-0035 §2, the shellish-spawn contract).
-pub const PROVIDER_SPEC: &str = "gravity-provider";
+/// Overridable per deployment via `GRAVITY_PROVIDER_BIN` (a test or a
+/// non-PATH install points at the absolute binary).
+pub fn provider_spec() -> String {
+    std::env::var("GRAVITY_PROVIDER_BIN").unwrap_or_else(|_| PROVIDER_SPEC.into())
+}
 
-/// The turn booth spawn spec.
-pub const TURN_SPEC: &str = "gravity-turn";
+/// The turn booth spawn spec (`GRAVITY_TURN_BIN` override, same rule).
+pub fn turn_spec() -> String {
+    std::env::var("GRAVITY_TURN_BIN").unwrap_or_else(|_| TURN_SPEC.into())
+}
 
 /// Register both booth types on an engine. The spawn specs name the two
 /// guest binaries (deployment installs them on PATH or beside the
-/// engine's cwd — the spec is argv, resolved by the carrier's spawn);
-/// the codec is the session's declared one, CBOR here (high-frequency
-/// small token frames — the self-delimited document form skips the
-/// per-frame JSON quoting overhead; both guests read the same env).
+/// engine's cwd — the spec is argv, resolved by the carrier's spawn;
+/// env overrides for non-PATH installs and tests); the codec is the
+/// session's declared one, CBOR here (high-frequency small token
+/// frames — the self-delimited document form skips the per-frame JSON
+/// quoting overhead; both guests read the same env).
 pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
     engine
         .register(
-            aura_booth::BoothType::script(PROVIDER_TYPE, "induction", PROVIDER_SPEC)
+            aura_booth::BoothType::script(PROVIDER_TYPE, "induction", provider_spec())
                 .encoded(aura_booth::Encoding::Cbor),
         )
         .await?;
     engine
         .register(
-            aura_booth::BoothType::script(TURN_TYPE, "induction", TURN_SPEC)
+            aura_booth::BoothType::script(TURN_TYPE, "induction", turn_spec())
                 .encoded(aura_booth::Encoding::Cbor),
         )
         .await?;

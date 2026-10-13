@@ -29,6 +29,10 @@ use serde_json::{json, Value};
 fn main() -> anyhow::Result<()> {
     Guest::new()
         .named("gravity-turn")
+        // The per-handler auth declaration (prism's gate reads it): the
+        // turn needs a bound user — the SAME declaration face the echo
+        // plane enforces, no second ACL table.
+        .auth(serde_json::json!({ "turn": true }))
         // The Start handler: `turn` is the name the realm's iterate job
         // addresses (the handler the submit names). It runs round 0 and
         // its reply opens the stream (a plain `done:false` envelope).
