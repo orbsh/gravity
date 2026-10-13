@@ -9,7 +9,7 @@ fn deltas(events: &[SseEvent]) -> Vec<String> {
         .iter()
         .filter_map(|e| match e {
             SseEvent::Delta(d) => Some(d.clone()),
-            SseEvent::Done => None,
+            _ => None,
         })
         .collect()
 }
@@ -61,4 +61,36 @@ fn malformed_payload_is_an_error_not_a_panic() {
     let mut d = SseDecoder::new();
     d.feed(b"data: not-json\n\n");
     assert!(d.decode().is_err());
+}
+
+#[test]
+fn tool_calls_ride_the_chunk() {
+    let mut d = SseDecoder::new();
+    d.feed(br#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"/x\"}"}}]}}]}"#);
+    d.feed(b"\n\ndata: [DONE]\n\n");
+    let mut events = Vec::new();
+    while let Some(e) = d.decode().unwrap() {
+        events.push(e);
+    }
+    assert_eq!(events.len(), 2);
+    match &events[0] {
+        SseEvent::ToolCalls(calls) => {
+            assert_eq!(calls[0]["id"], "c1");
+            assert_eq!(calls[0]["function"]["name"], "read_file");
+        }
+        other => panic!("expected tool calls, got {other:?}"),
+    }
+    assert!(matches!(events[1], SseEvent::Done));
+}
+
+#[test]
+fn a_chunk_without_tool_calls_yields_no_tool_event() {
+    let mut d = SseDecoder::new();
+    d.feed(br#"data: {"choices":[{"delta":{"content":"hi"}}]}"#);
+    d.feed(b"\n\n");
+    let mut events = Vec::new();
+    while let Some(e) = d.decode().unwrap() {
+        events.push(e);
+    }
+    assert!(matches!(events[0], SseEvent::Delta(_)));
 }

@@ -95,6 +95,12 @@ fn next_envelope(stream: &mut Stream) -> anyhow::Result<Value> {
         if let Some(ev) = stream.sse.decode()? {
             return Ok(match ev {
                 SseEvent::Delta(delta) => json!({ "done": false, "item": { "delta": delta } }),
+                // Tool calls ride the envelope verbatim — the TURN
+                // parses and dispatches them (the provider is transport,
+                // not policy).
+                SseEvent::ToolCalls(calls) => {
+                    json!({ "done": false, "item": { "tool_calls": calls } })
+                }
                 SseEvent::Done => json!({ "done": true }),
             });
         }

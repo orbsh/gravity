@@ -10,9 +10,14 @@ use anyhow::Context;
 use serde_json::Value;
 
 /// One decoded SSE event.
+#[derive(Debug)]
 pub enum SseEvent {
     /// A token delta (`choices[0].delta.content`).
     Delta(String),
+    /// A tool call the LLM emitted (`choices[0].delta.tool_calls` —
+    /// Phase 2's loop face; the arguments string rides verbatim, the
+    /// caller's tool module parses it once at the boundary).
+    ToolCalls(Value),
     /// The `[DONE]` sentinel — the stream's terminal.
     Done,
 }
@@ -56,6 +61,19 @@ impl SseDecoder {
                 }
                 let chunk: Value = serde_json::from_str(data)
                     .with_context(|| format!("llm: bad SSE payload: {data}"))?;
+                // Tool calls ride the chunk before content (a chunk
+                // carries either; some providers emit both in one —
+                // content first, calls second).
+                if let Some(calls) = chunk
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .and_then(|d| d.get("tool_calls"))
+                {
+                    if calls.is_array() && !calls.as_array().unwrap().is_empty() {
+                        return Ok(Some(SseEvent::ToolCalls(calls.clone())));
+                    }
+                }
                 if let Some(delta) = chunk
                     .get("choices")
                     .and_then(|c| c.get(0))

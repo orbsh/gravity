@@ -14,6 +14,7 @@
 
 pub mod llm;
 pub mod surface;
+pub mod tool;
 pub mod turn;
 
 /// One turn's input: the user message plus the addressing the memory

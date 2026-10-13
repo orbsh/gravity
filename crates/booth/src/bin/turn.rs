@@ -74,9 +74,46 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
         *PROVIDER_STREAM.lock().unwrap() = None;
         return Ok(reply);
     }
-    let delta = env
-        .get("item")
-        .and_then(|i| i.get("delta"))
+    let Some(item) = env.get("item") else {
+        anyhow::bail!("turn: non-terminal envelope carried no item");
+    };
+    // Tool calls from the LLM: parse, dispatch through ctx.invoke (the
+    // target rides the call verbatim — the tool list is the caller's),
+    // and surface each result as this stream's own envelope item. The
+    // transcript accounting is Phase 2.5's split — the loop keeps the
+    // wire flowing; the NEXT provider stream (opened by the finish
+    // path's next-turn cycle) carries the fed-back messages.
+    if let Some(calls) = item.get("tool_calls") {
+        let parsed = gravity_core::tool::parse_tool_calls(&json!({ "tool_calls": calls }))
+            .context("turn: malformed tool calls from the provider")?;
+        let mut out = Vec::new();
+        for call in parsed {
+            let result = ctx.invoke(
+                "effector",
+                "",
+                &call.function.name,
+                json!({
+                    "target": format!("effector:local:{}", call.function.name),
+                    "args": call.function.arguments,
+                }),
+            );
+            let content = match result {
+                Ok(v) => v.to_string(),
+                // Failure is a value into the next inference (the tool
+                // failed, not the turn — the loop continues).
+                Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
+            };
+            out.push(json!({
+                "tool_result": {
+                    "tool_call_id": call.id,
+                    "content": content,
+                }
+            }));
+        }
+        return Ok(json!({ "done": false, "item": out[0] }));
+    }
+    let delta = item
+        .get("delta")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
