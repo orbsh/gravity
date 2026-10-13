@@ -257,3 +257,105 @@ async fn failed_provider_pull_appends_nothing() {
     let view = surface.fetch_session(7, 1).await.unwrap();
     assert!(view.increment.is_empty(), "a failed turn appends nothing");
 }
+
+/// Transport-level retry (Phase 1): transient failures (503) are
+/// retried with constant backoff — the turn succeeds once the endpoint
+/// recovers; a client error (401) is NOT transient and fails through
+/// on the first attempt.
+#[tokio::test]
+async fn transient_endpoint_failures_are_retried() {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_for_route = hits.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move || {
+            let n = hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                } else {
+                    let mut sse = String::new();
+                    sse.push_str(r#"data: {"choices":[{"delta":{"content":"recovered"}}]}"#);
+                    sse.push_str("\n\ndata: [DONE]\n\n");
+                    axum::response::Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(axum::body::Body::from(sse))
+                        .unwrap()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{addr}");
+    let store_url = mem_server().await;
+    let engine = boot().await;
+
+    let deltas = drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    assert_eq!(deltas.join(""), "recovered", "the retry landed the stream");
+    assert!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "the provider actually retried"
+    );
+}
+
+#[tokio::test]
+async fn client_errors_fail_through_without_retry() {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_for_route = hits.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move || {
+            let n = hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                assert_eq!(n, 0, "a 401 must not be retried");
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::UNAUTHORIZED)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{addr}");
+    let store_url = mem_server().await;
+    let engine = boot().await;
+
+    let slot = Realm::iterate(
+        &engine.realm,
+        IterateOp::Start {
+            target: InstanceId {
+                booth_type: TURN_TYPE.into(),
+                key: InstanceKey::Named("s1".into()),
+            },
+            handler: "turn".into(),
+            args: turn_args(&store_url, &endpoint, "hi"),
+        },
+    )
+    .await
+    .unwrap();
+    let failed = match slot {
+        CallSlot::Hot { rx, .. } => match rx.await {
+            Ok(Err(_)) => true,
+            Ok(Ok(v)) => v
+                .get("value")
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains("rejected the request (401)"))
+                .unwrap_or(false),
+            Err(_) => false,
+        },
+        _ => panic!("hot-only"),
+    };
+    assert!(failed, "the 401 fails through");
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one attempt — a 401 is not transient"
+    );
+}

@@ -6,11 +6,12 @@
 //! HTTP is the only cross-process form.
 
 use anyhow::Context;
-use mem_core::channel::{ChannelStore, MessageKey, SessionView};
-
+/// The projection type rides the seam too (prompt assembly reads it).
+pub use mem_core::channel::SessionView;
 /// mem-core's single-member default, re-exported so drivers need no
 /// mem-core dependency for one constant.
 pub use mem_core::channel::DEFAULT_MEMBER;
+use mem_core::channel::{ChannelStore, MessageKey};
 
 /// One trait object per surface kind; the turn function takes
 /// `&dyn MemorySurface`. Methods mirror `ChannelStore`'s primitives

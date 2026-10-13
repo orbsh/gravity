@@ -102,6 +102,15 @@ fn next_envelope(stream: &mut Stream) -> anyhow::Result<Value> {
     }
 }
 
+/// Connection retry: constant backoff, a bounded attempt count. The
+/// transport-level resilience PLAN Phase 1 assigns to the provider —
+/// transient endpoint failures (connection refused, 502/503) retry;
+/// a 4xx (bad key, bad model) is NOT transient and fails through
+/// immediately (retrying a 401 is just delay). `done` is reported by
+/// the host's pull — the guest never sees it as an error to retry.
+const CONNECT_ATTEMPTS: u32 = 3;
+const CONNECT_BACKOFF_MS: u64 = 500;
+
 fn open_stream(args: &Value) -> anyhow::Result<Stream> {
     let endpoint = args
         .get("endpoint")
@@ -125,13 +134,32 @@ fn open_stream(args: &Value) -> anyhow::Result<Stream> {
 
     let url = format!("{endpoint}/chat/completions");
     let body = json!({ "model": model, "messages": messages, "stream": true });
-    let resp = ureq::post(&url)
-        .set("Authorization", &format!("Bearer {key}"))
-        .set("Content-Type", "application/json")
-        .send_string(&body.to_string())
-        .context("provider: LLM endpoint request failed")?;
-    Ok(Stream {
-        sse: SseDecoder::new(),
-        reader: resp.into_reader(),
-    })
+    let mut last_err = String::new();
+    for attempt in 0..CONNECT_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(CONNECT_BACKOFF_MS));
+        }
+        let resp = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {key}"))
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string());
+        match resp {
+            Ok(resp) => {
+                return Ok(Stream {
+                    sse: SseDecoder::new(),
+                    reader: resp.into_reader(),
+                });
+            }
+            Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) => {
+                // Client error: not transient — the pull fails through
+                // now (the consumer decides what a 401/404 means).
+                anyhow::bail!("provider: endpoint rejected the request ({code})");
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                eprintln!("[gravity-provider] connect attempt {attempt}: {last_err}");
+            }
+        }
+    }
+    anyhow::bail!("provider: endpoint unreachable after {CONNECT_ATTEMPTS} attempts: {last_err}")
 }
