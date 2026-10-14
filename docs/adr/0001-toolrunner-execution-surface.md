@@ -184,7 +184,7 @@ What the wire already provides (verified against the code, not assumed):
 - **k10r:** the script store, with gravity as its only client. The node never
   talks to it — the byte path is gravity → control path → node.
 - **prism:** one new piece of work — a mount-registration face. Per (alias ×
-  language) a `RemoteProbe` type whose source is the runner artifact.
+  operation language) a `RemoteProbe` type whose source is the runner artifact.
   `RemoteProbe` definitions are not persisted, so this is an idempotent
   registration per boot, and the dial-in `Frame::Register { node_alias,
   carriers }` already supplies the alias and the carrier set for the trigger.

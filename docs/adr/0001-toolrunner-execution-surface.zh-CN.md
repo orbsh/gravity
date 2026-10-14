@@ -139,7 +139,7 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
   形态走。
 - **k10r：** 脚本的家，且 gravity 是它唯一的客户；节点永不与它说话——字节路径是
   gravity → 控制路径 → 节点。
-- **prism：** 多出一件工作——mount 注册面。按 (别名 × 语言) 注册一个
+- **prism：** 多出一件工作——mount 注册面。按 (别名 × 操作语言) 注册一个
   `RemoteProbe` 类型，source 是那份 runner 部署件。`RemoteProbe` 定义不持久化，所以
   这是每次启动的幂等注册；拨入帧 `Frame::Register { node_alias, carriers }` 已经提供
   了别名与载具集，可作触发源。
