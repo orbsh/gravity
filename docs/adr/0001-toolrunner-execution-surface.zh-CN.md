@@ -101,13 +101,16 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
 
    状态：一次性形态两门语言都已落地（`deploy/runners/runner_nu.nu`、
    `deploy/runners/runner_py.py`），常驻形态已在 python 落地
-   （`deploy/runners/runner_py_guest.py`，JSON lines 的 induction guest 协议），且**驻留已端到端
-   证实**——同一 mount 两次调用，guest 作用域的 `STATE` 跨调用存活
-   （`prism/crates/prism/tests/runner_mount.rs`）。**尚未证实**的是远程 induction guest 的
-   **ctx 桥出口**：常驻 guest 里的一次 `ctx_invoke` 卡满 30 秒调用期限、没有回音，也就是说
-   链条——载具 `route_frame` → `HostBridge` → `Frame::Host` → prism 的
-   `host_wire::resolve_host_call`——中有一处没把答案带回来。复现方式：把那条断言加回
-   `runner_mount.rs`；在依赖常驻形态做任何触及记忆的事之前，先把它定位。
+   （`deploy/runners/runner_py_guest.py`，JSON lines 的 induction guest 协议），**驻留已端到端
+   证实**——同一 mount 两次调用，guest 作用域的 `STATE` 跨调用存活——并连同
+   **ctx 桥出口**一起证实：下发的脚本经宿主 realm 调到兄弟 mount 并取回它的值
+   （`prism/crates/prism/tests/runner_mount.rs`）。走到这一步定位并修掉了三处断点，每层一处：
+   guest 把 ctx 帧写进了下发脚本的 stdout 捕获缓冲而不是协议通道（父进程在等一行永远不来的
+   帧，脚本在等一个永远不会发出的回复，两边互等到调用期限）——协议通道必须骑在重定向之前
+   钉住的 fd 上；常驻会话留着**冷启动那次调用**的桥，于是后续调用带的是一个没人在等的
+   call id——桥是**逐调用**的数据，分发缝每次调用重新装一遍；拨入侧的读循环把宿主调用的
+   解析内联在里面等（它等的那个 call 的 `Frame::Result` 只有这个循环能读）——ctx 目标与调用
+   方同节点时（惯例情形）自锁到调用期限。读循环只管关联，解析是 spawn 出去的。
 
 ## 已考虑并否决
 

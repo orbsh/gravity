@@ -130,17 +130,24 @@ What the wire already provides (verified against the code, not assumed):
    process) is still NOT a runner form: it admits no process boundary.
 
    Status: the one-shot form is landed for BOTH languages
-   (`deploy/runners/runner_nu.nu`, `deploy/runners/runner_py.py`), and the
-   resident form is landed for python (`deploy/runners/runner_py_guest.py`,
-   the induction-guest protocol in JSON lines) with residency proven end to end
-   — two calls through one mount, guest-scope `STATE` surviving between them
-   (`prism/crates/prism/tests/runner_mount.rs`). NOT yet verified: the ctx
-   bridge OUT of a remote induction guest. A `ctx_invoke` from the resident
-   guest took the 30 s call deadline with no reply, so somewhere in the chain —
-   carrier `route_frame` → `HostBridge` → `Frame::Host` → prism's
-   `host_wire::resolve_host_call` — the answer does not come back. Reproduce by
-   restoring that assertion in `runner_mount.rs`; locate it before relying on
-   the resident form for anything that touches memory.
+   (`deploy/runners/runner_nu.nu`, `deploy/runners/runner_py.py`), the resident
+   form is landed for python (`deploy/runners/runner_py_guest.py`, the
+   induction-guest protocol in JSON lines) with residency proven end to end —
+   two calls through one mount, guest-scope `STATE` surviving between them —
+   and the ctx bridge OUT of a remote induction guest proven with it: a
+   delivered script calls a sibling mount through the host realm and gets its
+   value back (`prism/crates/prism/tests/runner_mount.rs`). Getting there cost
+   three located breaks, one per layer, all fixed: the guest wrote its ctx
+   frame into the delivered script's stdout capture buffer instead of the wire,
+   so the parent waited for a line that never came while the script waited for
+   a reply that was never sent (the protocol channel must ride fds pinned
+   before the redirect); a resident session kept the bridge of its cold-start
+   call, so later calls named a call id nobody was waiting on — the bridge is
+   per-CALL data and the dispatch seam re-arms it on every call; and the
+   dial-in reader loop resolved the host call inline, parking on a hot realm
+   call whose Result frame only that loop can read — a self-deadlock to the
+   deadline whenever the ctx target lives on the same node, which is the
+   ordinary case. The loop correlates; the resolution is spawned.
 
 ## Considered and rejected
 
