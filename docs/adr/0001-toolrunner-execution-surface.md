@@ -105,10 +105,12 @@ What the wire already provides (verified against the code, not assumed):
    node's bwrap policy exposes — not a routing one.) An operation's language is
    a property of the skill (its script is data, and data has a language) and
    gravity routes to the matching mount; the LLM never picks a carrier at call
-   time. Precision: the manifest's `language` names the CARRIER, while the
-   operation's language rides the mount's NAME by convention (a mount runs what
-   its runner runs — `runner_nu` / `runner_py`); making it a first-class
-   manifest field is open.
+   time. The manifest names BOTH axes, so the route is a MATCH rather than a
+   string sniff: `carrier` is the node facility the call runs in (the only axis
+   a node can lack, announced per connection), `language` is the operation
+   language the mount serves (what a skill's declared language is matched
+   against). A mount's name is just its type name — carrying the language in it
+   (the `runner_nu` / `runner_py` convention) is retired.
 8. **A runner per language; where the boundary matters, a process — and
    in-process evaluation decides who can be resident.** Two runner forms: the
    one-shot `exec` carrier (argv spec, request JSON on stdin, stdout read whole

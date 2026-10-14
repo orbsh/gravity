@@ -82,9 +82,11 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
    强制是结构性的、不是劝阻性的：没有 mount 的语言根本调不到，而没有任何数据路径能铸
    出 mount。（nu 脚本仍可能去调外部二进制——那是沙箱策略的事，即节点的 bwrap 政策
    暴露了什么，不是路由的事。）一个操作的语言是 **skill 的属性**（脚本是数据，数据带
-   语言），由 gravity 路由到对应 mount；LLM 永不在调用时选载具。精确一点：清单里的
-   `language` 指的是**载具**，而操作的语言按约定骑在 **mount 名**上（mount 跑的就是它
-   runner 跑的那门语言——`runner_nu` / `runner_py`）；把它升为清单的一等字段是仍开项。
+   语言），由 gravity 路由到对应 mount；LLM 永不在调用时选载具。清单把**两根轴都写出来**，
+   于是路由是"匹配"而不是"嗅字符串"：`carrier` = 这次调用在节点的哪个载具里跑（唯一一根
+   节点可能缺的轴，按连接自报），`language` = 这道 mount 服务哪个**操作语言**（skill 声明
+   的语言拿它匹配）。mount 名就是它的类型名——把语言塞进名字（`runner_nu` / `runner_py`
+   那套约定）已退役。
 8. **每语言一份 runner；需要边界的地方就是进程——而在进程内求值决定谁能常驻。** 两种
    runner 形态：一次性 `exec` 载具（argv 规格、请求 JSON 走 stdin、stdout 整体读出——
    没有帧、没有驻留、没有 ctx 桥），够跑无状态的系统操作，也是最容易部署的一种；以及
