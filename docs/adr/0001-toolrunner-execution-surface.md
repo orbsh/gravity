@@ -105,17 +105,29 @@ What the wire already provides (verified against the code, not assumed):
    node's bwrap policy exposes — not a routing one.) An operation's language is
    a property of the skill (its script is data, and data has a language) and
    gravity routes to the matching mount; the LLM never picks a carrier at call
-   time.
-8. **A runner per language; where the boundary matters, a process.** Two runner
-   forms: the one-shot `exec` carrier (argv spec, request JSON on stdin, stdout
-   read whole — no frames, no residency, no ctx bridge), which is enough for
-   stateless system operations and is the simplest thing that can be deployed;
-   and the resident `induction` carrier (a guest speaking the frame protocol,
-   carrying residency plus the ctx bridge), which has a nu fixture to start from
-   (`effector/crates/runtime/examples/induction_nu.nu`) and none for python — a
-   python guest/runner is a deployment artifact that does not exist yet. The
-   embedded python carrier (pyo3, in-process CPython) is NOT a runner form here:
-   it admits no process boundary and no sandbox.
+   time. Precision: the manifest's `language` names the CARRIER, while the
+   operation's language rides the mount's NAME by convention (a mount runs what
+   its runner runs — `runner_nu` / `runner_py`); making it a first-class
+   manifest field is open.
+8. **A runner per language; where the boundary matters, a process — and
+   in-process evaluation decides who can be resident.** Two runner forms: the
+   one-shot `exec` carrier (argv spec, request JSON on stdin, stdout read whole
+   — no frames, no residency, no ctx bridge), enough for stateless system
+   operations and the simplest thing to deploy; and the resident `induction`
+   carrier (a guest speaking the frame protocol, carrying residency plus the ctx
+   bridge), in which the delivered code would run in the guest's own process.
+   Verified: **that second form is not available in nu** — nu cannot evaluate a
+   runtime string in-process (`source` demands a parse-time-constant path, and
+   nu 0.116 has no `eval` command), so a nu guest could only shell out to a
+   child, and a child never sees the guest's ctx scope. In-process evaluation is
+   what puts residency within reach: python can — a guest process whose `exec`
+   runs the delivered script in its own scope, where the guest's ctx helpers are
+   visible — and nu cannot. So nu is the one-shot systems language
+   (`deploy/runners/runner_nu.nu`), python is one-shot today
+   (`deploy/runners/runner_py.py`) and the resident candidate once a python
+   guest exists, and that guest is a deployment artifact that does not exist
+   yet. The embedded python carrier (pyo3, in-process CPython in the node's own
+   process) is still NOT a runner form: it admits no process boundary.
 
 ## Considered and rejected
 

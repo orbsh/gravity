@@ -82,14 +82,22 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
    强制是结构性的、不是劝阻性的：没有 mount 的语言根本调不到，而没有任何数据路径能铸
    出 mount。（nu 脚本仍可能去调外部二进制——那是沙箱策略的事，即节点的 bwrap 政策
    暴露了什么，不是路由的事。）一个操作的语言是 **skill 的属性**（脚本是数据，数据带
-   语言），由 gravity 路由到对应 mount；LLM 永不在调用时选载具。
-8. **每语言一份 runner；需要边界的地方就是进程。** 两种 runner 形态：一次性 `exec`
-   载具（argv 规格、请求 JSON 走 stdin、stdout 整体读出——没有帧、没有驻留、没有 ctx
-   桥），够跑无状态的系统操作，也是最容易部署的一种；以及驻留的 `induction` 载具
-   （说帧协议的 guest，带驻留与 ctx 桥），nu 有现成 fixture 可起手
-   （`effector/crates/runtime/examples/induction_nu.nu`），python 没有——那份 python
-   guest/runner 是尚不存在的部署件。嵌入式 python 载具（pyo3，进程内 CPython）在这里
-   **不是**一种 runner 形态：它不容纳进程边界，也不容纳沙箱。
+   语言），由 gravity 路由到对应 mount；LLM 永不在调用时选载具。精确一点：清单里的
+   `language` 指的是**载具**，而操作的语言按约定骑在 **mount 名**上（mount 跑的就是它
+   runner 跑的那门语言——`runner_nu` / `runner_py`）；把它升为清单的一等字段是仍开项。
+8. **每语言一份 runner；需要边界的地方就是进程——而在进程内求值决定谁能常驻。** 两种
+   runner 形态：一次性 `exec` 载具（argv 规格、请求 JSON 走 stdin、stdout 整体读出——
+   没有帧、没有驻留、没有 ctx 桥），够跑无状态的系统操作，也是最容易部署的一种；以及
+   驻留的 `induction` 载具（说帧协议的 guest，带驻留与 ctx 桥），下发的代码会在
+   guest 自己的进程里跑。**已核实：第二种形态在 nu 里不存在**——nu 无法在进程内对一段
+   运行时字符串求值（`source` 要求路径是解析期常量，且 nu 0.116 没有 `eval` 命令），
+   所以 nu guest 只能 shell 出一个子进程，而子进程永远看不到 guest 的 ctx 作用域。
+   进程内求值正是常驻的前提：python 可以——guest 进程里的 `exec` 让下发脚本跑在自己的
+   作用域里，而 guest 的 ctx 辅助函数在那可见——nu 不行。于是 nu 是一次性系统语言
+   （`deploy/runners/runner_nu.nu`），python 今天是一次性
+   （`deploy/runners/runner_py.py`），并且是常驻形态的候选语言（等一份 python guest
+   存在；那份 guest 目前是尚不存在的部署件）。嵌入式 python 载具（pyo3，进程内 CPython
+   跑在节点自己的进程里）依旧**不是** runner 形态：它不容纳进程边界。
 
 ## 已考虑并否决
 
