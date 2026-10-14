@@ -99,6 +99,16 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
    存在；那份 guest 目前是尚不存在的部署件）。嵌入式 python 载具（pyo3，进程内 CPython
    跑在节点自己的进程里）依旧**不是** runner 形态：它不容纳进程边界。
 
+   状态：一次性形态两门语言都已落地（`deploy/runners/runner_nu.nu`、
+   `deploy/runners/runner_py.py`），常驻形态已在 python 落地
+   （`deploy/runners/runner_py_guest.py`，JSON lines 的 induction guest 协议），且**驻留已端到端
+   证实**——同一 mount 两次调用，guest 作用域的 `STATE` 跨调用存活
+   （`prism/crates/prism/tests/runner_mount.rs`）。**尚未证实**的是远程 induction guest 的
+   **ctx 桥出口**：常驻 guest 里的一次 `ctx_invoke` 卡满 30 秒调用期限、没有回音，也就是说
+   链条——载具 `route_frame` → `HostBridge` → `Frame::Host` → prism 的
+   `host_wire::resolve_host_call`——中有一处没把答案带回来。复现方式：把那条断言加回
+   `runner_mount.rs`；在依赖常驻形态做任何触及记忆的事之前，先把它定位。
+
 ## 已考虑并否决
 
 - **把 effector 集成进 gravity（进程内执行面）。** 它换来"单件发布"的内聚，代价是

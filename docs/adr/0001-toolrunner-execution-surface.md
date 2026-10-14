@@ -129,6 +129,19 @@ What the wire already provides (verified against the code, not assumed):
    yet. The embedded python carrier (pyo3, in-process CPython in the node's own
    process) is still NOT a runner form: it admits no process boundary.
 
+   Status: the one-shot form is landed for BOTH languages
+   (`deploy/runners/runner_nu.nu`, `deploy/runners/runner_py.py`), and the
+   resident form is landed for python (`deploy/runners/runner_py_guest.py`,
+   the induction-guest protocol in JSON lines) with residency proven end to end
+   — two calls through one mount, guest-scope `STATE` surviving between them
+   (`prism/crates/prism/tests/runner_mount.rs`). NOT yet verified: the ctx
+   bridge OUT of a remote induction guest. A `ctx_invoke` from the resident
+   guest took the 30 s call deadline with no reply, so somewhere in the chain —
+   carrier `route_frame` → `HostBridge` → `Frame::Host` → prism's
+   `host_wire::resolve_host_call` — the answer does not come back. Reproduce by
+   restoring that assertion in `runner_mount.rs`; locate it before relying on
+   the resident form for anything that touches memory.
+
 ## Considered and rejected
 
 - **Integrating effector into gravity (an in-process execution surface).** It
