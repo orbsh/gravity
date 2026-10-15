@@ -2,8 +2,8 @@
 
 > **语言：** [English](0001-toolrunner-execution-surface.md)（主文档） · [中文](0001-toolrunner-execution-surface.zh-CN.md)
 
-**状态：** Accepted（2026-10-14）。还没有任何实现落地；本记录固定的是各相位排队
-所依据的形态。
+**状态：** Accepted（2026-10-14）。该面当天即已落地——文末更新记录了落了什么、以及
+仍欠的那一件；下面的形态仍是各相位排队的依据。
 **日期：** 2026-10-14
 
 ## 背景
@@ -160,9 +160,36 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
   重做一遍，只换来省掉几个静态注册。清单的撰写与审核归**部署层**（ADR-0015：节点身份
   不是用户身份）；**谁能用哪个节点**归**应用层**（gravity 的 realm/实例键 + prism 的
   auth 门）。
-- **仍开：** prism 今天把 `Frame::Register.carriers` 丢掉了
-  （`crates/prism/src/effectors.rs` 里的 `_(carriers)`），所以"语言 ↔ 节点"这条事实
-  还没有落点——要么在节点清单里声明，要么把载具集接进注册与路由。
+- **已闭合（2026-10-14）：** prism 的 mount 声明两个轴都写了，拨入路径也会比对——帧里
+  宣告的载具集与声明所声称的那份相比（`prism/src/mounts.rs::dial_in_note`），"语言 ↔
+  节点"这条事实因此有了落点。至今仍不是**文件**形态的是**节点自己的**清单：挂载清单是
+  编译期声明，节点那一半是它的 effector config。
+
+## 更新（2026-10-14）：该面已落地，仍欠一件
+
+上面的裁决写在它存在之前，而当天它大半成了事实。已落地：prism 的 mount 注册面
+（`prism/src/mounts.rs` —— `MountDecl`/`PRISM_MOUNTS`/`register_all`，启动时幂等重放，
+因为 `RemoteProbe` 定义不持久化）、三份 runner 部署件
+（`effector/deploy/runners/runner_nu.nu`、`runner_py.py`、`runner_py_guest.py`），以及
+第 8 条裁决在 python 上的常驻形态——`runner_py_guest.py` 是一个 induction guest，跨调用
+的驻留成立，且从它出去的 ctx bridge 端到端验证过：交付的脚本经宿主场域调用兄弟 mount
+并拿回它的值（`prism/crates/prism/tests/runner_mount.rs`）。路上定位并修掉三处断点，每层
+一处——guest 的协议帧走了 `sys.stdout`，而交付脚本的包装器正把 stdout 重定向进结果捕获
+（线的 fd 在重定向之前就已钉死）；常驻会话留着冷启动那次调用的 bridge，于是后续调用报出
+一个没人在等的 call id（bridge 是**按调用**的数据，由分派缝在每次调用时重挂）；dial-in
+读取循环内联解析 host 调用，停在一个只有它自己能读到 Result 帧的兄弟调用上——目标就在
+同一节点时（也就是通常情况）自锁到超时。第三处就是 aura 当前 HEAD（`4992e8e`）动
+`crates/engine/src/effectors.rs` 的原因。
+
+节点侧的 containment 半边落在 effector（effector ADR-0001）：牢笼由节点自己声明的
+`CapabilitySurface` 构建（`fs_scope` 作写范围、`deny_read`、`cwd`），`config.sandbox` 就是
+这里清单行所假定的那个开关，而没有执法点的声明会让启动失败。
+
+仍欠：gravity 自己的调用点。今天既没有 skill search，也没有
+`invoke(mount, key, entry, args{code, args})`——turn 仍以裁决前的形态
+`ctx.invoke(tool_target, …)` 分派到名为 `effector` 的摊位类型
+（`crates/booth/src/bin/turn.rs`）。它等两件事：k10r 提供脚本字节，以及动态写出代码的
+语言默认值裁决。
 
 ## 相关记录
 

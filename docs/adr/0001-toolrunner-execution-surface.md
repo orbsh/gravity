@@ -2,8 +2,9 @@
 
 > **Languages:** [English](0001-toolrunner-execution-surface.md) (primary) · [中文](0001-toolrunner-execution-surface.zh-CN.md)
 
-**Status:** Accepted (2026-10-14). Nothing is implemented yet; this record fixes
-the shape the phases are sequenced against.
+**Status:** Accepted (2026-10-14). The surface itself landed the same day — the
+Update at the end records what, and the one piece still owed; the shape below is
+what the phases are sequenced against.
 **Date:** 2026-10-14
 
 ## Context
@@ -212,10 +213,45 @@ What the wire already provides (verified against the code, not assumed):
   the deploy layer (ADR-0015: node identity is not user identity); *who may use
   which node* belongs to the application layer (gravity's realms/instance keys
   plus prism's auth gate).
-- **Open:** prism discards `Frame::Register.carriers` today (`_(carriers)` in
-  `crates/prism/src/effectors.rs`), so the language↔node fact has no home yet —
-  either declare it in the node manifest or wire the carrier set into
-  registration and routing.
+- **Closed 2026-10-14:** prism's mount declaration names both axes and the
+  dial-in path checks them — the carrier set the frame announces is compared
+  against the set the declaration claims (`prism/src/mounts.rs::dial_in_note`),
+  so the language↔node fact has a home. What is still nowhere a FILE is the
+  *node's* manifest: the mount list is a compiled-in declaration, and the node's
+  own half is its effector config.
+
+## Update (2026-10-14): the surface landed; one piece is owed
+
+The ruling above was written before any of it existed, and the same day carried
+most of it. Landed: prism's mount-registration face (`prism/src/mounts.rs` —
+`MountDecl`/`PRISM_MOUNTS`/`register_all`, replayed at boot because
+`RemoteProbe` definitions do not persist), the three runner artifacts
+(`effector/deploy/runners/runner_nu.nu`, `runner_py.py`, `runner_py_guest.py`),
+and ruling 8's resident form for python — `runner_py_guest.py` is an induction
+guest whose residency holds across calls, and the ctx bridge OUT of it is proven
+end to end: a delivered script calls a sibling mount through the host realm and
+gets its value back (`prism/crates/prism/tests/runner_mount.rs`). Three breaks
+were located and fixed on the way, one per layer — the guest's protocol frames
+rode `sys.stdout`, which the delivered-script wrapper redirects into its result
+capture (the wire fds are pinned before the redirect); a resident session kept
+the bridge of its cold-start call, so later calls named a call id nobody waited
+on (the bridge is per-CALL data, re-armed by the dispatch seam); and the dial-in
+reader loop resolved host calls inline, parking on a sibling call whose Result
+frame only that loop can read — a self-deadlock to the deadline in the ordinary
+case where the ctx target lives on the same node. That third break is why aura's
+HEAD (`4992e8e`) touches `crates/engine/src/effectors.rs`.
+
+The node-side containment half landed in the effector (effector ADR-0001): the
+jail is built from the node's own `CapabilitySurface` (`fs_scope` as write scope,
+`deny_read`, `cwd`), `config.sandbox` is the switch the manifest line here
+assumed, and a declaration with no enforcement point fails the startup.
+
+Owed: gravity's own call site. No skill search and no
+`invoke(mount, key, entry, args{code, args})` exists yet — the turn still
+dispatches `ctx.invoke(tool_target, …)` to a booth type named `effector`, the
+pre-ruling shape (`crates/booth/src/bin/turn.rs`). It waits on two things: k10r
+serving the script bytes, and a ruling for the language default of dynamically
+written code.
 
 ## Related records
 
