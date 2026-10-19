@@ -1227,7 +1227,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3068,7 +3068,7 @@ dependencies = [
 [[package]]
 name = "okm-core"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#bd023aa15aeb70b4b74ca997db84dd13dd08da52"
+source = "git+https://github.com/orbsh/okm?branch=main#6e6691a9da10d28ac36c16a561eae1106c62f41e"
 dependencies = [
  "fjall",
  "okm-derive 0.1.0 (git+https://github.com/orbsh/okm?branch=main)",
@@ -3098,7 +3098,7 @@ dependencies = [
 [[package]]
 name = "okm-derive"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#bd023aa15aeb70b4b74ca997db84dd13dd08da52"
+source = "git+https://github.com/orbsh/okm?branch=main#6e6691a9da10d28ac36c16a561eae1106c62f41e"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -3120,7 +3120,7 @@ dependencies = [
 [[package]]
 name = "okm-dynamic"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#bd023aa15aeb70b4b74ca997db84dd13dd08da52"
+source = "git+https://github.com/orbsh/okm?branch=main#6e6691a9da10d28ac36c16a561eae1106c62f41e"
 dependencies = [
  "okm-core 0.1.0 (git+https://github.com/orbsh/okm?branch=main)",
 ]
@@ -3159,7 +3159,7 @@ dependencies = [
 [[package]]
 name = "okm-wire"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#bd023aa15aeb70b4b74ca997db84dd13dd08da52"
+source = "git+https://github.com/orbsh/okm?branch=main#6e6691a9da10d28ac36c16a561eae1106c62f41e"
 
 [[package]]
 name = "okm-wire"
@@ -3556,7 +3556,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3920,7 +3920,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3979,7 +3979,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4686,7 +4686,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
