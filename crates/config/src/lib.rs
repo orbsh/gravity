@@ -26,6 +26,13 @@ pub struct GravityConfig {
     /// form, ADR-0007 as revised 2026-10-10).
     pub store_path: Option<String>,
     pub store_url: Option<String>,
+    /// How k10r should render the memory it hands back (ADR-0010 §5):
+    /// `plaintext` (the default), `markdown`, `mermaid`. `struct` is NOT
+    /// accepted — it returns the fact data for a caller that assembles the
+    /// graph itself, and this executor injects k10r's rendering instead; a
+    /// config carrying it is refused when the turn surface is built
+    /// (`MemoryFormat::from_config`, gravity-core).
+    pub memory_format: Option<String>,
 }
 
 impl GravityConfig {

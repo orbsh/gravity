@@ -7,14 +7,30 @@
 
 use gravity_core::llm::WireMessage;
 use gravity_core::surface::{InProcessSurface, MemorySurface};
-use mem_core::channel::{kind, role, ChannelStore};
+use mem_core::channel::{kind, role};
+use mem_core::FactTuple;
+
+/// The head's corpus: one fact about the default user node (node 1 of
+/// scope 1), so the head block participates in the byte comparison.
+fn user_fact() -> FactTuple {
+    FactTuple::from_json(r#"["用户","person",{},"PREFERS",{},"简洁","style",{}]"#).unwrap()
+}
 
 /// The prompt assembly, verbatim from the seam test's stub (the real
 /// `turn()` collapses this when Phase 1's injectable transport lands —
 /// until then the copy IS the contract under test; the assertion below
 /// pins what "stable" means for whoever reimplements it).
-fn assemble(view: &gravity_core::surface::SessionView, user_message: &str) -> Vec<WireMessage> {
+fn assemble(
+    view: &gravity_core::surface::SessionProjection,
+    user_message: &str,
+) -> Vec<WireMessage> {
     let mut messages: Vec<WireMessage> = Vec::new();
+    if !view.head.is_empty() {
+        messages.push(WireMessage {
+            role: "system".into(),
+            content: view.head.clone(),
+        });
+    }
     if let Some(summary) = &view.summary {
         messages.push(WireMessage {
             role: "system".into(),
@@ -23,7 +39,7 @@ fn assemble(view: &gravity_core::surface::SessionView, user_message: &str) -> Ve
     }
     for (_, row) in &view.increment {
         messages.push(WireMessage {
-            role: wire_role(row.role).to_string(),
+            role: row.role.clone().unwrap_or_else(|| "user".into()),
             content: row.content.clone(),
         });
     }
@@ -32,15 +48,6 @@ fn assemble(view: &gravity_core::surface::SessionView, user_message: &str) -> Ve
         content: user_message.to_string(),
     });
     messages
-}
-
-fn wire_role(role: u8) -> &'static str {
-    match role {
-        mem_core::channel::role::ASSISTANT => "assistant",
-        mem_core::channel::role::TOOL => "tool",
-        mem_core::channel::role::SYSTEM => "system",
-        _ => "user",
-    }
 }
 
 fn render(messages: &[WireMessage]) -> String {
@@ -54,7 +61,13 @@ fn render(messages: &[WireMessage]) -> String {
 #[tokio::test]
 async fn same_state_assembles_byte_identical_views() {
     let dir = tempfile::TempDir::new().unwrap();
-    let surface = InProcessSurface::open(dir.path()).unwrap();
+    let mut stores = mem_core::open_service(dir.path()).unwrap();
+    stores.graph.ingest(1, &user_fact()).unwrap();
+    let surface = InProcessSurface::wrap(stores);
+    assert!(
+        !surface.fetch_session(7, 1).await.unwrap().head.is_empty(),
+        "the head is part of the bytes under test"
+    );
 
     // A conversation with every role the assembly maps (user, assistant,
     // tool) — the richest stable view.
@@ -90,6 +103,23 @@ async fn same_state_assembles_byte_identical_views() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let http = gravity_core::surface::HttpSurface::new(&format!("http://{addr}"));
+    let status = reqwest::Client::new()
+        .post(format!("http://{addr}/facts/1"))
+        .json(&serde_json::json!([
+            "用户",
+            "person",
+            {},
+            "PREFERS",
+            {},
+            "简洁",
+            "style",
+            {}
+        ]))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::OK);
     http.append_message(7, 100, 0, role::USER, kind::TEXT, "first question")
         .await
         .unwrap();
@@ -151,12 +181,19 @@ async fn checkpoint_compression_rewrites_the_view_deliberately() {
     // mem-core call — gravity never writes checkpoints; this stands in
     // for Krystallizer's compression side.)
     let dir = tempfile::TempDir::new().unwrap();
-    let mut store = ChannelStore::open(&dir.path().join("s")).unwrap();
-    store.append(7, 100, 0, role::USER, kind::TEXT, "old q");
-    store.append(7, 100, 1, role::ASSISTANT, kind::TEXT, "old a");
-    store.append(7, 200, 0, role::USER, kind::TEXT, "new q");
-
-    let surface = InProcessSurface::wrap(store);
+    let surface = InProcessSurface::open(dir.path()).unwrap();
+    surface
+        .append_message(7, 100, 0, role::USER, kind::TEXT, "old q")
+        .await
+        .unwrap();
+    surface
+        .append_message(7, 100, 1, role::ASSISTANT, kind::TEXT, "old a")
+        .await
+        .unwrap();
+    surface
+        .append_message(7, 200, 0, role::USER, kind::TEXT, "new q")
+        .await
+        .unwrap();
     let before = surface.fetch_session(7, 1).await.unwrap();
     let p_before = render(&assemble(&before, "next"));
 
@@ -164,9 +201,11 @@ async fn checkpoint_compression_rewrites_the_view_deliberately() {
     // SAME directory (InProcessSurface holds the store; a second open
     // would contend on the fjall lock — so drop and reopen).
     drop(surface);
-    let mut store2 = ChannelStore::open(&dir.path().join("s")).unwrap();
-    store2.append_checkpoint(7, 1, 100, "compressed summary");
-    let surface2 = InProcessSurface::wrap(store2);
+    let mut stores = mem_core::open_service(dir.path()).unwrap();
+    stores
+        .channels
+        .append_checkpoint(7, 1, 100, "compressed summary");
+    let surface2 = InProcessSurface::wrap(stores);
     let after = surface2.fetch_session(7, 1).await.unwrap();
     let p_after = render(&assemble(&after, "next"));
 

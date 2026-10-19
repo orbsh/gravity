@@ -32,14 +32,22 @@ pub async fn turn(
     let channel_id = input.channel_id;
     let member_id = input.member_id;
 
-    // 1. Fetch the session projection (checkpoint + increment).
+    // 1. Fetch the session projection (head + checkpoint + increment).
     let view = store.fetch_session(channel_id, member_id).await?;
 
-    // 2. Assemble the prompt: summary (if any) as a system preamble,
-    // then the increment as the conversation, then the user message.
-    // Prompt-view byte stability is Phase 1's contract test — Phase 0
-    // just builds a sane list.
+    // 2. Assemble the prompt: the head first (initialization memory, the
+    // long-horizon layer k10r rendered), then the summary (if any) as a
+    // system preamble, then the increment as the conversation, then the
+    // user message. Prompt-view byte stability is Phase 1's contract test —
+    // Phase 0 just builds a sane list. Nothing is prepended to the head: it
+    // IS k10r's rendering, and a second wrapper would be gravity's voice.
     let mut messages: Vec<WireMessage> = Vec::new();
+    if !view.head.is_empty() {
+        messages.push(WireMessage {
+            role: "system".into(),
+            content: view.head.clone(),
+        });
+    }
     if let Some(summary) = &view.summary {
         messages.push(WireMessage {
             role: "system".into(),
@@ -48,7 +56,10 @@ pub async fn turn(
     }
     for (_, row) in &view.increment {
         messages.push(WireMessage {
-            role: wire_role(row.role).to_string(),
+            // k10r resolved the stored code to the LLM role name; a code it
+            // does not police arrives as None and reads as the user's turn
+            // (the same fallback the wire had before the name moved).
+            role: row.role.clone().unwrap_or_else(|| "user".into()),
             content: row.content.clone(),
         });
     }
@@ -77,16 +88,4 @@ pub async fn turn(
         .await?;
 
     Ok(TurnOutput { reply })
-}
-
-/// Storage role byte → wire role string. The mapping lives here, at the
-/// seam where krystallizer's storage currency meets the LLM wire — the
-/// storage layer stores the byte, this function interprets it.
-fn wire_role(role: u8) -> &'static str {
-    match role {
-        mem_core::channel::role::ASSISTANT => "assistant",
-        mem_core::channel::role::TOOL => "tool",
-        mem_core::channel::role::SYSTEM => "system",
-        _ => "user",
-    }
 }

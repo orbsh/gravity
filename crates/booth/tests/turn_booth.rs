@@ -192,9 +192,9 @@ async fn stream_appends_the_exchange_after_done() {
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
     let view = surface.fetch_session(7, 1).await.unwrap();
     assert_eq!(view.increment.len(), 2);
-    assert_eq!(view.increment[0].1.role, mem_core::channel::role::USER);
+    assert_eq!(view.increment[0].1.role.as_deref(), Some("user"));
     assert_eq!(view.increment[0].1.content, "hi");
-    assert_eq!(view.increment[1].1.role, mem_core::channel::role::ASSISTANT);
+    assert_eq!(view.increment[1].1.role.as_deref(), Some("assistant"));
     assert_eq!(view.increment[1].1.content, "hello");
     assert_eq!(
         view.increment[0].0.ts_ms, view.increment[1].0.ts_ms,

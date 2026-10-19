@@ -1,13 +1,17 @@
 //! Turn-loop tests with a stubbed LLM: the same assertions run against
-//! BOTH memory surfaces — in-process (real ChannelStore on a temp dir)
-//! and HTTP (real mem-server on a local port) — pinning the seam
-//! contract: the turn function must not behave differently across the
-//! deployment forms.
+//! BOTH memory surfaces — in-process (real stores on a temp dir) and HTTP
+//! (real mem-server on a local port) — pinning the seam contract: the turn
+//! function must not behave differently across the deployment forms.
+//!
+//! The projection the seam hands out is k10r's own (ADR-0010 §5): the head
+//! arrives RENDERED, and an increment entry carries the LLM role NAME. Both
+//! surfaces must produce the same one — that is what the head test drives.
 
 use gravity_core::llm::WireMessage;
 use gravity_core::surface::{InProcessSurface, MemorySurface};
 use gravity_core::TurnInput;
-use mem_core::channel::{kind, role, ChannelStore};
+use mem_core::channel::{kind, role};
+use mem_core::FactTuple;
 
 /// The turn body, parameterized over the reply — a test-local copy so
 /// the LLM call is stubbed while the memory-seam behavior (fetch →
@@ -28,6 +32,12 @@ async fn turn_with(
         .await?;
 
     let mut messages: Vec<WireMessage> = Vec::new();
+    if !view.head.is_empty() {
+        messages.push(WireMessage {
+            role: "system".into(),
+            content: view.head.clone(),
+        });
+    }
     if let Some(summary) = &view.summary {
         messages.push(WireMessage {
             role: "system".into(),
@@ -36,7 +46,7 @@ async fn turn_with(
     }
     for (_, row) in &view.increment {
         messages.push(WireMessage {
-            role: wire_role(row.role).to_string(),
+            role: row.role.clone().unwrap_or_else(|| "user".into()),
             content: row.content.clone(),
         });
     }
@@ -66,15 +76,6 @@ async fn turn_with(
         .append_message(input.channel_id, ts, 1, role::ASSISTANT, kind::TEXT, &reply)
         .await?;
     Ok(reply)
-}
-
-fn wire_role(role: u8) -> &'static str {
-    match role {
-        mem_core::channel::role::ASSISTANT => "assistant",
-        mem_core::channel::role::TOOL => "tool",
-        mem_core::channel::role::SYSTEM => "system",
-        _ => "user",
-    }
 }
 
 /// Shared assertions over any surface: success appends the delta with
@@ -122,18 +123,12 @@ async fn seam_contract(store: &dyn MemorySurface) {
     );
     assert_eq!(view.increment[0].0.sub, 0);
     assert_eq!(view.increment[1].0.sub, 1);
-    assert_eq!(view.increment[0].1.role, role::USER);
+    // The role NAME is k10r's mapping — the seam never sees the stored byte.
+    assert_eq!(view.increment[0].1.role.as_deref(), Some("user"));
+    assert_eq!(view.increment[1].1.role.as_deref(), Some("assistant"));
     assert_eq!(view.increment[0].1.kind, kind::TEXT);
     assert_eq!(view.increment[0].1.content, "hi");
     assert_eq!(view.increment[1].1.content, "hello!");
-
-    // The projection feeds prompt assembly: roles map to wire strings.
-    let roles: Vec<&str> = view
-        .increment
-        .iter()
-        .map(|(_, r)| wire_role(r.role))
-        .collect();
-    assert_eq!(roles, vec!["user", "assistant"]);
 }
 
 #[tokio::test]
@@ -157,19 +152,91 @@ async fn http_surface_contract() {
     seam_contract(&surface).await;
 }
 
+/// The head is TEXT, rendered by k10r, on BOTH surfaces: the same corpus
+/// answers the same block, and the block is the user node's one fact.
+///
+/// This is the contract that broke when the projection's head stopped being
+/// a fact array (2026-10-20) — a caller that decoded it as data (or that
+/// tried to render it itself) is exactly what these assertions catch.
+#[tokio::test]
+async fn head_is_rendered_by_both_surfaces() {
+    let tuple =
+        || FactTuple::from_json(r#"["用户","person",{},"PREFERS",{},"简洁","style",{}]"#).unwrap();
+
+    // In-process: the fact lands through the service's own graph handle
+    // (the surface has no ingest — that is the caller's write door).
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut stores = mem_core::open_service(dir.path()).unwrap();
+    stores.graph.ingest(1, &tuple()).unwrap();
+    let in_process = InProcessSurface::wrap(stores);
+    let local = in_process
+        .fetch_session(7, gravity_core::surface::DEFAULT_MEMBER)
+        .await
+        .unwrap();
+
+    // HTTP: the same corpus through the door.
+    let dir2 = tempfile::TempDir::new().unwrap();
+    let app = mem_server::open(dir2.path().to_path_buf()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let base = format!("http://{addr}");
+    let status = reqwest::Client::new()
+        .post(format!("{base}/facts/1"))
+        .json(&serde_json::json!([
+            "用户",
+            "person",
+            {},
+            "PREFERS",
+            {},
+            "简洁",
+            "style",
+            {}
+        ]))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let http = gravity_core::surface::HttpSurface::new(&base);
+    let remote = http
+        .fetch_session(7, gravity_core::surface::DEFAULT_MEMBER)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        local.head, remote.head,
+        "both surfaces hand back k10r's rendering, byte for byte"
+    );
+    assert!(
+        local.head.contains("用户 (person) -[PREFERS]-> 简洁"),
+        "the head renders the user node's fact: {}",
+        local.head
+    );
+}
+
 /// The checkpoint path rides the same seam: a summary set through the
-/// in-process store shows up in the HTTP-fetched view's summary field
-/// and prunes the increment (the mem-server side's own tests cover the
-/// wire; this covers the seam's decode into SessionView).
+/// in-process store shows up in the view's summary field and prunes the
+/// increment.
 #[tokio::test]
 async fn checkpoint_flows_through_surface() {
     let dir = tempfile::TempDir::new().unwrap();
-    let mut store = ChannelStore::open(&dir.path().join("s")).unwrap();
-    store.append(3, 100, 0, role::USER, kind::TEXT, "old");
-    store.append(3, 200, 0, role::USER, kind::TEXT, "new");
-    store.append_checkpoint(3, gravity_core::surface::DEFAULT_MEMBER, 100, "compressed");
+    let surface = InProcessSurface::open(dir.path()).unwrap();
+    for (ts, content) in [(100u64, "old"), (200, "new")] {
+        surface
+            .append_message(3, ts, 0, role::USER, kind::TEXT, content)
+            .await
+            .unwrap();
+    }
+    drop(surface);
 
-    let surface = InProcessSurface::wrap(store);
+    // The compression side's write: a fresh handle on the SAME directory
+    // (Fjall locks it, so the surface must be dropped first).
+    let mut stores = mem_core::open_service(dir.path()).unwrap();
+    stores
+        .channels
+        .append_checkpoint(3, gravity_core::surface::DEFAULT_MEMBER, 100, "compressed");
+    let surface = InProcessSurface::wrap(stores);
     let view = surface
         .fetch_session(3, gravity_core::surface::DEFAULT_MEMBER)
         .await

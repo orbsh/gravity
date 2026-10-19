@@ -9,12 +9,12 @@ Pure Rust. The booth face runs as induction guest processes (stdio pipe protocol
 One turn = one execution:
 
 ```
-fetch_session(session_id) -> SessionView   // full mode, from Krystallizer
+fetch_session(channel, member) -> SessionProjection  // head (rendered by k10r) + checkpoint + increment
 run LLM + tool-call loop                   // skill execution via Probe
 append(session_id, delta)                  // only the new messages
 ```
 
-Stateless between turns: no resident loop, no session state in memory. Compression is invisible here — when Krystallizer's fetched view carries a trailing compression prompt, Gravity just runs it; memory tool calls flow back and Krystallizer handles them on append. Active compression (upstream slowdown, user idle) calls `summarize` and ends the turn without a normal reply.
+Stateless between turns: no resident loop, no session state in memory. Compression is NOT wired yet, and Gravity has no door that requests one: k10r owns the verdict (the trigger is evaluated at the projection read and arrives with it), and the caller's half is running the summary turn out of band and handing the text back through the existing checkpoint door. Memory reads are k10r's doors; the head arrives already rendered.
 
 ## Layout
 

@@ -4,24 +4,119 @@
 //! this trait, invisible to the turn loop. In-process linking is a
 //! local same-machine implementation detail, NOT a second access mode;
 //! HTTP is the only cross-process form.
+//!
+//! **The seam's currency is the PROJECTION k10r hands out, not storage
+//! rows.** k10r renders (ADR-0010 §5): the head arrives as text in the
+//! format the deployment asked for, and an increment entry arrives with the
+//! LLM role NAME already resolved — the mapping from the stored code is
+//! k10r's side of the wire (ADR-0008 §2). Gravity renders nothing about the
+//! graph: it never assembles a head fact list, a slice or a community.
 
 use anyhow::Context;
-/// The projection type rides the seam too (prompt assembly reads it).
-pub use mem_core::channel::SessionView;
+use mem_core::channel::MessageKey;
 /// mem-core's single-member default, re-exported so drivers need no
 /// mem-core dependency for one constant.
 pub use mem_core::channel::DEFAULT_MEMBER;
-use mem_core::channel::{ChannelStore, MessageKey};
+
+/// How k10r represents a memory answer (ADR-0010 §5).
+///
+/// `struct` is deliberately NOT a variant: it hands back the fact DATA for a
+/// consumer that assembles the graph itself, and the turn executor does no
+/// such assembly — the renderer is k10r's. A deployment that configures
+/// `struct` is a configuration error, surfaced at once ([`Self::from_config`])
+/// rather than discovered as a decode failure on the first turn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MemoryFormat {
+    /// The line form — the default, and what a prompt wants.
+    #[default]
+    Plaintext,
+    /// Headings and bullets.
+    Markdown,
+    /// A `graph LR` diagram; readable by a human, not a prompt.
+    Mermaid,
+}
+
+impl MemoryFormat {
+    /// Parse a configured value. Absent means the default; `struct` is
+    /// refused BY NAME with the reason, because the executor cannot use it.
+    pub fn from_config(raw: Option<&str>) -> anyhow::Result<Self> {
+        match raw {
+            None => Ok(Self::default()),
+            Some("plaintext") => Ok(Self::Plaintext),
+            Some("markdown") => Ok(Self::Markdown),
+            Some("mermaid") => Ok(Self::Mermaid),
+            Some("struct") => anyhow::bail!(
+                "memory format `struct` is not usable by the turn executor: it returns \
+                 the fact data for a caller that assembles the graph itself, and gravity \
+                 injects k10r's rendering"
+            ),
+            Some(other) => anyhow::bail!(
+                "unknown memory format `{other}` — expected plaintext / markdown / mermaid"
+            ),
+        }
+    }
+
+    /// The wire value, as k10r spells it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Plaintext => "plaintext",
+            Self::Markdown => "markdown",
+            Self::Mermaid => "mermaid",
+        }
+    }
+
+    /// mem-core's own format token — the in-process surface renders through
+    /// the same functions the HTTP answer came from.
+    fn render(self) -> mem_core::RenderFormat {
+        match self {
+            Self::Plaintext => mem_core::RenderFormat::Plaintext,
+            Self::Markdown => mem_core::RenderFormat::Markdown,
+            Self::Mermaid => mem_core::RenderFormat::Mermaid,
+        }
+    }
+}
+
+/// One increment entry as the projection carries it: the key the message
+/// lives under, the LLM role NAME (k10r's mapping), the kind byte and the
+/// content. `role` is `None` for a stored code k10r does not police — a
+/// writer's bug, which the turn loop surfaces by falling back to `user`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewRow {
+    pub role: Option<String>,
+    pub kind: u8,
+    pub content: String,
+}
+
+/// The assembled projection k10r serves (ADR-0008 §2): the head
+/// (initialization memory, RENDERED), the compression point, and the log
+/// increment strictly after it.
+///
+/// The head is text because a memory consumer need not know how the graph is
+/// assembled (ADR-0010 §5); the increment stays structural because it is the
+/// CONVERSATION — its role turns must stay separable on the LLM wire.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionProjection {
+    /// Initialization memory, rendered by k10r in the requested format;
+    /// empty when the user node has no facts yet.
+    pub head: String,
+    pub coverage_ts: u64,
+    pub summary: Option<String>,
+    pub increment: Vec<(MessageKey, ViewRow)>,
+}
 
 /// One trait object per surface kind; the turn function takes
-/// `&dyn MemorySurface`. Methods mirror `ChannelStore`'s primitives
-/// exactly — the surface adds no policy. `async_trait` boxes the
-/// futures (object safety); the turn loop's latency is dominated by
-/// the LLM call, the boxing is noise at this seam.
+/// `&dyn MemorySurface`. Methods mirror the mem-server doors exactly — the
+/// surface adds no policy. `async_trait` boxes the futures (object safety);
+/// the turn loop's latency is dominated by the LLM call, the boxing is
+/// noise at this seam.
 #[async_trait::async_trait]
 pub trait MemorySurface: Send + Sync {
-    /// The projection read (checkpoint + increment).
-    async fn fetch_session(&self, channel_id: u64, member_id: u64) -> anyhow::Result<SessionView>;
+    /// The projection read (head + checkpoint + increment).
+    async fn fetch_session(
+        &self,
+        channel_id: u64,
+        member_id: u64,
+    ) -> anyhow::Result<SessionProjection>;
 
     /// Append one log entry; returns the full key (the delta record).
     async fn append_message(
@@ -35,34 +130,82 @@ pub trait MemorySurface: Send + Sync {
     ) -> anyhow::Result<MessageKey>;
 }
 
-/// In-process surface: wraps a tokio-mutex'd `ChannelStore` — the same
-/// single-writer discipline the mem-server shell uses (mem-core's
-/// append/checkpoint take `&mut self`; the channel log is single-writer
-/// by design).
+/// In-process surface: wraps a tokio-mutex'd `ChannelStore` + `GraphStore` —
+/// the same single-writer discipline the mem-server shell uses. It links the
+/// SAME primitives and renders through the SAME function the HTTP answer
+/// came from, so the two surfaces agree on the shape.
 pub struct InProcessSurface {
-    store: tokio::sync::Mutex<mem_core::channel::ChannelStore>,
+    channels: tokio::sync::Mutex<mem_core::ChannelStore>,
+    graph: tokio::sync::Mutex<mem_core::GraphStore>,
+    format: MemoryFormat,
 }
 
 impl InProcessSurface {
-    /// Open (or create) the channel-log keyspace at `path`.
+    /// Open (or create) the service database at `path` — ONE database, both
+    /// keyspaces (`open_service`), because Fjall locks the directory.
     pub fn open(path: &std::path::Path) -> Result<Self, fjall::Error> {
-        Ok(Self::wrap(ChannelStore::open(path)?))
+        Ok(Self::wrap(mem_core::open_service(path)?))
     }
 
-    /// Wrap an already-opened store — the booth binding (Milestone B)
-    /// takes over a store its host opened; Fjall locks per directory,
-    /// so a second `open` of the same path is an error, not a handle.
-    pub fn wrap(store: ChannelStore) -> Self {
+    /// Wrap stores a host already opened — the booth binding (Milestone B)
+    /// takes over stores its host opened; Fjall locks per directory, so a
+    /// second `open` of the same path is an error, not a handle.
+    pub fn wrap(stores: mem_core::ServiceStores) -> Self {
         Self {
-            store: tokio::sync::Mutex::new(store),
+            channels: tokio::sync::Mutex::new(stores.channels),
+            graph: tokio::sync::Mutex::new(stores.graph),
+            format: MemoryFormat::default(),
         }
+    }
+
+    /// Ask for another representation (the in-process landing point for the
+    /// format knob; an HTTP deployment passes it in the URL instead).
+    pub fn with_format(mut self, format: MemoryFormat) -> Self {
+        self.format = format;
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl MemorySurface for InProcessSurface {
-    async fn fetch_session(&self, channel_id: u64, member_id: u64) -> anyhow::Result<SessionView> {
-        Ok(self.store.lock().await.fetch_full(channel_id, member_id))
+    async fn fetch_session(
+        &self,
+        channel_id: u64,
+        member_id: u64,
+    ) -> anyhow::Result<SessionProjection> {
+        // ONE lock order (channel, then graph) — the same order the mem-server
+        // door takes, so an in-process deployment cannot deadlock where HTTP
+        // would not.
+        let channels = self.channels.lock().await;
+        let mut graph = self.graph.lock().await;
+        let projection = mem_core::view::assemble(
+            &channels,
+            &mut graph,
+            channel_id,
+            member_id,
+            mem_core::view::DEFAULT_SCOPE,
+            mem_core::view::DEFAULT_USER_NODE,
+        );
+        Ok(SessionProjection {
+            head: mem_core::render_head(&projection.head, self.format.render()),
+            coverage_ts: projection.view.coverage_ts,
+            summary: projection.view.summary,
+            increment: projection
+                .view
+                .increment
+                .into_iter()
+                .map(|(key, row)| {
+                    (
+                        key,
+                        ViewRow {
+                            role: mem_core::view::role_name(row.role).map(str::to_string),
+                            kind: row.kind,
+                            content: row.content,
+                        },
+                    )
+                })
+                .collect(),
+        })
     }
 
     async fn append_message(
@@ -74,7 +217,7 @@ impl MemorySurface for InProcessSurface {
         kind: u8,
         content: &str,
     ) -> anyhow::Result<MessageKey> {
-        let mut store = self.store.lock().await;
+        let mut store = self.channels.lock().await;
         Ok(store.append(channel_id, ts_ms, sub, role, kind, content))
     }
 }
@@ -84,6 +227,7 @@ impl MemorySurface for InProcessSurface {
 pub struct HttpSurface {
     base: String, // e.g. http://127.0.0.1:8100 — no trailing slash
     http: reqwest::Client,
+    format: MemoryFormat,
 }
 
 /// Request body of `POST /channels/{id}/messages` (mem-server's wire
@@ -97,50 +241,61 @@ struct AppendMessageDto {
     content: String,
 }
 
-/// The response of the append call (mem-server's `MessageKeyDto`).
-/// The key is reconstructible locally (the caller sent ts/sub), so the
-/// body is not parsed — the status check is the contract.
 impl HttpSurface {
     pub fn new(base: &str) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
+            format: MemoryFormat::default(),
         }
+    }
+
+    /// Ask k10r for another representation of the head (ADR-0010 §5). The
+    /// format rides the query string, so it shows in a log line and is
+    /// reproducible with curl.
+    pub fn with_format(mut self, format: MemoryFormat) -> Self {
+        self.format = format;
+        self
     }
 }
 
 #[async_trait::async_trait]
 impl MemorySurface for HttpSurface {
-    async fn fetch_session(&self, channel_id: u64, member_id: u64) -> anyhow::Result<SessionView> {
-        // Wire shape mirrors mem-server's SessionDto; keys are not
-        // needed by the prompt assembly, so the response is decoded
-        // loosely (increment rows only).
+    async fn fetch_session(
+        &self,
+        channel_id: u64,
+        member_id: u64,
+    ) -> anyhow::Result<SessionProjection> {
         #[derive(serde::Deserialize)]
         struct KeyDto {
             channel_id: u64,
             ts_ms: u64,
             sub: u16,
         }
+        /// The increment entry is FLAT: the role NAME rides beside the key
+        /// (k10r resolved the stored code — there is no nested storage row).
         #[derive(serde::Deserialize)]
-        struct RowDto {
+        struct EntryDto {
             key: KeyDto,
-            row: RowInner,
-        }
-        #[derive(serde::Deserialize)]
-        struct RowInner {
-            role: u8,
+            role: Option<String>,
             kind: u8,
             content: String,
         }
         #[derive(serde::Deserialize)]
         struct SessionDto {
+            /// Rendered text under every text format. A `struct` answer would
+            /// put an ARRAY here and fail this decode — which is why the
+            /// format is validated where it is configured.
+            #[serde(default)]
+            head: String,
             coverage_ts: u64,
             summary: Option<String>,
-            increment: Vec<RowDto>,
+            increment: Vec<EntryDto>,
         }
+        let format = self.format.name();
         let url = format!(
-            "{base}/channels/{channel_id}/members/{member_id}/session",
-            base = self.base
+            "{base}/channels/{channel_id}/members/{member_id}/session?format={format}",
+            base = self.base,
         );
         let dto: SessionDto = self
             .http
@@ -152,26 +307,26 @@ impl MemorySurface for HttpSurface {
             .json()
             .await
             .context("mem-server session response was not the expected shape")?;
-        Ok(SessionView {
+        Ok(SessionProjection {
+            head: dto.head,
             coverage_ts: dto.coverage_ts,
             summary: dto.summary,
             increment: dto
                 .increment
                 .into_iter()
-                // Keys ride the wire (mem-server echoes them in every
-                // entry) — delta records (Phase 2.5) need them, so no
-                // key-dropping here.
-                .map(|r| {
+                // Keys ride the wire (mem-server echoes them in every entry)
+                // — delta records (Phase 2.5) are written from them.
+                .map(|entry| {
                     (
                         MessageKey {
-                            channel_id: r.key.channel_id,
-                            ts_ms: r.key.ts_ms,
-                            sub: r.key.sub,
+                            channel_id: entry.key.channel_id,
+                            ts_ms: entry.key.ts_ms,
+                            sub: entry.key.sub,
                         },
-                        mem_core::channel::MessageRow {
-                            role: r.row.role,
-                            kind: r.row.kind,
-                            content: r.row.content,
+                        ViewRow {
+                            role: entry.role,
+                            kind: entry.kind,
+                            content: entry.content,
                         },
                     )
                 })
@@ -189,8 +344,7 @@ impl MemorySurface for HttpSurface {
         content: &str,
     ) -> anyhow::Result<MessageKey> {
         let url = format!("{base}/channels/{channel_id}/messages", base = self.base);
-        let status = self
-            .http
+        self.http
             .post(&url)
             .json(&AppendMessageDto {
                 ts_ms,
@@ -203,9 +357,7 @@ impl MemorySurface for HttpSurface {
             .await
             .context("mem-server append request failed (transport)")?
             .error_for_status()
-            .context("mem-server append rejected (HTTP status)")?
-            .status();
-        let _ = status;
+            .context("mem-server append rejected (HTTP status)")?;
         Ok(MessageKey {
             channel_id,
             ts_ms,

@@ -22,14 +22,21 @@ async fn main() -> anyhow::Result<()> {
     // over store_path (in-process) when both are present — explicit
     // precedence, not an error, so one config file serves both bring-up
     // and the deployed shape.
+    //
+    // The memory representation is validated HERE, before the first turn:
+    // `struct` returns the fact data for a caller that assembles the graph
+    // itself, which this executor never does (ADR-0010 §5).
+    let format = gravity_core::surface::MemoryFormat::from_config(config.memory_format.as_deref())
+        .context("memory_format")?;
     let surface: std::sync::Arc<dyn gravity_core::surface::MemorySurface> = if let Some(url) =
         &config.store_url
     {
-        std::sync::Arc::new(gravity_core::surface::HttpSurface::new(url))
+        std::sync::Arc::new(gravity_core::surface::HttpSurface::new(url).with_format(format))
     } else if let Some(path) = &config.store_path {
         std::sync::Arc::new(
             gravity_core::surface::InProcessSurface::open(std::path::Path::new(path))
-                .map_err(|e| anyhow::anyhow!("opening store at {path}: {e}"))?,
+                .map_err(|e| anyhow::anyhow!("opening store at {path}: {e}"))?
+                .with_format(format),
         )
     } else {
         anyhow::bail!("config needs either store_path (in-process) or store_url (mem-server HTTP)");

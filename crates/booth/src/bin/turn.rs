@@ -3,10 +3,12 @@
 //!
 //! `turn(args)` is an iterate PRODUCER whose stream IS the turn:
 //!
-//! 1. `GET {store_url}/channels/{c}/members/{m}/session` — the
-//!    projection (summary + increment), the mem-server wire shape.
-//! 2. Prompt assembly: summary preamble (system) + increment + the
-//!    user message.
+//! 1. `GET {store_url}/channels/{c}/members/{m}/session?format=` — the
+//!    projection (head + summary + increment), the mem-server wire shape.
+//!    The head is TEXT: k10r renders the initialization memory, gravity
+//!    never assembles the graph (ADR-0010 §5).
+//! 2. Prompt assembly: head block (system) + summary preamble (system) +
+//!    increment + the user message.
 //! 3. `ctx.iterate_start(llm_provider, "", "stream", provider_args)` —
 //!    each envelope item's `delta` is re-emitted as this stream's own
 //!    item (the stream IS the turn; nothing buffers).
@@ -23,6 +25,7 @@
 //! "endpoint", "model", "key_env"}`.
 
 use anyhow::Context;
+use gravity_core::surface::MemoryFormat;
 use induction_guest::{Ctx, Guest};
 use serde_json::{json, Value};
 
@@ -128,17 +131,30 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
         .context("turn: missing `user_message`")?
         .to_string();
 
-    // 1. The session projection (mem-server's SessionDto shape).
-    let url = format!("{store_url}/channels/{channel_id}/members/{member_id}/session");
+    // 1. The session projection (mem-server's SessionDto shape). The head's
+    // representation is the deployment's choice, and `struct` is refused
+    // here: it returns the fact DATA, which this executor does not assemble.
+    let format = MemoryFormat::from_config(args.get("memory_format").and_then(Value::as_str))
+        .context("turn: the configured memory format is unusable")?;
+    let url = format!(
+        "{store_url}/channels/{channel_id}/members/{member_id}/session?format={}",
+        format.name()
+    );
     let resp = ureq::get(&url)
         .call()
         .context("turn: mem-server session request failed")?;
     let view: Value =
         serde_json::from_reader(resp.into_reader()).context("turn: bad session projection")?;
 
-    // 2. Prompt assembly. Storage role byte → wire role (mem-core's
-    // channel constants: 1=assistant, 2=tool, 3=system, else user).
+    // 2. Prompt assembly. The head arrives RENDERED (k10r's own text — no
+    // wrapper of ours), the summary is the compression point, and every
+    // increment entry carries the LLM role name k10r resolved.
     let mut messages: Vec<Value> = Vec::new();
+    if let Some(head) = view.get("head").and_then(Value::as_str) {
+        if !head.is_empty() {
+            messages.push(json!({ "role": "system", "content": head }));
+        }
+    }
     if let Some(summary) = view.get("summary").and_then(Value::as_str) {
         if !summary.is_empty() {
             messages.push(json!({
@@ -153,18 +169,15 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
         .cloned()
         .unwrap_or_default()
     {
-        let role = entry
-            .get("row")
-            .and_then(|r| r.get("role"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        // The entry is FLAT: `role` is the resolved NAME (null for a code
+        // k10r does not police → the user's turn, the pre-existing fallback).
+        let role = entry.get("role").and_then(Value::as_str).unwrap_or("user");
         let content = entry
-            .get("row")
-            .and_then(|r| r.get("content"))
+            .get("content")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        messages.push(json!({ "role": wire_role(role), "content": content }));
+        messages.push(json!({ "role": role, "content": content }));
     }
     messages.push(json!({ "role": "user", "content": user_message }));
 
@@ -349,13 +362,4 @@ fn finish_turn() -> anyhow::Result<Value> {
         );
     }
     Ok(json!({ "done": true, "value": { "reply": reply } }))
-}
-
-fn wire_role(role: u64) -> &'static str {
-    match role {
-        1 => "assistant",
-        2 => "tool",
-        3 => "system",
-        _ => "user",
-    }
 }
