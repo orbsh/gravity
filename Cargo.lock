@@ -1227,7 +1227,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2729,6 +2729,7 @@ dependencies = [
  "miette",
  "okm-core 0.1.0 (git+https://github.com/orbsh/okm?branch=main)",
  "okm-derive 0.1.0 (git+https://github.com/orbsh/okm?branch=main)",
+ "okm-vector",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2925,7 +2926,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3068,7 +3069,7 @@ dependencies = [
 [[package]]
 name = "okm-core"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#6e6691a9da10d28ac36c16a561eae1106c62f41e"
+source = "git+https://github.com/orbsh/okm?branch=main#e0842a73eb0a0bc9a9d3dc778e134f3762c618ae"
 dependencies = [
  "fjall",
  "okm-derive 0.1.0 (git+https://github.com/orbsh/okm?branch=main)",
@@ -3098,7 +3099,7 @@ dependencies = [
 [[package]]
 name = "okm-derive"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#6e6691a9da10d28ac36c16a561eae1106c62f41e"
+source = "git+https://github.com/orbsh/okm?branch=main#e0842a73eb0a0bc9a9d3dc778e134f3762c618ae"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -3120,7 +3121,7 @@ dependencies = [
 [[package]]
 name = "okm-dynamic"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#6e6691a9da10d28ac36c16a561eae1106c62f41e"
+source = "git+https://github.com/orbsh/okm?branch=main#e0842a73eb0a0bc9a9d3dc778e134f3762c618ae"
 dependencies = [
  "okm-core 0.1.0 (git+https://github.com/orbsh/okm?branch=main)",
 ]
@@ -3157,9 +3158,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "okm-vector"
+version = "0.1.0"
+source = "git+https://github.com/orbsh/okm?branch=main#e0842a73eb0a0bc9a9d3dc778e134f3762c618ae"
+dependencies = [
+ "okm-core 0.1.0 (git+https://github.com/orbsh/okm?branch=main)",
+]
+
+[[package]]
 name = "okm-wire"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#6e6691a9da10d28ac36c16a561eae1106c62f41e"
+source = "git+https://github.com/orbsh/okm?branch=main#e0842a73eb0a0bc9a9d3dc778e134f3762c618ae"
 
 [[package]]
 name = "okm-wire"
@@ -3556,7 +3565,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3920,7 +3929,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3979,7 +3988,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4686,7 +4695,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4705,7 +4714,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
