@@ -104,7 +104,7 @@ async fn same_state_assembles_byte_identical_views() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let http = gravity_core::surface::HttpSurface::new(&format!("http://{addr}"));
     let status = reqwest::Client::new()
-        .post(format!("http://{addr}/facts/1"))
+        .post(format!("http://{addr}/memories/1"))
         .json(&serde_json::json!([
             "用户",
             "person",

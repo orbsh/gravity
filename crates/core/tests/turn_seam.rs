@@ -182,7 +182,7 @@ async fn head_is_rendered_by_both_surfaces() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let base = format!("http://{addr}");
     let status = reqwest::Client::new()
-        .post(format!("{base}/facts/1"))
+        .post(format!("{base}/memories/1"))
         .json(&serde_json::json!([
             "用户",
             "person",
