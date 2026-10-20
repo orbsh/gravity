@@ -94,6 +94,19 @@ pub struct ViewRow {
 /// The head is text because a memory consumer need not know how the graph is
 /// assembled (ADR-0010 §5); the increment stays structural because it is the
 /// CONVERSATION — its role turns must stay separable on the LLM wire.
+/// The compression directive k10r serves beside the projection (ADR-0008 §4).
+///
+/// It is a CONTROL value, not a record: the span to summarize up to, and the
+/// tail prompt to append to it. Gravity carries it so the directive is not
+/// dropped between the seam and the turn loop; running the branch turn is the
+/// turn loop's half, and k10r derives the coverage point when the summary comes
+/// back — gravity never states one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Compression {
+    pub checkpoint: u64,
+    pub prompt: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionProjection {
     /// Initialization memory, rendered by k10r in the requested format;
@@ -102,6 +115,9 @@ pub struct SessionProjection {
     pub coverage_ts: u64,
     pub summary: Option<String>,
     pub increment: Vec<(MessageKey, ViewRow)>,
+    /// The policy's verdict when one fired; `None` = build the context from
+    /// the records alone.
+    pub compress: Option<Compression>,
 }
 
 /// One trait object per surface kind; the turn function takes
@@ -176,7 +192,7 @@ impl MemorySurface for InProcessSurface {
         // ONE lock order (channel, then graph) — the same order the mem-server
         // door takes, so an in-process deployment cannot deadlock where HTTP
         // would not.
-        let channels = self.channels.lock().await;
+        let mut channels = self.channels.lock().await;
         let mut graph = self.graph.lock().await;
         let projection = mem_core::view::assemble(
             &channels,
@@ -186,6 +202,30 @@ impl MemorySurface for InProcessSurface {
             mem_core::view::DEFAULT_SCOPE,
             mem_core::view::DEFAULT_USER_NODE,
         );
+        // The policy evaluates HERE, as it does at the door, so the two
+        // surfaces answer the same directive for the same state. No clock rides
+        // this call (the caller's clock belongs to its own turn), so the cache
+        // clock stays silent and only the budget can fire.
+        let assembled = mem_core::render_head(&projection.head, mem_core::RenderFormat::Plaintext)
+            .len()
+            + projection.view.summary.as_deref().map_or(0, str::len)
+            + projection
+                .view
+                .increment
+                .iter()
+                .map(|(_, row)| row.content.len())
+                .sum::<usize>();
+        let verdict = mem_core::compress::evaluate(
+            &projection.view,
+            assembled,
+            None,
+            &mem_core::CompressionParams::default(),
+        );
+        if let Some(v) = &verdict {
+            // Recorded so the summary that comes back can land on this split
+            // (the store derives the coverage point from it).
+            channels.note_verdict(channel_id, member_id, v);
+        }
         Ok(SessionProjection {
             head: mem_core::render_head(&projection.head, self.format.render()),
             coverage_ts: projection.view.coverage_ts,
@@ -205,6 +245,10 @@ impl MemorySurface for InProcessSurface {
                     )
                 })
                 .collect(),
+            compress: verdict.map(|v| Compression {
+                checkpoint: v.checkpoint_ts,
+                prompt: mem_core::TAIL_PROMPT.to_string(),
+            }),
         })
     }
 
@@ -281,6 +325,13 @@ impl MemorySurface for HttpSurface {
             kind: u8,
             content: String,
         }
+        /// The compression directive (ADR-0008 §4) — absent when no verdict
+        /// fired, which is the ordinary case.
+        #[derive(serde::Deserialize)]
+        struct CompressDto {
+            checkpoint: u64,
+            prompt: String,
+        }
         #[derive(serde::Deserialize)]
         struct SessionDto {
             /// Rendered text under every text format. A `struct` answer would
@@ -291,6 +342,8 @@ impl MemorySurface for HttpSurface {
             coverage_ts: u64,
             summary: Option<String>,
             increment: Vec<EntryDto>,
+            #[serde(default)]
+            compress: Option<CompressDto>,
         }
         let format = self.format.name();
         let url = format!(
@@ -311,6 +364,10 @@ impl MemorySurface for HttpSurface {
             head: dto.head,
             coverage_ts: dto.coverage_ts,
             summary: dto.summary,
+            compress: dto.compress.map(|c| Compression {
+                checkpoint: c.checkpoint,
+                prompt: c.prompt,
+            }),
             increment: dto
                 .increment
                 .into_iter()

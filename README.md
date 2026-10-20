@@ -14,7 +14,7 @@ run LLM + tool-call loop                   // skill execution via Probe
 append(session_id, delta)                  // only the new messages
 ```
 
-Stateless between turns: no resident loop, no session state in memory. Compression is NOT wired yet, and Gravity has no door that requests one: k10r owns the verdict (the trigger is evaluated at the projection read and arrives with it), and the caller's half is running the summary turn out of band and handing the text back through the existing checkpoint door. Memory reads are k10r's doors; the head arrives already rendered.
+Stateless between turns: no resident loop, no session state in memory. Compression: k10r owns the verdict (the trigger is evaluated at the projection read and arrives as `SessionProjection.compress` — `{checkpoint, prompt}`), and Gravity CARRIES it through both surfaces (the in-process one runs the same engine, so the two agree); running the summary turn out of band and handing the text back through the checkpoint door is the turn loop's half, still unwired. Gravity no longer states a coverage point where it calls k10r — the door derives it from the verdict it served. Memory reads are k10r's doors; the head arrives already rendered.
 
 ## Layout
 
