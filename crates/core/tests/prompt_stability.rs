@@ -204,7 +204,7 @@ async fn checkpoint_compression_rewrites_the_view_deliberately() {
     let mut stores = mem_core::open_service(dir.path()).unwrap();
     stores
         .channels
-        .append_checkpoint(7, 1, 100, "compressed summary");
+        .append_checkpoint(7, (100, 0), "compressed summary", &[]);
     let surface2 = InProcessSurface::wrap(stores);
     let after = surface2.fetch_session(7, 1).await.unwrap();
     let p_after = render(&assemble(&after, "next"));

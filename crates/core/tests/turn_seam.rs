@@ -235,7 +235,7 @@ async fn checkpoint_flows_through_surface() {
     let mut stores = mem_core::open_service(dir.path()).unwrap();
     stores
         .channels
-        .append_checkpoint(3, gravity_core::surface::DEFAULT_MEMBER, 100, "compressed");
+        .append_checkpoint(3, (100, 0), "compressed", &[]);
     let surface = InProcessSurface::wrap(stores);
     let view = surface
         .fetch_session(3, gravity_core::surface::DEFAULT_MEMBER)

@@ -195,12 +195,11 @@ impl MemorySurface for InProcessSurface {
         let mut channels = self.channels.lock().await;
         let mut graph = self.graph.lock().await;
         let projection = mem_core::view::assemble(
-            &channels,
+            &mut channels,
             &mut graph,
             channel_id,
             member_id,
             mem_core::view::DEFAULT_SCOPE,
-            mem_core::view::DEFAULT_USER_NODE,
         );
         // The policy evaluates HERE, as it does at the door, so the two
         // surfaces answer the same directive for the same state. No clock rides
@@ -222,9 +221,13 @@ impl MemorySurface for InProcessSurface {
             &mem_core::CompressionParams::default(),
         );
         if let Some(v) = &verdict {
-            // Recorded so the summary that comes back can land on this split
-            // (the store derives the coverage point from it).
-            channels.note_verdict(channel_id, member_id, v);
+            // The split this verdict chose is FROZEN here, so the summary that
+            // comes back lands on it (ADR-0008 §2: the checkpoint carries the
+            // head, not a re-computation of it). k10r retired the separate
+            // verdict record — the checkpoint IS the record, and the head ids are
+            // what it carries; a decision that is not written down is not one.
+            let head_ids: Vec<u64> = projection.head.iter().map(|fact| fact.edge_id).collect();
+            channels.open_checkpoint(channel_id, (v.checkpoint_ts, v.checkpoint_sub), &head_ids);
         }
         Ok(SessionProjection {
             head: mem_core::render_head(&projection.head, self.format.render()),
