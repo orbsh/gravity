@@ -2,6 +2,7 @@
 //! ctx iterate arms against the provider guest (also spawned here), and
 //! drives the turn stream to done — reproducing the realm's wiring
 //! without the engine.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unwrap_in_result, clippy::panic_in_result_fn)]
 
 use induction_host::{spawn, Budgets, HostOps, InvokeCall, OpsFuture, Spec};
 use serde_json::{json, Value};

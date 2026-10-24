@@ -6,6 +6,7 @@
 //! The projection the seam hands out is k10r's own (ADR-0010 §5): the head
 //! arrives RENDERED, and an increment entry carries the LLM role NAME. Both
 //! surfaces must produce the same one — that is what the head test drives.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unwrap_in_result, clippy::panic_in_result_fn)]
 
 use gravity_core::llm::WireMessage;
 use gravity_core::surface::{InProcessSurface, MemorySurface};

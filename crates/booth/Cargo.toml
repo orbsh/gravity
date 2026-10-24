@@ -32,3 +32,6 @@ induction-host = { path = "../../../induction/crates/induction-host" }
 induction-protocol = { path = "../../../induction/crates/induction-protocol" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
+
+[lints]
+workspace = true

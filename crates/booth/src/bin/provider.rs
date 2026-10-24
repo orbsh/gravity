@@ -31,7 +31,7 @@ fn main() -> anyhow::Result<()> {
         // replies the first envelope (`{done:false, item:{delta}}`).
         .on("stream", |_ctx: &mut Ctx, args: Value| {
             let conn = open_stream(&args)?;
-            let mut slot = STREAM.lock().unwrap();
+            let mut slot = STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut stream = conn;
             let reply = next_envelope(&mut stream)?;
             // Done already dropped the stream (next_envelope signals it
@@ -44,7 +44,7 @@ fn main() -> anyhow::Result<()> {
         // The pull handler: `__next__` is the reserved binding the
         // guest guard table routes every pull round to.
         .producer(|_ctx: &mut Ctx, _args: Value| {
-            let mut slot = STREAM.lock().unwrap();
+            let mut slot = STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(mut stream) = slot.take() else {
                 anyhow::bail!("provider: pull with no live stream");
             };

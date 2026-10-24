@@ -69,10 +69,10 @@ impl SseDecoder {
                     .and_then(|c| c.get(0))
                     .and_then(|c| c.get("delta"))
                     .and_then(|d| d.get("tool_calls"))
+                    .and_then(Value::as_array)
+                    .filter(|a| !a.is_empty())
                 {
-                    if calls.is_array() && !calls.as_array().unwrap().is_empty() {
-                        return Ok(Some(SseEvent::ToolCalls(calls.clone())));
-                    }
+                    return Ok(Some(SseEvent::ToolCalls(Value::Array(calls.clone()))));
                 }
                 if let Some(delta) = chunk
                     .get("choices")

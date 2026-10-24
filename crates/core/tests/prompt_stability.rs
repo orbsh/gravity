@@ -4,6 +4,7 @@
 //! provider's prefix KV cache keys on the exact prompt bytes; a view
 //! that reorders, reformats, or re-timestamps between turns silently
 //! invalidates the cache and pays full price per token).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unwrap_in_result, clippy::panic_in_result_fn)]
 
 use gravity_core::llm::WireMessage;
 use gravity_core::surface::{InProcessSurface, MemorySurface};

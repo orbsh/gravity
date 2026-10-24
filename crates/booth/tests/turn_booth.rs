@@ -11,6 +11,7 @@
 //!   exchange after the stream ends;
 //! - a failed provider pull appends nothing (the turn function's
 //!   oldest rule, through the booth form).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unwrap_in_result, clippy::panic_in_result_fn)]
 
 use aura_booth::{call::CallSlot, InstanceId, InstanceKey, IterateOp};
 use aura_engine::Engine;

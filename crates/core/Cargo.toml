@@ -20,3 +20,6 @@ tempfile.workspace = true
 mem-server = { path = "../../../krystallizer/crates/mem-server" }
 axum = "0.8"
 async-trait = "0.1"
+
+[lints]
+workspace = true

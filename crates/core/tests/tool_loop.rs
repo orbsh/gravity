@@ -4,6 +4,7 @@
 //! round. Failure is a value into the next round (a tool failure is
 //! not a turn failure); the delta boundary is the loop's own — the
 //! transcript lives in the loop, never a full-session write-back.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unwrap_in_result, clippy::panic_in_result_fn)]
 
 use gravity_core::tool::{parse_tool_calls, ToolDispatch, ToolResultMessage};
 use serde_json::{json, Value};

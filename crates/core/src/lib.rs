@@ -45,6 +45,9 @@ pub struct TurnOutput {
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before 1970")
+        // A clock before 1970 reads as 0, not as a crash: the value is a
+        // timestamp, and a timer that cannot tell the time has no better
+        // answer than "the epoch".
+        .unwrap_or_default()
         .as_millis() as u64
 }

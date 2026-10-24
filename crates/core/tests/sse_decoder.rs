@@ -1,6 +1,7 @@
 //! The SSE wire decoder's own contract: framing, the sentinel, the
 //! chunk shape, and split-read behavior (a chunk boundary mid-frame
 //! must not lose or corrupt an event).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unwrap_in_result, clippy::panic_in_result_fn)]
 
 use gravity_core::llm::sse::{SseDecoder, SseEvent};
 

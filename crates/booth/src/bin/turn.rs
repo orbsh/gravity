@@ -61,13 +61,13 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
     // Tool results from the Start-face dispatch loop surface first (the
     // consumer sees the loop's progress before the content deltas).
     {
-        let mut results = TOOL_RESULTS.lock().unwrap();
+        let mut results = TOOL_RESULTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !results.is_empty() {
             return Ok(json!({ "done": false, "item": results.remove(0) }));
         }
     }
     // Rounds ≥ 1: pull the provider, re-emit the delta.
-    let guard = PROVIDER_STREAM.lock().unwrap();
+    let guard = PROVIDER_STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(sid) = guard.as_ref() else {
         anyhow::bail!("turn: pull with no provider stream");
     };
@@ -82,7 +82,7 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
         let _ = ctx.iterate_dispose(sid);
         drop(guard);
         let reply = finish_turn()?;
-        *PROVIDER_STREAM.lock().unwrap() = None;
+        *PROVIDER_STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         return Ok(reply);
     }
     let Some(item) = env.get("item") else {
@@ -93,7 +93,7 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    REPLY_PARTS.lock().unwrap().push(delta.clone());
+    REPLY_PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(delta.clone());
     Ok(json!({ "done": false, "item": { "delta": delta } }))
 }
 
@@ -103,7 +103,7 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
 fn start_envelope(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
     // Capture the turn's own args for the finish path (the pull
     // handler's args are the guard's `{stream_id, round}`).
-    *TURN_ARGS.lock().unwrap() = Some(args.clone());
+    *TURN_ARGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(args.clone());
     let (first_delta, _sid) = start_turn(ctx, args)?;
     Ok(json!({ "done": false, "item": { "delta": first_delta } }))
 }
@@ -243,7 +243,7 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
             let entry = json!({
                 "tool_result": { "tool_call_id": call.id, "content": content }
             });
-            TOOL_RESULTS.lock().unwrap().push(entry);
+            TOOL_RESULTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(entry);
             // The fed-back wire shape: the assistant's call + the tool's
             // result (OpenAI's loop contract).
             messages.push(json!({ "role": "assistant", "tool_calls": calls }));
@@ -291,10 +291,10 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    *PROVIDER_STREAM.lock().unwrap() = Some(sid.clone());
+    *PROVIDER_STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sid.clone());
 
     // Remember the reply text accumulated so far.
-    REPLY_PARTS.lock().unwrap().push(delta.clone());
+    REPLY_PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(delta.clone());
     Ok((delta, sid))
 }
 
@@ -315,7 +315,7 @@ static TOOL_RESULTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::n
 fn finish_turn() -> anyhow::Result<Value> {
     let args = TURN_ARGS
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
         .ok_or_else(|| anyhow::anyhow!("turn: finish with no captured args"))?;
     let store_url = args
@@ -334,7 +334,7 @@ fn finish_turn() -> anyhow::Result<Value> {
         .context("turn: missing `user_message`")?
         .to_string();
 
-    let reply_parts: Vec<String> = std::mem::take(&mut *REPLY_PARTS.lock().unwrap());
+    let reply_parts: Vec<String> = std::mem::take(&mut *REPLY_PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     let reply = reply_parts.concat();
     if reply.is_empty() {
         anyhow::bail!("turn: provider stream yielded no tokens");
