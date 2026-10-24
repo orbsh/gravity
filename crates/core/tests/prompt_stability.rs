@@ -11,10 +11,15 @@ use gravity_core::surface::{InProcessSurface, MemorySurface};
 use mem_core::channel::{kind, role};
 use mem_core::FactTuple;
 
-/// The head's corpus: one fact about the default user node (node 1 of
-/// scope 1), so the head block participates in the byte comparison.
+/// The head's corpus: one fact about the channel's default member node
+/// (channel 7, member 1 — the node k10r names `member-7-1`), so the head
+/// block participates in the byte comparison.
 fn user_fact() -> FactTuple {
-    FactTuple::from_json(r#"["用户","person",{},"PREFERS",{},"简洁","style",{}]"#).unwrap()
+    let member = mem_core::channel::member_node(7, 1);
+    FactTuple::from_json(&format!(
+        r#"["{member}","person",{{}},"PREFERS",{{}},"简洁","style",{{}}]"#
+    ))
+    .unwrap()
 }
 
 /// The prompt assembly, verbatim from the seam test's stub (the real
@@ -106,8 +111,8 @@ async fn same_state_assembles_byte_identical_views() {
     let http = gravity_core::surface::HttpSurface::new(&format!("http://{addr}"));
     let status = reqwest::Client::new()
         .post(format!("http://{addr}/memories/1"))
-        .json(&serde_json::json!([
-            "用户",
+        .json(&serde_json::json!([[
+            mem_core::channel::member_node(7, 1),
             "person",
             {},
             "PREFERS",
@@ -115,7 +120,7 @@ async fn same_state_assembles_byte_identical_views() {
             "简洁",
             "style",
             {}
-        ]))
+        ]]))
         .send()
         .await
         .unwrap()
@@ -205,7 +210,8 @@ async fn checkpoint_compression_rewrites_the_view_deliberately() {
     let mut stores = mem_core::open_service(dir.path()).unwrap();
     stores
         .channels
-        .append_checkpoint(7, (100, 0), "compressed summary", &[]);
+        .append_checkpoint(7, (100, 0), "compressed summary", &[])
+        .unwrap();
     let surface2 = InProcessSurface::wrap(stores);
     let after = surface2.fetch_session(7, 1).await.unwrap();
     let p_after = render(&assemble(&after, "next"));

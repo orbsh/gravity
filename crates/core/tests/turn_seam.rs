@@ -154,15 +154,22 @@ async fn http_surface_contract() {
 }
 
 /// The head is TEXT, rendered by k10r, on BOTH surfaces: the same corpus
-/// answers the same block, and the block is the user node's one fact.
+/// answers the same block, and the block is the member node's one fact.
 ///
 /// This is the contract that broke when the projection's head stopped being
 /// a fact array (2026-10-20) — a caller that decoded it as data (or that
 /// tried to render it itself) is exactly what these assertions catch.
 #[tokio::test]
 async fn head_is_rendered_by_both_surfaces() {
-    let tuple =
-        || FactTuple::from_json(r#"["用户","person",{},"PREFERS",{},"简洁","style",{}]"#).unwrap();
+    // k10r's head reads the channel's MEMBER nodes (`member-<channel>-<member>`),
+    // so the corpus hangs the fact there.
+    let member = mem_core::channel::member_node(7, gravity_core::surface::DEFAULT_MEMBER);
+    let tuple = || {
+        FactTuple::from_json(&format!(
+            r#"["{member}","person",{{}},"PREFERS",{{}},"简洁","style",{{}}]"#
+        ))
+        .unwrap()
+    };
 
     // In-process: the fact lands through the service's own graph handle
     // (the surface has no ingest — that is the caller's write door).
@@ -170,6 +177,12 @@ async fn head_is_rendered_by_both_surfaces() {
     let mut stores = mem_core::open_service(dir.path()).unwrap();
     stores.graph.ingest(1, &tuple()).unwrap();
     let in_process = InProcessSurface::wrap(stores);
+    // One append so the channel has its seeded member (the head traverses
+    // the members of the channel).
+    in_process
+        .append_message(7, 100, 0, role::USER, kind::TEXT, "seed")
+        .await
+        .unwrap();
     let local = in_process
         .fetch_session(7, gravity_core::surface::DEFAULT_MEMBER)
         .await
@@ -184,8 +197,8 @@ async fn head_is_rendered_by_both_surfaces() {
     let base = format!("http://{addr}");
     let status = reqwest::Client::new()
         .post(format!("{base}/memories/1"))
-        .json(&serde_json::json!([
-            "用户",
+        .json(&serde_json::json!([[
+            member,
             "person",
             {},
             "PREFERS",
@@ -193,13 +206,16 @@ async fn head_is_rendered_by_both_surfaces() {
             "简洁",
             "style",
             {}
-        ]))
+        ]]))
         .send()
         .await
         .unwrap()
         .status();
     assert_eq!(status, reqwest::StatusCode::OK);
     let http = gravity_core::surface::HttpSurface::new(&base);
+    http.append_message(7, 100, 0, role::USER, kind::TEXT, "seed")
+        .await
+        .unwrap();
     let remote = http
         .fetch_session(7, gravity_core::surface::DEFAULT_MEMBER)
         .await
@@ -210,8 +226,10 @@ async fn head_is_rendered_by_both_surfaces() {
         "both surfaces hand back k10r's rendering, byte for byte"
     );
     assert!(
-        local.head.contains("用户 (person) -[PREFERS]-> 简洁"),
-        "the head renders the user node's fact: {}",
+        local
+            .head
+            .contains(&format!("{member} (person) -[PREFERS]-> 简洁")),
+        "the head renders the member node's fact: {}",
         local.head
     );
 }
@@ -236,7 +254,8 @@ async fn checkpoint_flows_through_surface() {
     let mut stores = mem_core::open_service(dir.path()).unwrap();
     stores
         .channels
-        .append_checkpoint(3, (100, 0), "compressed", &[]);
+        .append_checkpoint(3, (100, 0), "compressed", &[])
+        .unwrap();
     let surface = InProcessSurface::wrap(stores);
     let view = surface
         .fetch_session(3, gravity_core::surface::DEFAULT_MEMBER)

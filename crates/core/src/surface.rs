@@ -159,7 +159,9 @@ pub struct InProcessSurface {
 impl InProcessSurface {
     /// Open (or create) the service database at `path` — ONE database, both
     /// keyspaces (`open_service`), because Fjall locks the directory.
-    pub fn open(path: &std::path::Path) -> Result<Self, fjall::Error> {
+    /// The seam's error is mem-core's `String` (the storage crate does not
+    /// hand out its own error type).
+    pub fn open(path: &std::path::Path) -> Result<Self, String> {
         Ok(Self::wrap(mem_core::open_service(path)?))
     }
 
@@ -200,7 +202,7 @@ impl MemorySurface for InProcessSurface {
             channel_id,
             member_id,
             mem_core::view::DEFAULT_SCOPE,
-        );
+        )?;
         // The policy evaluates HERE, as it does at the door, so the two
         // surfaces answer the same directive for the same state. No clock rides
         // this call (the caller's clock belongs to its own turn), so the cache
@@ -227,7 +229,9 @@ impl MemorySurface for InProcessSurface {
             // verdict record — the checkpoint IS the record, and the head ids are
             // what it carries; a decision that is not written down is not one.
             let head_ids: Vec<u64> = projection.head.iter().map(|fact| fact.edge_id).collect();
-            channels.open_checkpoint(channel_id, (v.checkpoint_ts, v.checkpoint_sub), &head_ids);
+            channels
+                .open_checkpoint(channel_id, (v.checkpoint_ts, v.checkpoint_sub), &head_ids)
+                .map_err(anyhow::Error::msg)?;
         }
         Ok(SessionProjection {
             head: mem_core::render_head(&projection.head, self.format.render()),
@@ -265,7 +269,9 @@ impl MemorySurface for InProcessSurface {
         content: &str,
     ) -> anyhow::Result<MessageKey> {
         let mut store = self.channels.lock().await;
-        Ok(store.append(channel_id, ts_ms, sub, role, kind, content))
+        store
+            .append(channel_id, ts_ms, sub, role, kind, content)
+            .map_err(anyhow::Error::msg)
     }
 }
 
