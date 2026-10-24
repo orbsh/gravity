@@ -18,15 +18,15 @@ impl HostOps for Ops {
         Box::pin(async { Err("no invoke".into()) })
     }
     fn iterate<'a>(&'a self, arm: induction_protocol::Arm, args: &'a Value) -> OpsFuture<'a> {
-        use induction_protocol::{Arm, CallFrame, FrameKind};
+        use induction_protocol::{Arm, CallFrame, IterateKind};
         let args = args.clone();
         Box::pin(async move {
             let mut guard = self.provider.lock().await;
             let proc = guard.as_mut().unwrap();
             let kind = match arm {
-                Arm::IterateStart => FrameKind::IterateStart,
-                Arm::IterateNext => FrameKind::IterateNext,
-                _ => FrameKind::IterateDispose,
+                Arm::IterateStart => IterateKind::Start,
+                Arm::IterateNext => IterateKind::Next,
+                _ => IterateKind::Dispose,
             };
             let sid = args
                 .get("stream_id")
@@ -132,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     });
     let frame = induction_protocol::CallFrame::iterate(
         1,
-        induction_protocol::FrameKind::IterateStart,
+        induction_protocol::IterateKind::Start,
         "turn",
         args,
         "t1".to_string(),
@@ -149,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
     for round in 1..8 {
         let frame = induction_protocol::CallFrame::iterate(
             round + 1,
-            induction_protocol::FrameKind::IterateNext,
+            induction_protocol::IterateKind::Next,
             "turn",
             json!({}),
             "t1".to_string(),
