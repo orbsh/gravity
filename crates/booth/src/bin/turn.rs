@@ -66,6 +66,9 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
             return Ok(json!({ "done": false, "item": results.remove(0) }));
         }
     }
+    // The side branch advances one pull per round, on the same face: the
+    // summary is produced alongside the answer, never in front of it.
+    step_compression(ctx);
     // Rounds ≥ 1: pull the provider, re-emit the delta.
     let guard = PROVIDER_STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(sid) = guard.as_ref() else {
@@ -81,6 +84,9 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
         // guard's `{stream_id, round}`, not the turn's.
         let _ = ctx.iterate_dispose(sid);
         drop(guard);
+        // The answer has streamed; the summary's tail is the only thing
+        // still owed (see drain_compression).
+        drain_compression(ctx);
         let reply = finish_turn()?;
         *PROVIDER_STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         return Ok(reply);
@@ -104,6 +110,9 @@ fn start_envelope(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
     // Capture the turn's own args for the finish path (the pull
     // handler's args are the guard's `{stream_id, round}`).
     *TURN_ARGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(args.clone());
+    // A resident guest serves turn after turn: nothing from the previous
+    // one may leak into this one (the branch slot is per turn).
+    *COMPRESSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let (first_delta, _sid) = start_turn(ctx, args)?;
     Ok(json!({ "done": false, "item": { "delta": first_delta } }))
 }
@@ -179,7 +188,17 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
             .to_string();
         messages.push(json!({ "role": role, "content": content }));
     }
+    // The prefix the compression side branch summarizes: head + summary +
+    // history, WITHOUT this turn's new message (the span k10r proposed to
+    // cover ends before it).
+    let prefix_len = messages.len();
     messages.push(json!({ "role": "user", "content": user_message }));
+
+    // 3. The compression side branch (Phase 3): k10r's verdict rode the
+    // projection, so the summary is produced HERE, concurrently with the
+    // answer and from the same prefix — the caller never states a coverage
+    // point; k10r derives it from the verdict it served (ADR-0008 §4).
+    start_compression(ctx, args, &view, &messages[..prefix_len]);
 
     // 3. Open the provider stream; its first reply carries the first
     // envelope (with the realm-minted stream_id merged in). A
@@ -296,6 +315,179 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
     // Remember the reply text accumulated so far.
     REPLY_PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(delta.clone());
     Ok((delta, sid))
+}
+
+/// The compression side branch's provider instance key. A provider guest
+/// holds ONE SSE connection per process, and the realm keys instances by
+/// (booth type, key), so the side branch takes its own instance — sharing
+/// the main branch's would make the two streams fight over that one slot.
+const SIDE_KEY: &str = "compress";
+
+/// The side branch while it is live: its provider stream and the tokens
+/// received so far (process state — the process IS the turn).
+struct Compression {
+    stream_id: String,
+    parts: Vec<String>,
+}
+
+static COMPRESSION: std::sync::Mutex<Option<Compression>> = std::sync::Mutex::new(None);
+
+/// Open the compression side branch from k10r's verdict (ADR-0008 §4): the
+/// same prefix the main branch reads, the served tail prompt in place of
+/// this turn's message. It runs CONCURRENTLY with the answer — the provider
+/// pulls are interleaved by the pull face — and every failure is swallowed:
+/// compression is maintenance, and a broken side branch must never fail a
+/// turn. An unlanded summary leaves k10r's node open, which is its
+/// "compressing" marker; the next read skips it.
+fn start_compression(ctx: &mut Ctx, args: &Value, view: &Value, prefix: &[Value]) {
+    let Some(prompt) = view
+        .get("compress")
+        .and_then(|c| c.get("prompt"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let mut messages: Vec<Value> = prefix.to_vec();
+    messages.push(json!({ "role": "user", "content": prompt }));
+    let first = match ctx.iterate_start(
+        "llm_provider",
+        SIDE_KEY,
+        "stream",
+        json!({
+            "endpoint": args.get("endpoint"),
+            "model": args.get("model"),
+            "key_env": args.get("key_env"),
+            "messages": messages,
+        }),
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("[gravity-turn] compression branch failed to open: {e:#}");
+            return;
+        }
+    };
+    // A string reply is the provider's error value crossing the bridge.
+    if let Some(err) = first.as_str() {
+        eprintln!("[gravity-turn] compression branch failed: {err}");
+        return;
+    }
+    // A branch that closed on its first round carries no stream id (the
+    // realm merges one only for a non-terminal reply): nothing to land.
+    let Some(sid) = first
+        .get("stream_id")
+        .and_then(Value::as_str)
+        .filter(|_| first.get("done").and_then(Value::as_bool) != Some(true))
+    else {
+        return;
+    };
+    let mut parts = Vec::new();
+    if let Some(delta) = first
+        .get("item")
+        .and_then(|item| item.get("delta"))
+        .and_then(Value::as_str)
+    {
+        parts.push(delta.to_string());
+    }
+    *COMPRESSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Compression {
+        stream_id: sid.to_string(),
+        parts,
+    });
+}
+
+/// One pull round of the side branch. On `done` the summary goes to k10r's
+/// checkpoint door — the summary ALONE: k10r derives the coverage point from
+/// the verdict it served, so the caller never states one.
+fn step_compression(ctx: &mut Ctx) {
+    let Some(mut branch) = COMPRESSION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    else {
+        return;
+    };
+    let env = match ctx.iterate_next(&branch.stream_id) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("[gravity-turn] compression pull failed: {e:#}");
+            return;
+        }
+    };
+    if env.get("done").and_then(Value::as_bool) == Some(true) {
+        let _ = ctx.iterate_dispose(&branch.stream_id);
+        if let Some(err) = env.get("value").and_then(Value::as_str) {
+            eprintln!("[gravity-turn] compression branch ended without a summary: {err}");
+            return;
+        }
+        let summary = branch.parts.concat();
+        if summary.trim().is_empty() {
+            return;
+        }
+        land_summary(&summary);
+        return;
+    }
+    if let Some(delta) = env
+        .get("item")
+        .and_then(|item| item.get("delta"))
+        .and_then(Value::as_str)
+    {
+        branch.parts.push(delta.to_string());
+    }
+    *COMPRESSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(branch);
+}
+
+/// Drain the side branch before the turn closes. The carrier releases the
+/// turn's stream at `done` and the guest's state goes with it, so a branch
+/// still live here is pulled to completion: the summary must land before the
+/// next user message (Phase 3), and the answer has already streamed, so the
+/// only wait is the summary's own tail. The cap keeps a runaway branch from
+/// holding the turn open; what is left unlanded is k10r's open node, which
+/// its next read treats as "compressing".
+fn drain_compression(ctx: &mut Ctx) {
+    for _ in 0..64 {
+        let live = COMPRESSION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if !live {
+            return;
+        }
+        step_compression(ctx);
+    }
+    eprintln!("[gravity-turn] compression branch still live after 64 pulls");
+}
+
+/// `POST …/checkpoint { summary }` — the door k10r opened when it served the
+/// verdict. 204 is the answer; anything else is REPORTED and the turn goes
+/// on (the alternative, failing the turn over maintenance, would trade a
+/// user-visible answer for a bookkeeping one).
+fn land_summary(summary: &str) {
+    let Some(args) = TURN_ARGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    else {
+        return;
+    };
+    let (Some(store_url), Some(channel_id), Some(member_id)) = (
+        args.get("store_url").and_then(Value::as_str),
+        args.get("channel_id").and_then(Value::as_u64),
+        args.get("member_id").and_then(Value::as_u64),
+    ) else {
+        return;
+    };
+    let url = format!(
+        "{}/channels/{channel_id}/members/{member_id}/checkpoint",
+        store_url.trim_end_matches('/')
+    );
+    let body = json!({ "summary": summary }).to_string();
+    match ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body)
+    {
+        Ok(resp) if (200..300).contains(&resp.status()) => {}
+        Ok(resp) => eprintln!("[gravity-turn] checkpoint door answered {}", resp.status()),
+        Err(e) => eprintln!("[gravity-turn] checkpoint door failed: {e}"),
+    }
 }
 
 /// The accumulated reply text (process state — the turn IS the stream).

@@ -59,6 +59,62 @@ async fn sse_server(body_chunks: Vec<&'static str>) -> String {
     format!("http://{addr}")
 }
 
+/// One SSE body assembled from `chunks` (the reply is their concatenation,
+/// one chunk per token) and closed by `[DONE]`.
+fn sse_body(chunks: &[&'static str]) -> String {
+    let mut sse = String::new();
+    for c in chunks {
+        let payload = serde_json::json!({ "choices": [{ "delta": { "content": c } }] });
+        sse.push_str(&format!("data: {payload}\n\n"));
+    }
+    sse.push_str("data: [DONE]\n\n");
+    sse
+}
+
+/// An SSE stub that answers the answer and the compression branch
+/// DIFFERENTLY, keyed on the request itself: k10r's tail prompt is the last
+/// message of the side branch (the turn appends it in place of the user's
+/// message), so a request that ends with it asks for the summary and every
+/// other request asks for the reply.
+async fn sse_server_two_branches(
+    reply: Vec<&'static str>,
+    summary: Vec<&'static str>,
+) -> String {
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let reply = reply.clone();
+            let summary = summary.clone();
+            async move {
+                let asked = serde_json::from_slice::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("messages")
+                            .and_then(|m| m.as_array())
+                            .and_then(|m| m.last())
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                let chunks = if asked.starts_with("Summarize the conversation span") {
+                    summary
+                } else {
+                    reply
+                };
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse_body(&chunks)))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
 async fn boot() -> Engine {
     // The provider guest reads the LLM key from the env var its args NAME
     // (`key_env`), and that var rides the PROCESS environment the guest
@@ -99,6 +155,31 @@ async fn mem_server() -> String {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     // Leak the guard: the store files must outlive the test (the same
     // discipline the python-cut tests used).
+    std::mem::forget(dir);
+    format!("http://{addr}")
+}
+
+/// A mem-server whose compression policy fires on any non-empty increment
+/// (k10r's own budget-only recipe, copied from its compression surface test):
+/// the turn's session read then carries a `compress` verdict, which is what
+/// the side branch rides. The cache clock is out of reach, so only the budget
+/// can speak.
+async fn mem_server_with_compression() -> String {
+    let dir = tempfile::TempDir::new().unwrap();
+    let app = mem_server::open_with_compression(
+        dir.path().to_path_buf(),
+        None,
+        mem_core::CompressionParams {
+            context_bytes: 100,
+            budget_percent: 50,
+            cache_ttl_ms: 3_600_000,
+            floor_bytes: 1,
+        },
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     std::mem::forget(dir);
     format!("http://{addr}")
 }
@@ -578,4 +659,38 @@ async fn a_provider_that_never_stops_asking_for_tools_fails_the_turn() {
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
     let view = surface.fetch_session(7, 1).await.unwrap();
     assert!(view.increment.is_empty(), "a failed turn appends nothing");
+}
+
+/// Phase 3's turn-loop half: k10r's verdict rode the projection, so the turn
+/// fires the side branch from the SAME prefix (without this turn's message),
+/// runs it alongside the answer, and lands the summary through the checkpoint
+/// door before the next message — k10r derives the coverage point from the
+/// verdict it served, so the caller never states one.
+#[tokio::test]
+async fn the_compression_branch_lands_the_served_summary() {
+    let endpoint =
+        sse_server_two_branches(vec!["hel", "lo ", "wor", "ld"], vec!["compressed ", "span"]).await;
+    let store_url = mem_server_with_compression().await;
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    // Three records with a wide gap before the last one: the verdict's split
+    // is that gap's end (k10r's own recipe).
+    for (ts, text) in [
+        (1_000u64, "first message of the span"),
+        (2_000, "second message of the span"),
+        (9_000, "third message of the span"),
+    ] {
+        surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
+    }
+
+    let engine = boot().await;
+    let deltas = drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    assert_eq!(deltas.join(""), "hello world", "the answer still streams");
+
+    let view = surface.fetch_session(7, 1).await.unwrap();
+    assert_eq!(
+        view.summary.as_deref(),
+        Some("compressed span"),
+        "the checkpoint door took the summary the side branch produced"
+    );
+    assert_eq!(view.coverage_ts, 2_000, "the split k10r proposed");
 }
