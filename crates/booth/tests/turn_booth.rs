@@ -60,6 +60,13 @@ async fn sse_server(body_chunks: Vec<&'static str>) -> String {
 }
 
 async fn boot() -> Engine {
+    // The provider guest reads the LLM key from the env var its args NAME
+    // (`key_env`), and that var rides the PROCESS environment the guest
+    // child inherits. The fixture owns the requirement — without it the
+    // provider bails at Start and every happy-path turn ends empty, so
+    // the suite would depend on an ambient variable no machine is told
+    // to export.
+    std::env::set_var("GRAVITY_TEST_KEY", "test-key");
     let engine = Engine::start(&Default::default())
         .await
         .expect("engine boot");
@@ -136,6 +143,15 @@ async fn drain_turn(engine: &Engine, store_url: &str, endpoint: &str, msg: &str)
             Err(_) => panic!("reply dropped"),
         };
         if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+            // A failed guest answers a STRING value (the carrier wraps a
+            // bare error reply as `{done:true, value:"…"}`), while a
+            // finished turn answers `{value:{reply}}`. Reading `done`
+            // alone turns "the provider never started" into "the model
+            // said nothing" — the exact failure this fixture is here to
+            // catch, so it fails loudly instead.
+            if let Some(err) = v.get("value").and_then(|value| value.as_str()) {
+                panic!("turn failed: {err}");
+            }
             return deltas;
         }
         if stream_id.is_none() {
