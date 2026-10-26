@@ -14,15 +14,36 @@ run LLM + tool-call loop                   // skill execution via Probe
 append(session_id, delta)                  // only the new messages
 ```
 
-Stateless between turns: no resident loop, no session state in memory. Compression: k10r owns the verdict (the trigger is evaluated at the projection read and arrives as `SessionProjection.compress` — `{checkpoint, prompt}`), and Gravity CARRIES it through both surfaces (the in-process one runs the same engine, so the two agree); running the summary turn out of band and handing the text back through the checkpoint door is the turn loop's half, still unwired. Gravity no longer states a coverage point where it calls k10r — the door derives it from the verdict it served. Memory reads are k10r's doors; the head arrives already rendered.
+Stateless between turns: no resident loop, no session state in memory. Compression: k10r owns the verdict (the trigger is evaluated at the projection read and arrives as `SessionProjection.compress` — `{checkpoint, prompt}`), and Gravity CARRIES it through both surfaces (the in-process one runs the same engine, so the two agree). The turn loop runs the summary out of band: it opens a second provider stream from the SAME prefix on its own instance key, advances both streams round by round, and hands the summary back through the checkpoint door — k10r derives the coverage point from the verdict it served. A branch still live when the answer ends is drained before the turn closes (the carrier releases the guest's state at `done`); the scheduled/idle trigger that would make it free of the turn's end is still open. Memory reads are k10r's doors; the head arrives already rendered.
 
 ## Layout
 
 - `crates/core` — turn executor: memory surface seam (in-process / HTTP), LLM loop, tool-call dispatch, SSE streaming
-- `crates/cli` — local driver: for-loop over turns (local/single-machine mode)
-- `crates/booth` — Aura Booth binding: one turn event per execution (distributed mode)
+- `crates/cli` — the venue client: one command = one call over prism's WS turn verbs (`turn.submit` / `turn.delta`* / `turn.done` / `turn.cancel`), no REPL, no client-side session state (ADR-0002)
+- `crates/booth` — Aura Booth binding: one turn event per execution (the turn runs here, in the venue)
 
-Same execution function, three drivers: CLI (local), Aura Booth (distributed), FaaS (serverless).
+The turn function is ONE implementation (`crates/core`), executed by the booth. The CLI does not run it: it submits to the venue like any other client, so there is no second driver — a FaaS driver (same function, another host) stays deferred.
+
+## The CLI
+
+```
+gravity [--json] [--session <id>] [--venue <ws-url>] [--cancel-after-ms <n>] <text>...
+```
+
+One argument = one turn (`-` reads stdin as ONE turn); `--json` prints one
+object per turn for scripts, the default streams the deltas as they arrive.
+Ctrl-C — or `--cancel-after-ms` — sends `turn.cancel`, the venue's own verb,
+rather than dropping a turn behind a dead socket. Exit codes: 0 done, 2
+usage/config, 3 auth, 4 the turn failed, 5 venue unreachable.
+
+Config (`GRAVITY_CONFIG`, default `./gravity.json`) needs a `venue` node:
+
+```json
+{ "venue": { "url": "ws://127.0.0.1:7780", "username": "me", "password_env": "GRAVITY_VENUE_PW" } }
+```
+
+The password lives in the env var that field NAMES (never in the file). The
+CLI logs in, falls back to signup once on a fresh venue, then submits.
 
 ## Memory connection (Phase 0)
 
