@@ -12,13 +12,16 @@
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct GravityConfig {
     /// OpenAI-compatible chat-completions endpoint
-    /// (e.g. `https://api.openai.com/v1`).
-    pub endpoint: String,
+    /// (e.g. `https://api.openai.com/v1`). Optional since the CLI became a
+    /// VENUE CLIENT (ADR-0002): a CLI deployment names `venue` and holds no
+    /// endpoint of its own — the turn runs in the booth, whose facts ride
+    /// the turn args.
+    pub endpoint: Option<String>,
     /// Model id the endpoint serves (`gpt-4o-mini`, ...).
-    pub model: String,
+    pub model: Option<String>,
     /// The env var NAME holding the API key — the key itself is never
     /// in the config (ADR-0007 §secrets).
-    pub api_key_env: String,
+    pub api_key_env: Option<String>,
     /// Krystallizer connection — exactly one of:
     /// `store_path`: a local fjall directory (in-process mem-core, the
     /// same-machine detail), or
@@ -33,6 +36,21 @@ pub struct GravityConfig {
     /// config carrying it is refused when the turn surface is built
     /// (`MemoryFormat::from_config`, gravity-core).
     pub memory_format: Option<String>,
+    /// The venue this CLI submits turns to (ADR-0002). Its presence is what
+    /// makes the file a CLIENT config; the local for-loop is retired.
+    pub venue: Option<VenueConfig>,
+}
+
+/// The venue's connection facts. The password is NOT here — the field names
+/// the env var that holds it (the same custody rule as the API key).
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct VenueConfig {
+    /// The gateway's WS address, e.g. `ws://127.0.0.1:7780`.
+    pub url: String,
+    /// The account the CLI binds as (signup on first use, login after).
+    pub username: String,
+    /// The env var NAME holding the password.
+    pub password_env: String,
 }
 
 impl GravityConfig {
@@ -40,7 +58,24 @@ impl GravityConfig {
     /// boundary exactly once per call — it never lands in the config
     /// struct, so Debug-logging the config can never leak it.
     pub fn api_key(&self) -> anyhow::Result<String> {
-        std::env::var(&self.api_key_env)
-            .map_err(|_| anyhow::anyhow!("env var {} not set (the API key)", self.api_key_env))
+        let name = self
+            .api_key_env
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("config has no `api_key_env` (not an LLM-hosting config)"))?;
+        std::env::var(name).map_err(|_| anyhow::anyhow!("env var {name} not set (the API key)"))
+    }
+
+    /// The endpoint, when this config hosts an LLM locally.
+    pub fn endpoint(&self) -> anyhow::Result<&str> {
+        self.endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("config has no `endpoint` (not an LLM-hosting config)"))
+    }
+
+    /// The model id, same rule.
+    pub fn model(&self) -> anyhow::Result<&str> {
+        self.model
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("config has no `model` (not an LLM-hosting config)"))
     }
 }

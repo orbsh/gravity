@@ -9,11 +9,26 @@ name = "gravity"
 path = "src/main.rs"
 
 [dependencies]
-gravity-core = { path = "../core" }
+# No gravity-core: the CLI submits to a venue (ADR-0002) — the turn function
+# runs in the booth, not in this process.
 gravity-config = { path = "../config" }
 anyhow.workspace = true
 serde_json.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "io-util", "time", "net"] }
+tokio-tungstenite = { version = "0.24", features = ["handshake"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+# The fixture's venue is a hand-rolled WS server (tokio-tungstenite's own
+# accept side): the CLI's protocol handling is what these tests pin, and
+# prism's gateway already has its own end-to-end suite. Integration tests see
+# only this section plus the binary, so every crate they name is repeated here.
+tempfile.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["handshake"] }
+futures-util = "0.3"
 
 [lints]
 workspace = true

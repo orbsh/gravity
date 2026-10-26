@@ -38,11 +38,15 @@ impl LlmClient {
     /// Resolve once per turn (not per request): the key comes from the
     /// env var named in the config and is held only inside this handle.
     pub fn from_config(config: &gravity_config::GravityConfig) -> anyhow::Result<Self> {
+        let api_key_env_name = config
+            .api_key_env
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("config has no `api_key_env` (not an LLM-hosting config)"))?;
         Ok(Self {
-            endpoint: config.endpoint.trim_end_matches('/').to_string(),
-            model: config.model.clone(),
+            endpoint: config.endpoint()?.trim_end_matches('/').to_string(),
+            model: config.model()?.to_string(),
             api_key: config.api_key()?,
-            api_key_env_name: config.api_key_env.clone(),
+            api_key_env_name,
             http: reqwest::Client::new(),
         })
     }

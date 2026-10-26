@@ -2147,10 +2147,12 @@ name = "gravity-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures-util",
  "gravity-config",
- "gravity-core",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]
