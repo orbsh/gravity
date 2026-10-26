@@ -45,6 +45,11 @@ Config (`GRAVITY_CONFIG`, default `./gravity.json`) needs a `venue` node:
 The password lives in the env var that field NAMES (never in the file). The
 CLI logs in, falls back to signup once on a fresh venue, then submits.
 
+`scripts/smoke-venue.sh` puts this binary on a real gateway — stub provider,
+k10r's mem-server, prism, then `gravity --json hi` — and asserts both the reply
+on stdout and the message pair k10r recorded. It is a script and not a test
+because it wants three repos built and three fixed ports.
+
 ## Memory connection (Phase 0)
 
 The turn function speaks one `MemorySurface` seam; the config picks the
