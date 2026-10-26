@@ -533,7 +533,7 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
         CallSlot::Hot { rx, .. } => (rx, None),
         _ => panic!("iterate is hot-only"),
     };
-    let mut saw_tool_result = None;
+    let mut reply = String::new();
     loop {
         let v = match rx.await {
             Ok(Ok(v)) => v,
@@ -551,8 +551,8 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
                     .to_string(),
             );
         }
-        if let Some(tr) = v.get("item").and_then(|i| i.get("tool_result")) {
-            saw_tool_result = Some(tr.clone());
+        if let Some(delta) = v.get("item").and_then(|i| i.get("delta")).and_then(|d| d.as_str()) {
+            reply.push_str(delta);
         }
         let id = stream_id.clone().unwrap();
         match Realm::iterate(&engine.realm, IterateOp::Next { stream_id: id })
@@ -563,15 +563,9 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
             _ => panic!("iterate is hot-only"),
         }
     }
-    let tr = saw_tool_result.expect("the tool result surfaced as an envelope item");
-    assert_eq!(tr["tool_call_id"], "c1");
-    let answer: serde_json::Value =
-        serde_json::from_str(tr["content"].as_str().expect("content is a string"))
-            .expect("the door's answer is JSON");
-    assert!(
-        answer[0]["outcome"].is_string(),
-        "the ingest answered an outcome, not an error: {answer}"
-    );
+    // The stream carries the ANSWER and nothing else (prism's face takes
+    // `item.delta`; a tool_result item would kill the turn at the pump).
+    assert_eq!(reply, "all good", "the answer streamed after the tool round");
 
     // The list rode BOTH rounds: the first request offered it, and the
     // re-open (the next inference round) carried the same affordances.
@@ -584,8 +578,27 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
             .iter()
             .map(|tool| tool["function"]["name"].as_str().unwrap_or_default())
             .collect();
-        assert_eq!(names, vec!["recall_memory", "commit_memory"], "{body}");
+        assert_eq!(
+            names,
+            vec!["recall_memory", "commit_memory", "resolve_skills"],
+            "{body}"
+        );
     }
+    // The tool's answer rode back INTO the loop: the re-open carries the
+    // assistant's call and the tool message (OpenAI's wire shape), which is
+    // the only place a tool result belongs.
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).expect("a JSON request");
+    let tool_message = second["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("the tool result is fed back to the model");
+    assert_eq!(tool_message["tool_call_id"], "c1");
+    assert!(
+        tool_message["content"].as_str().unwrap_or("").contains("outcome"),
+        "the ingest's answer reached the model: {tool_message}"
+    );
 
     // And the write LANDED: the graph door shows the entity the tuple named.
     // The read runs on a BLOCKING thread: mem-server lives in this process, so

@@ -1,12 +1,13 @@
 //! The fixed tool list (ADR-0004): hardcoded, grouped, and carrying the names
 //! k10r's tool face already has (`docs/SEAM.md` §2).
 //!
-//! Two entries today, because two doors answer: `recall_memory` and
-//! `commit_memory`. `resolve_skills` has no door (k10r withdrew the bring-up
-//! pool read with zero clients; the skill node is Phase 5+) and `invoke_skill`
-//! needs the skill identity `resolve_skills` produces — the ADR fixed their
-//! NAMES so nothing is renamed later, and the list grows by door, never by
-//! enthusiasm. Listing a tool the substrate cannot serve would teach the model
+//! Three entries today, because three doors answer: `recall_memory`,
+//! `commit_memory` and `resolve_skills` (k10r ADR-0015 landed the skill node and
+//! its resolve door, which is what this name was waiting for). `invoke_skill`
+//! stays off until the walk over a skill exists (gravity Phase 4.6: resolve a
+//! step's `code_id` to a code row, then call the language's mount) — the ADR
+//! fixed the NAME so nothing is renamed later, and the list grows by door, never
+//! by enthusiasm. Listing a tool the substrate cannot serve would teach the model
 //! that failing tools are normal.
 //!
 //! The list is static on purpose: the `tools` array is part of the request's
@@ -82,6 +83,31 @@ static SPECS: &[ToolSpec] = &[
         },
         nature: Nature::Human,
     },
+    ToolSpec {
+        name: "resolve_skills",
+        description: "List the skills this deployment can run. Use it when the answer needs a \
+                      capability the conversation did not hand you: k10r answers candidates by \
+                      intent — each with a name, what it does and a score. A candidate is not a \
+                      tool by itself; the call that walks one comes from `invoke_skill`, which \
+                      takes the id you pick here.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What you are trying to do, in natural language."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many candidates at most (default 5, at most 20)."
+                    }
+                },
+                "required": ["query"]
+            })
+        },
+        nature: Nature::Fast,
+    },
 ];
 
 /// The entries, in the order the model sees them.
@@ -149,6 +175,20 @@ pub fn call(
             let scope = scope(memory_scope, "commit_memory")?;
             post(&format!("{store_url}/memories/{scope}"), facts)
         }
+        "resolve_skills" => {
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or("resolve_skills: `query` is required")?;
+            // A skill is a node in the same graph as the facts (k10r ADR-0015),
+            // so the scope that addresses the graph addresses its skills too.
+            let scope = scope(memory_scope, "resolve_skills")?;
+            let mut body = json!({ "query": query });
+            if let Some(limit) = args.get("limit") {
+                body["limit"] = limit.clone();
+            }
+            post(&format!("{store_url}/skills/{scope}/resolve"), &body)
+        }
         other => Err(format!(
             "unknown tool `{other}`; this deployment serves: {}",
             names().join(", ")
@@ -184,7 +224,10 @@ mod tests {
 
     #[test]
     fn the_list_carries_the_tool_faces_names() {
-        assert_eq!(names(), vec!["recall_memory", "commit_memory"]);
+        assert_eq!(
+            names(),
+            vec!["recall_memory", "commit_memory", "resolve_skills"]
+        );
     }
 
     #[test]
@@ -211,6 +254,79 @@ mod tests {
         };
         assert!(error.contains("unknown tool `invoke_skill`"), "{error}");
         assert!(error.contains("recall_memory"), "{error}");
+    }
+
+    /// A one-shot HTTP server on an OS-picked port: it records the request line
+    /// and body, then answers `answer`. Enough to prove WHERE a tool call goes
+    /// and WHAT it carries — the door's own behaviour is k10r's test.
+    fn one_shot(answer: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let url = format!("http://{}", listener.local_addr().expect("an address"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("one connection");
+            // Read until the body is there: one `read()` may stop at the end of
+            // the headers (TCP segmentation), and a test that assumes otherwise
+            // asserts against an empty body.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut chunk).expect("a request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let complete = String::from_utf8_lossy(&request)
+                    .split_once("\r\n\r\n")
+                    .map(|(head, body)| {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        body.len() >= length
+                    })
+                    .unwrap_or(false);
+                if complete {
+                    break;
+                }
+            }
+            tx.send(String::from_utf8_lossy(&request).to_string())
+                .expect("the test is listening");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                answer.len(),
+                answer
+            );
+            socket.write_all(response.as_bytes()).expect("a reply");
+        });
+        (url, rx)
+    }
+
+    #[test]
+    fn resolve_skills_posts_to_the_skill_door_with_the_scope_in_the_path() {
+        let (url, seen) = one_shot(r#"[{"node_id":4,"name":"github-issues","title":"issues","content":"lists them","score":0.5}]"#);
+        let answer = call(
+            "resolve_skills",
+            &json!({ "query": "list github issues", "limit": 3 }),
+            &url,
+            Some(37),
+        )
+        .expect("the door answered");
+        assert_eq!(answer[0]["name"], "github-issues");
+
+        let request = seen.recv().expect("the server saw the call");
+        assert!(
+            request.starts_with("POST /skills/37/resolve "),
+            "a skill is a node in the graph, so the graph's scope addresses it: {request}"
+        );
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        assert!(body.contains("\"query\":\"list github issues\""), "{body}");
+        assert!(body.contains("\"limit\":3"), "the limit rides the call: {body}");
     }
 
     #[test]

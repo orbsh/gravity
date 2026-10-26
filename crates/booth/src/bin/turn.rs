@@ -58,14 +58,6 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
     if round == 0 {
         anyhow::bail!("turn: pull round 0 is the Start handler's job");
     }
-    // Tool results from the Start-face dispatch loop surface first (the
-    // consumer sees the loop's progress before the content deltas).
-    {
-        let mut results = TOOL_RESULTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !results.is_empty() {
-            return Ok(json!({ "done": false, "item": results.remove(0) }));
-        }
-    }
     // The side branch advances one pull per round, on the same face: the
     // summary is produced alongside the answer, never in front of it.
     step_compression(ctx);
@@ -241,11 +233,13 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
         let Some(calls) = first.get("item").and_then(|i| i.get("tool_calls")) else {
             break; // a content stream — the pull face takes over
         };
-        // Dispatch every call; feed the messages back; surface each
-        // result (the consumer's tool_result items ride the loop rounds
-        // through TOOL_RESULTS). The list is the contract (ADR-0004):
-        // every failure is a value the MODEL reads, never a turn failure —
-        // a wrong argument must not cost the user their answer.
+        // Dispatch every call, feed the messages back, and re-open the
+        // provider — the loop's own rounds. The list is the contract
+        // (ADR-0004): every failure is a value the MODEL reads, never a
+        // turn failure — a wrong argument must not cost the user their
+        // answer. The result goes to the model and to this turn's
+        // transcript, not to the stream (prism's face carries `item.delta`
+        // and refuses the rest).
         let parsed = gravity_core::tool::parse_tool_calls(&json!({ "tool_calls": calls }))
             .context("turn: malformed tool calls from the provider")?;
         let memory_scope = args.get("memory_scope").and_then(Value::as_u64);
@@ -259,12 +253,13 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
                 Ok(value) => value.to_string(),
                 Err(error) => json!({ "error": error }).to_string(),
             };
-            let entry = json!({
-                "tool_result": { "tool_call_id": call.id, "content": content }
-            });
-            TOOL_RESULTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(entry);
             // The fed-back wire shape: the assistant's call + the tool's
-            // result (OpenAI's loop contract).
+            // result (OpenAI's loop contract). The result is the MODEL's,
+            // not the consumer's: prism's turn stream carries text deltas
+            // (`item.delta`) and refuses anything else, so the loop's
+            // progress stays inside the turn (PLAN Phase 2.5's transcript).
+            // A tool PROGRESS frame for a UI is prism's protocol to add,
+            // not a frame gravity invents behind its back.
             messages.push(json!({ "role": "assistant", "tool_calls": calls }));
             messages.push(json!({
                 "role": "tool",
@@ -497,11 +492,6 @@ static REPLY_PARTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::n
 /// The turn's own args, captured at Start (the pull handler's args are
 /// the guard's `{stream_id, round}` — the addressing rides state).
 static TURN_ARGS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
-
-/// Tool results from the Start-face dispatch loop (the consumer sees
-/// the loop's progress — each surfaces as an envelope item before the
-/// content deltas).
-static TOOL_RESULTS: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
 
 /// The terminal round: append the one-ts-two-subs exchange, return the
 /// terminal envelope (the full reply as the value).

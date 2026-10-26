@@ -8,7 +8,8 @@
 #   1. stub provider (SSE)       — fixed tokens, so the expected reply is known
 #   2. krystallizer mem-server   — a fresh store under $ROOT
 #   3. prism                     — open posture, gravity's booth binaries wired
-#   4. `gravity --json hi`       — the CLI, as a user would run it
+#   4. `gravity --json hi`       — the CLI, as a user would run it, with the
+#                                  stub asking for `commit_memory` on round 0
 # and then reads k10r back to prove the turn landed (a reply on stdout is not
 # the same claim as a written record).
 #
@@ -68,16 +69,23 @@ KDL
 cat > "$ROOT/sse.py" <<PY
 import json
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(sys.argv[1])
 CHUNKS = ["hello", " world"]
+# One fact the model is told to commit, so the run exercises the TOOL PATH
+# through the real stack (prism -> the booth -> k10r), not just the reply path.
+FACT = [["alice", "person", {}, "likes", {}, "tea", "drink", {}]]
+ROUNDS = 0
+LOCK = threading.Lock()
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_POST(self):
+        global ROUNDS
         body = self.rfile.read(int(self.headers.get("content-length", 0)))
         # The affordances must ride the request (ADR-0004): a model that is
         # never told what it can call cannot call anything. A missing list is
@@ -85,6 +93,15 @@ class Handler(BaseHTTPRequestHandler):
         # quietly looking like a model that chose not to use a tool.
         missing = [name for name in (b"recall_memory", b"commit_memory") if name not in body]
         if missing:
+            self.send_response(500)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        with LOCK:
+            round_index = ROUNDS
+            ROUNDS += 1
+        # round 1's check needs the body, and a refusal must not start a 200.
+        if round_index == 1 and b"github-issues" not in body:
             self.send_response(500)
             self.send_header("content-length", "0")
             self.end_headers()
@@ -99,9 +116,47 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"%x\r\n%s\r\n" % (len(payload), payload))
             self.wfile.flush()
 
-        for piece in CHUNKS:
-            event = {"choices": [{"index": 0, "delta": {"content": piece}}]}
-            chunk(b"data: " + json.dumps(event).encode() + b"\n\n")
+        def event(delta: dict) -> None:
+            chunk(b"data: " + json.dumps({"choices": [{"index": 0, "delta": delta}]}).encode() + b"\n\n")
+
+        if round_index == 0:
+            # A real model with the list in front of it asks for a capability
+            # first: resolve_skills, the group that lists what this deployment
+            # can do.
+            event(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {
+                                "name": "resolve_skills",
+                                "arguments": json.dumps({"query": "list github issues"}),
+                            },
+                        }
+                    ]
+                }
+            )
+        elif round_index == 1:
+            # The resolver's answer must have come BACK as the tool message of
+            # this request, carrying the skill declared before the run. A door
+            # that answers into the void looks exactly like a model that never
+            # asked, so the check is here rather than in k10r.
+            event(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "c2",
+                            "function": {
+                                "name": "commit_memory",
+                                "arguments": json.dumps({"facts": FACT}),
+                            },
+                        }
+                    ]
+                }
+            )
+        else:
+            for piece in CHUNKS:
+                event({"content": piece})
         chunk(b"data: [DONE]\n\n")
         chunk(b"")
 
@@ -138,6 +193,17 @@ wait_for "$SSE_PORT" "stub provider" || exit 1
     >"$ROOT/mem.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_for "$MEM_PORT" "mem-server" || exit 1
+
+# One skill declared before the turn: `resolve_skills` must have something to
+# find, or the smoke proves the door exists and nothing else. Its step points at
+# a code row the run never fetches — resolving is the call under test, the walk
+# over the result is invoke_skill's (still unlisted, gravity Phase 4.6).
+curl -sf -X POST "http://127.0.0.1:$MEM_PORT/skills/37" \
+    -H 'content-type: application/json' \
+    -d '{"name":"github-issues","title":"issues","content":"Lists the open issues of a GitHub repository.","steps":"[{\"code_id\":1}]"}' \
+    >"$ROOT/skill.json" || fail "declaring a skill failed"
+grep -q '"created":true' "$ROOT/skill.json" || fail "the skill was not created: $(cat "$ROOT/skill.json")"
+echo "ok: a skill is declared for the resolver to find"
 
 PRISM_ADDR="127.0.0.1:$PRISM_PORT" PRISM_IDENTITY=open PRISM_DATA="$ROOT/prism-data" \
 GRAVITY_PROVIDER_BIN="$GRAVITY_REPO/target/debug/gravity-provider" \
@@ -190,6 +256,25 @@ contents = [row["content"] for row in session["increment"]]
 if contents != ["hi", expected]:
     raise SystemExit(f"FAIL: k10r holds {contents!r}, expected ['hi', {expected!r}]")
 print("ok: k10r recorded the turn:", contents)
+PY
+
+# The TOOL path, through the whole stack: the stub asked for `commit_memory`
+# on its first inference round, so the fact must be in k10r's graph now. A
+# reply alone proves nothing — the model can answer without ever reaching a
+# tool — which is why this reads the graph instead of the transcript.
+curl -sf "http://127.0.0.1:$MEM_PORT/graph/37" >"$ROOT/graph.json" || fail "k10r graph read failed"
+python3 - "$ROOT/graph.json" <<'PY' || exit 1
+import json
+import sys
+
+graph = json.load(open(sys.argv[1]))
+names = sorted(node["name"] for node in graph["nodes"])
+if "alice" not in names or "tea" not in names:
+    raise SystemExit(f"FAIL: the tool's write never landed; graph nodes: {names}")
+edges = [(link["kind"]) for link in graph["links"]]
+if "likes" not in edges:
+    raise SystemExit(f"FAIL: the fact's edge is missing; link kinds: {edges}")
+print("ok: commit_memory reached k10r through the venue:", names, edges)
 PY
 
 echo "PASS (logs under $ROOT)"

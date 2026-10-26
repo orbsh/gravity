@@ -2,10 +2,12 @@
 
 > **Languages:** [English](0004-fixed-tool-list.md) (primary) · [中文](0004-fixed-tool-list.zh-CN.md)
 
-**Status:** Accepted (2026-10-26). Partly landed the same day: the turn sends
-the fixed `tools` array on every inference round and the memory pair
-(`recall_memory`, `commit_memory`) is wired end to end; the skill pair still
-waits on `resolve_skills`' door (k10r, PLAN Phase 5).
+**Status:** Accepted (2026-10-26). Landed the same day: the turn sends the fixed
+`tools` array on every inference round and three of the four names are wired end
+to end — `recall_memory`, `commit_memory`, and `resolve_skills` (k10r ADR-0015
+landed the skill node and its resolve door). `invoke_skill` stays unlisted until
+the walk over a skill exists (Phase 4.6): resolve a step's `code_id` to a code
+row, then call the language's mount.
 **Date:** 2026-10-26
 
 **Names withdrawn in this record:** `memory_search` / `memory_recall` /
@@ -61,9 +63,9 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
 
    | tool | arguments | what it does | today |
    |---|---|---|---|
-   | `recall_memory` | `{query}` | `POST /memories/{memory_scope}/recall` — the landing plus its community, rendered by k10r, with k10r's read budget | door landed; the tool is gravity's to write |
-   | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}` — the graph's ingest | door landed; the tool is gravity's to write |
-   | `resolve_skills` | `{query}` | the SELECTABLE SKILL LIST — what the model consults when it cannot finish on its own | **no door**: k10r withdrew the bring-up pool read on 2026-10-20 with zero clients; the skill node is Phase 5+, and "the list arrives with it, not before" (SEAM.md §2) |
+   | `recall_memory` | `{query}` | `POST /memories/{memory_scope}/recall` — the landing plus its community, rendered by k10r, with k10r's read budget | LISTED (gravity `crates/booth/src/tools.rs`) |
+   | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}` — the graph's ingest | LISTED |
+   | `resolve_skills` | `{query}`, `{limit}` | the SELECTABLE SKILL LIST — what the model consults when it cannot finish on its own; k10r answers candidates by intent | LISTED (2026-10-26): k10r ADR-0015 landed the skill node and `POST /skills/{memory_scope}/resolve` — a skill is a node in the same graph, so the graph's scope addresses it |
    | `invoke_skill` | `{name, args}` | two steps, and only the first is k10r's: `GET /code/{id}` fetches the script, then the governed call `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` runs it on an effector node mount (SEAM.md §3) | code row door landed; the call is gravity's Phase 4.6 |
 
    The task group (`task_open` / `task_done` / `task_list`) is declared but NOT
@@ -103,11 +105,11 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    N round trips.
 8. **The list grows by DOOR, never by enthusiasm.** An entry ships when its
    substrate answers; the names above are fixed now so nothing is renamed later.
-   Concretely: `recall_memory` and `commit_memory` go out as soon as they are
-   written, `invoke_skill` needs the skill identity that `resolve_skills`
-   produces (plus the language→mount match prism already declares), and
-   `resolve_skills` needs its door back — k10r withdrew a read that had no
-   client, and this is the client.
+   Concretely: `recall_memory` and `commit_memory` went out as soon as they were
+   written, and `resolve_skills` followed the same day its door landed (k10r
+   ADR-0015 — the bring-up pool read k10r withdrew with zero clients now has one).
+   `invoke_skill` is what remains: it needs the walk over a resolved skill —
+   `steps[].code_id` → `GET /code/{id}` → the language's mount (Phase 4.6).
 
 ## Considered and rejected
 
@@ -137,9 +139,21 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
 - **The affordance list and the prompt are one prefix.** A fixed `tools` array
   means the stable part of the request does not move between turns; k10r's head
   and summary sit behind it, and both are already turn-stable.
-- **k10r owes one door back** (`resolve_skills`) and one schema (the skill node:
-  preconditions / steps / experience / verification, PLAN Phase 5+). Gravity's
-  side of the skill family is `invoke_skill`'s call.
+- **The skill family's k10r side is PAID** (2026-10-26): the door is back and the
+  schema exists — a skill node of kind `skill` in the fact graph, its four parts
+  split between props (preconditions / steps / verification, JSON text) and its
+  own incident facts (experience), with `POST /skills/{scope}` /
+  `GET /skills/{scope}/{id}` / `POST /skills/{scope}/resolve` in front of it
+  (k10r ADR-0015). What gravity still owes is `invoke_skill`: the walk from a
+  resolved candidate's `steps[].code_id` to a code row and a language's mount.
+- **A tool result is the MODEL's, not the consumer's.** The turn feeds each
+  result back into the loop (the assistant's call + a `tool` message, OpenAI's
+  wire shape) and keeps it in this turn's transcript; it does NOT surface on the
+  stream. prism's turn face carries `item.delta` text and refuses anything else
+  ("envelope item carries no delta string"), so a tool_result item kills the turn
+  at the pump — found by the smoke run, not by a unit test. A tool PROGRESS frame
+  for a UI ("running `commit_memory`…") is prism's protocol to add, not a frame
+  gravity invents behind another repo's face.
 - **PLAN Phase 5** implements the pull-through and weight write-back on
   `invoke_skill`: the skill row is the registration info the counter rides, the
   counter write is additive data (ADR-0003 §5), no topology moves.
@@ -149,11 +163,13 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
   `invoke_skill`, and the language → mount match already exists in prism's
   `PRISM_MOUNTS` (`carrier`, `language`). What it still owes is the
   language-default ruling for a skill whose row states no language.
-- **Open:** the skill node's schema and its namespace (k10r's declaration), the
-  `invoke_skill` argument shape for a script that expects its own parameters,
-  and whether the graph's other entrances (`top`, `timeline`, `chain`,
-  `anchored` — all landed as doors) should ever become tools or stay what they
-  are: doors for a caller that already knows what it is looking for.
+- **Open:** the `invoke_skill` argument shape for a script that expects its own
+  parameters (the skill's `steps` and the code row's `parameters` say what it
+  takes; how they meet the model's call is Phase 4.6's), and whether the graph's
+  other entrances (`top`, `timeline`, `chain`, `anchored` — all landed as doors)
+  should ever become tools or stay what they are: doors for a caller that
+  already knows what it is looking for. The skill node's schema and namespace
+  are CLOSED (k10r ADR-0015: kind `skill` in ns 36, the scope the facts live in).
 
 ## Related records
 

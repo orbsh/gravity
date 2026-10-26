@@ -2,9 +2,10 @@
 
 > **语言：** [English](0004-fixed-tool-list.md)（主文档） · [中文](0004-fixed-tool-list.zh-CN.md)
 
-**状态：** Accepted（2026-10-26）。同日部分落地：turn 在每一轮推理都发送固定的 `tools`
-数组，memory 组那两个（`recall_memory`、`commit_memory`）已端到端接上；skill 组仍在等
-`resolve_skills` 的门（k10r，PLAN Phase 5）。
+**状态：** Accepted（2026-10-26）。同日落地：turn 在每一轮推理都发送固定的 `tools` 数组，
+四个名字里有三个已端到端接上——`recall_memory`、`commit_memory`、`resolve_skills`（k10r
+ADR-0015 落地了 skill 节点与它的 resolve 门）。`invoke_skill` 在「走完一个 skill」存在之前
+不入清单（Phase 4.6：把一步的 `code_id` 解成 code 行，再调该语言的 mount）。
 **日期：** 2026-10-26
 
 **本记录中撤回的名字：** `memory_search` / `memory_recall` / `memory_top` /
@@ -47,9 +48,9 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
 
    | 工具 | 参数 | 做什么 | 今天 |
    |---|---|---|---|
-   | `recall_memory` | `{query}` | `POST /memories/{memory_scope}/recall`——landing 加它所在的 community，由 k10r 渲染，读取预算也是 k10r 自己的 | 门已落；工具是 gravity 要写的 |
-   | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}`——图谱的 ingest | 门已落；工具是 gravity 要写的 |
-   | `resolve_skills` | `{query}` | **可选 skill 清单**——模型自己完不成时去查的东西 | **无门**：k10r 在 2026-10-20 因零客户端撤除了 bring-up 的池读；skill 节点是 Phase 5+，而「清单随它一起到，不提前」（SEAM.md §2） |
+   | `recall_memory` | `{query}` | `POST /memories/{memory_scope}/recall`——landing 加它所在的 community，由 k10r 渲染，读取预算也是 k10r 自己的 | 已入清单（gravity `crates/booth/src/tools.rs`） |
+   | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}`——图谱的 ingest | 已入清单 |
+   | `resolve_skills` | `{query}`、`{limit}` | **可选 skill 清单**——模型自己完不成时去查的东西；k10r 按意图答候选 | 已入清单（2026-10-26）：k10r ADR-0015 落地了 skill 节点与 `POST /skills/{memory_scope}/resolve`——skill 与事实同图，所以图的 scope 就地址到它 |
    | `invoke_skill` | `{name, args}` | 两步，只有第一步是 k10r 的：`GET /code/{id}` 取脚本，然后受治理的调用 `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` 在 effector 节点 mount 上跑它（SEAM.md §3） | code 行门已落；调用是 gravity 的 Phase 4.6 |
 
    task 组（`task_open` / `task_done` / `task_list`）已声明但**不入清单**：它的写面还没有
@@ -75,10 +76,10 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
    答不了的——某次具体查找、近似面做不了的枚举。它们不是投影的替代品，也不许变成每轮轮询：
    一个在每个步骤前都先 `recall_memory` 的 turn，已经把一份组装好的视图换成了 N 次往返。
 8. **清单按门生长，不按热情生长。** 一个条目在它的基底能应答时才发出去；上面的名字现在就
-   定死，免得以后改名。具体说：`recall_memory` 与 `commit_memory` 写好就可以出去；
-   `invoke_skill` 需要 `resolve_skills` 产出的 skill 身份（以及 prism 已经声明过的
-   language → mount 匹配）；`resolve_skills` 需要它的门回来——k10r 撤掉的那个读当时没有
-   客户端，现在有了。
+   定死，免得以后改名。具体说：`recall_memory` 与 `commit_memory` 写好就出去了，
+   `resolve_skills` 则在它的门落地的同一天跟上（k10r ADR-0015——当初因零客户端撤掉的
+   bring-up 池读，现在有了客户端）。剩下的是 `invoke_skill`：它需要「走完一个被解析出来的
+   skill」——`steps[].code_id` → `GET /code/{id}` → 该语言的 mount（Phase 4.6）。
 
 ## 考虑并否决
 
@@ -100,8 +101,17 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
 
 - **能力清单与 prompt 是同一个 prefix。** 固定的 `tools` 数组意味着请求里稳定那一段不在
   turn 之间移动；k10r 的 head 与 summary 排在它后面，而这两样本来就逐 turn 稳定。
-- **k10r 欠一道门**（`resolve_skills`）**和一份 schema**（skill 节点：前置 / 步骤 / 经验 /
-  后验，PLAN Phase 5+）。skill 家族在 gravity 这一侧就是 `invoke_skill` 的那次调用。
+- **skill 家族的 k10r 一侧已付**（2026-10-26）：门回来了，schema 也有了——事实图里 kind 为
+  `skill` 的节点，四部分按归属拆开（前置 / 步骤 / 后验是 prop，JSON 文本；经验是它自己的
+  关联事实），前面站着 `POST /skills/{scope}` / `GET /skills/{scope}/{id}` /
+  `POST /skills/{scope}/resolve`（k10r ADR-0015）。gravity 还欠的是 `invoke_skill`：从候选的
+  `steps[].code_id` 走到 code 行，再走到该语言的 mount。
+- **工具结果是模型的，不是消费者的。** turn 把每个结果喂回循环（assistant 的调用 + 一条
+  `tool` 消息，OpenAI 的线上形状），并留在这一轮的 transcript 里；它**不上流**。prism 的
+  turn 面只承载 `item.delta` 文本，别的一律拒绝（"envelope item carries no delta
+  string"），所以一个 tool_result 条目会在泵那里把整轮打死——这是 smoke 跑出来的，不是单元
+  测试。给 UI 用的「正在跑 `commit_memory`…」进度帧，是 prism 要加的协议，不是 gravity 绕过
+  别人的面自己发明的帧。
 - **PLAN Phase 5** 在 `invoke_skill` 上实现 pull-through 与权重回写：skill 行就是计数器挂靠
   的注册信息，计数是加性数据（ADR-0003 §5），拓扑不动。
 - **PLAN Phase 2.5** 拿到它的声明点：条目的 `nature` 是静态元数据，于是「注册时声明为冷」
@@ -109,9 +119,11 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
 - **PLAN Phase 4.6** 收窄：它一直在等的 `run` 调用**就是** `invoke_skill`，而「语言 → mount」
   的匹配已经写在 prism 的 `PRISM_MOUNTS` 里（`carrier`、`language`）。它还欠的是：当 skill
   行没声明语言时，语言默认值怎么定。
-- **开放项：** skill 节点的 schema 与它所在的 namespace（k10r 的声明）、`invoke_skill`
-  传给脚本的入参形状、以及图谱其它入口（`top`、`timeline`、`chain`、`anchored`——都已作为
-  门落地）该不该变成工具，还是保持它们本来的样子：给已经知道要找什么的调用方用的门。
+- **开放项：** `invoke_skill` 传给脚本的入参形状（skill 的 `steps` 与 code 行的
+  `parameters` 说它要什么；两者怎么与模型的调用对上，是 Phase 4.6 的）、以及图谱其它入口
+  （`top`、`timeline`、`chain`、`anchored`——都已作为门落地）该不该变成工具，还是保持它们
+  本来的样子：给已经知道要找什么的调用方用的门。skill 节点的 schema 与 namespace 已**闭合**
+  （k10r ADR-0015：ns 36 里 kind `skill`，与事实同一个 scope）。
 
 ## 相关记录
 
