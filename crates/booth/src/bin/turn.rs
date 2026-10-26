@@ -217,6 +217,9 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
                 "model": args.get("model"),
                 "key_env": args.get("key_env"),
                 "messages": messages,
+                // The fixed list (ADR-0004): the same bytes every turn, and
+                // the reason a real model can call anything at all.
+                "tools": gravity_booth::tools::tools_array(),
             }),
         )
         .context("turn: provider stream failed to open")?;
@@ -240,24 +243,21 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
         };
         // Dispatch every call; feed the messages back; surface each
         // result (the consumer's tool_result items ride the loop rounds
-        // through TOOL_RESULTS).
+        // through TOOL_RESULTS). The list is the contract (ADR-0004):
+        // every failure is a value the MODEL reads, never a turn failure —
+        // a wrong argument must not cost the user their answer.
         let parsed = gravity_core::tool::parse_tool_calls(&json!({ "tool_calls": calls }))
             .context("turn: malformed tool calls from the provider")?;
-        let target_type = args
-            .get("tool_target")
-            .and_then(Value::as_str)
-            .unwrap_or("effector")
-            .to_string();
+        let memory_scope = args.get("memory_scope").and_then(Value::as_u64);
         for call in parsed {
-            let result = ctx.invoke(
-                &target_type,
-                "",
+            let content = match gravity_booth::tools::call(
                 &call.function.name,
-                call.function.arguments.clone(),
-            );
-            let content = match result {
-                Ok(v) => v.to_string(),
-                Err(e) => json!({ "error": format!("{e:#}") }).to_string(),
+                &call.function.arguments,
+                &store_url,
+                memory_scope,
+            ) {
+                Ok(value) => value.to_string(),
+                Err(error) => json!({ "error": error }).to_string(),
             };
             let entry = json!({
                 "tool_result": { "tool_call_id": call.id, "content": content }
@@ -284,6 +284,7 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
                     "model": args.get("model"),
                     "key_env": args.get("key_env"),
                     "messages": messages,
+                    "tools": gravity_booth::tools::tools_array(),
                 }),
             )
             .context("turn: provider re-open failed")?;

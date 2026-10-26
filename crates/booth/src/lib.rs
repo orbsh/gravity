@@ -27,6 +27,10 @@
 //! the store URL rides the args the same way (a deployment fact the
 //! caller supplies per call — the booth holds no connection state).
 
+/// The fixed tool list (ADR-0004) — the affordances the turn offers, their
+/// schemas, and the door each one reaches.
+pub mod tools;
+
 /// The turn booth's type name.
 pub const TURN_TYPE: &str = "gravity_turn";
 

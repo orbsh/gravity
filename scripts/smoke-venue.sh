@@ -78,7 +78,17 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("content-length", 0)))
+        body = self.rfile.read(int(self.headers.get("content-length", 0)))
+        # The affordances must ride the request (ADR-0004): a model that is
+        # never told what it can call cannot call anything. A missing list is
+        # answered as a server error so the turn fails loudly instead of
+        # quietly looking like a model that chose not to use a tool.
+        missing = [name for name in (b"recall_memory", b"commit_memory") if name not in body]
+        if missing:
+            self.send_response(500)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
@@ -136,6 +146,7 @@ GRAVITY_STORE_URL="http://127.0.0.1:$MEM_PORT" \
 GRAVITY_ENDPOINT="http://127.0.0.1:$SSE_PORT/v1" \
 GRAVITY_MODEL="smoke-model" \
 GRAVITY_KEY_ENV="SMOKE_KEY" \
+GRAVITY_MEMORY_SCOPE=37 \
 SMOKE_KEY="smoke-key" \
     "$PRISM_REPO/target/debug/prism" >"$ROOT/prism.log" 2>&1 &
 PIDS="$PIDS $!"

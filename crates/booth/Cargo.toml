@@ -19,10 +19,11 @@ gravity-core = { path = "../core" }
 induction-guest = { path = "../../../induction/crates/induction-guest" }
 anyhow.workspace = true
 serde_json.workspace = true
-ureq = "2"
+ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+ureq = { version = "2", features = ["json"] }
 mem-core = { path = "../../../krystallizer/crates/mem-core" }
 mem-server = { path = "../../../krystallizer/crates/mem-server" }
 axum = "0.8"
@@ -30,7 +31,7 @@ aura-engine = { path = "../../../aura/crates/engine", default-features = false }
 aura-realm = { path = "../../../aura/crates/realm" }
 induction-host = { path = "../../../induction/crates/induction-host" }
 induction-protocol = { path = "../../../induction/crates/induction-protocol" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 futures = "0.3"
 
 [lints]

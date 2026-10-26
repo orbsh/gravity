@@ -193,6 +193,9 @@ fn turn_args(store_url: &str, endpoint: &str, msg: &str) -> serde_json::Value {
         "endpoint": endpoint,
         "model": "test-model",
         "key_env": "GRAVITY_TEST_KEY",
+        // The k10r namespace the memory tools reach (ADR-0004 §5): k10r's
+        // FACT_NS, the only scope a fact tuple can land in.
+        "memory_scope": 37,
     })
 }
 
@@ -218,10 +221,11 @@ async fn drain_turn(engine: &Engine, store_url: &str, endpoint: &str, msg: &str)
     };
     let mut deltas = Vec::new();
     loop {
-        let v = match rx.await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => panic!("pull failed: {e}"),
-            Err(_) => panic!("reply dropped"),
+        let v = match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
+            Ok(Ok(Ok(v))) => v,
+            Ok(Ok(Err(e))) => panic!("pull failed: {e}"),
+            Ok(Err(_)) => panic!("reply dropped"),
+            Err(_) => panic!("pull {stream_id:?} stalled for 20s"),
         };
         if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
             // A failed guest answers a STRING value (the carrier wraps a
@@ -457,31 +461,42 @@ async fn client_errors_fail_through_without_retry() {
     );
 }
 
-/// Phase 2 e2e: the provider's stream carries a tool_call — the turn
-/// parses it and dispatches through ctx.invoke to a SIBLING booth (the
-/// tool target type, here effector's induction_loop fixture speaking
-/// the same pipe), and the tool result surfaces as the stream's own
-/// envelope item. The cross-repo fixture path is the standing
-/// convention (aura's exec_booth.rs does the same).
+/// Phase 2 e2e, on the fixed list (ADR-0004): the provider asks for a tool by
+/// name, the turn dispatches it to the DOOR that name belongs to, the result
+/// feeds back into the next inference round, and the write actually landed in
+/// k10r (read back over the graph door, not trusted from the tool's own text).
+///
+/// `commit_memory` is the entry chosen because its door is deterministic: the
+/// ingest answer says which of landed / rewritten / dropped happened, and the
+/// graph read needs no embedding, so the test proves the path without an
+/// engine under the fixture.
 #[tokio::test]
-async fn tool_call_dispatches_to_the_sibling_booth() {
-    // The provider answers the loop's TWO inference rounds the way a
-    // real endpoint does: the first request asks for the tool, the
-    // SECOND (the loop's re-open, carrying the fed-back result) answers
-    // content. A stub answering tool calls to every request can never
-    // converge — the dispatch loop would burn its whole round budget
-    // and the turn would die on an empty reply.
+async fn a_tool_call_reaches_its_door_and_feeds_back() {
+    // The provider answers the loop's TWO inference rounds the way a real
+    // endpoint does: the first asks for the tool, the SECOND (the re-open
+    // carrying the fed-back result) answers content. The bodies are kept so
+    // the test can assert what the model was OFFERED, not just what it got.
     let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let hits_for_route = hits.clone();
+    let bodies_for_route = bodies.clone();
     let app = axum::Router::new().route(
         "/chat/completions",
-        axum::routing::post(move || {
-            let n = hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        axum::routing::post(move |request: axum::extract::Request| {
+            let bodies = bodies_for_route.clone();
             async move {
+                let n = hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&bytes).to_string());
                 let mut sse = String::new();
                 if n == 0 {
                     sse.push_str(
-                        r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"echo","arguments":"{\"x\":42}"}}]}}]}"#,
+                        r#"data: {"choices":[{"delta":{"tool_calls":[{"id":"c1","function":{"name":"commit_memory","arguments":"{\"facts\":[[\"alice\",\"person\",{},\"likes\",{},\"tea\",\"drink\",{}]]}"}}]}}]}"#,
                     );
                 } else {
                     sse.push_str(r#"data: {"choices":[{"delta":{"content":"all good"}}]}"#);
@@ -500,14 +515,7 @@ async fn tool_call_dispatches_to_the_sibling_booth() {
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
     let engine = boot().await;
-    // The tool target's TYPE is the caller's declaration (the deployment
-    // fact) — registered under a non-default name so a turn that
-    // ignored `tool_target` would dispatch into nothing and answer an
-    // error instead of the echo.
-    register_tool_target(&engine, "tool_booth").await;
 
-    let mut args = turn_args(&store_url, &endpoint, "hi");
-    args["tool_target"] = serde_json::json!("tool_booth");
     let slot = Realm::iterate(
         &engine.realm,
         IterateOp::Start {
@@ -516,7 +524,7 @@ async fn tool_call_dispatches_to_the_sibling_booth() {
                 key: InstanceKey::Named("s1".into()),
             },
             handler: "turn".into(),
-            args,
+            args: turn_args(&store_url, &endpoint, "hi"),
         },
     )
     .await
@@ -557,40 +565,51 @@ async fn tool_call_dispatches_to_the_sibling_booth() {
     }
     let tr = saw_tool_result.expect("the tool result surfaced as an envelope item");
     assert_eq!(tr["tool_call_id"], "c1");
-    // The fixture's echo handler wraps args: {"echoed": {"x": 42}}.
+    let answer: serde_json::Value =
+        serde_json::from_str(tr["content"].as_str().expect("content is a string"))
+            .expect("the door's answer is JSON");
     assert!(
-        tr["content"].to_string().contains("42"),
-        "the sibling booth answered through ctx.invoke: {tr}"
+        answer[0]["outcome"].is_string(),
+        "the ingest answered an outcome, not an error: {answer}"
     );
-    // One dispatch loop round: the provider saw the first request (the
-    // tool call) and exactly one re-open carrying the fed-back result —
-    // the second round answered content and let the pull face take over.
+
+    // The list rode BOTH rounds: the first request offered it, and the
+    // re-open (the next inference round) carried the same affordances.
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "two inference rounds");
+    for body in &bodies {
+        let request: serde_json::Value = serde_json::from_str(body).expect("a JSON request");
+        let tools = request["tools"].as_array().expect("the tools array is sent");
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(names, vec!["recall_memory", "commit_memory"], "{body}");
+    }
+
+    // And the write LANDED: the graph door shows the entity the tuple named.
+    // The read runs on a BLOCKING thread: mem-server lives in this process, so
+    // a blocking client call on the test's single-threaded runtime would starve
+    // the very server it is asking (the fixture deadlock, not the product's).
+    let graph_url = format!("{store_url}/graph/37");
+    let graph = tokio::task::spawn_blocking(move || {
+        ureq::get(&graph_url)
+            .call()
+            .unwrap()
+            .into_json::<serde_json::Value>()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(
+        graph.to_string().contains("alice"),
+        "the fact reached k10r through commit_memory: {graph}"
+    );
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "the loop re-opened the provider exactly once"
     );
-}
-
-/// Register the sibling tool target: effector's `induction_loop` fixture
-/// (its `echo` handler answers `{"echoed": args}`), speaking the same
-/// pipe. The cross-repo fixture path is the standing convention (aura's
-/// exec_booth.rs does the same) — built in ~/world/effector. The booth
-/// TYPE is the caller's declaration; the registered name is whatever the
-/// turn's `tool_target` arg names.
-async fn register_tool_target(engine: &Engine, booth_type: &str) {
-    let fixture = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../effector/target/debug/examples/induction_loop"
-    );
-    engine
-        .register(aura_booth::BoothType::script(
-            booth_type,
-            "induction",
-            fixture.to_string(),
-        ))
-        .await
-        .unwrap();
 }
 
 /// The dispatch loop's cap is a runaway stop, not a budget to spend
@@ -620,8 +639,6 @@ async fn a_provider_that_never_stops_asking_for_tools_fails_the_turn() {
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
     let engine = boot().await;
-    // The default deployment fact: `tool_target` absent names `effector`.
-    register_tool_target(&engine, "effector").await;
 
     let slot = Realm::iterate(
         &engine.realm,

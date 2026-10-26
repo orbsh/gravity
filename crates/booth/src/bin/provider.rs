@@ -139,7 +139,12 @@ fn open_stream(args: &Value) -> anyhow::Result<Stream> {
         .context("provider: missing `messages`")?;
 
     let url = format!("{endpoint}/chat/completions");
-    let body = json!({ "model": model, "messages": messages, "stream": true });
+    // The affordances ride through untouched (the turn owns the list — ADR-0004;
+    // this booth is a transport for whatever the caller's request shape is).
+    let mut body = json!({ "model": model, "messages": messages, "stream": true });
+    if let Some(tools) = args.get("tools") {
+        body["tools"] = tools.clone();
+    }
     let mut last_err = String::new();
     for attempt in 0..CONNECT_ATTEMPTS {
         if attempt > 0 {
