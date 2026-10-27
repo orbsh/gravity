@@ -1,17 +1,23 @@
 //! The fixed tool list (ADR-0004): hardcoded, grouped, and carrying the names
 //! k10r's tool face already has (`docs/SEAM.md` §2).
 //!
-//! Three entries today, because three doors answer: `recall_memory`,
-//! `commit_memory` and `resolve_skills` (k10r ADR-0015 landed the skill node and
-//! its resolve door, which is what this name was waiting for). `invoke_skill`
-//! stays off until the walk over a skill exists (gravity Phase 4.6: resolve a
-//! step's `code_id` to a code row, then call the language's mount) — the ADR
-//! fixed the NAME so nothing is renamed later, and the list grows by door, never
-//! by enthusiasm. Listing a tool the substrate cannot serve would teach the model
+//! Four entries today, because four doors answer: `recall_memory`,
+//! `commit_memory` and `resolve_skills` (k10r's HTTP surface — data access) and
+//! `invoke_skill` (a node mount — code execution, ADR-0001). The list is fixed
+//! because gravity is the top of the stack and a pure glue: its memory and
+//! skills ARE k10r's and its execution surface IS the node's, so there is
+//! nothing per-deployment to discover here. Names are k10r's; the ADR fixed
+//! them so nothing gets renamed later, and the list grows by door, never by
+//! enthusiasm. Listing a tool the substrate cannot serve would teach the model
 //! that failing tools are normal.
 //!
 //! The list is static on purpose: the `tools` array is part of the request's
 //! stable prefix, so the same bytes ride every turn.
+//!
+//! Two kinds of door, one dispatch: [`Doors`] is the seam. The turn owns the
+//! implementation (HTTP for k10r, `ctx.invoke` for a mount); this module owns
+//! the list, the argument reading and the error vocabulary, which is what the
+//! tests pin.
 
 use serde_json::{json, Value};
 
@@ -87,9 +93,9 @@ static SPECS: &[ToolSpec] = &[
         name: "resolve_skills",
         description: "List the skills this deployment can run. Use it when the answer needs a \
                       capability the conversation did not hand you: k10r answers candidates by \
-                      intent — each with a name, what it does and a score. A candidate is not a \
-                      tool by itself; the call that walks one comes from `invoke_skill`, which \
-                      takes the id you pick here.",
+                      intent — each with a name, what it does, its steps and a score. A \
+                      candidate is not a tool by itself; the call that runs one is \
+                      `invoke_skill`, which takes the id you pick here.",
         parameters: || {
             json!({
                 "type": "object",
@@ -107,6 +113,39 @@ static SPECS: &[ToolSpec] = &[
             })
         },
         nature: Nature::Fast,
+    },
+    ToolSpec {
+        name: "invoke_skill",
+        description: "Run ONE step of a skill you got from `resolve_skills`. It reads the skill, \
+                      takes the step you name (0 when you name none), fetches that step's script \
+                      and runs it on this deployment's node in the script's own language, \
+                      returning what the script returned. A skill with several steps is a \
+                      sequence YOU drive: call again with the next `step`, passing along whatever \
+                      it needs in `arguments`. Nothing else is kept between calls except what the \
+                      script itself remembers, so pass what it needs.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "integer",
+                        "description": "The `node_id` that `resolve_skills` answered."
+                    },
+                    "step": {
+                        "type": "integer",
+                        "description": "Which step to run (0-based; default 0)."
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "What the step's script receives as its arguments."
+                    }
+                },
+                "required": ["skill_id"]
+            })
+        },
+        // It runs code: outside the process, on a node, with whatever effects
+        // that code has (ADR-0004 §6).
+        nature: Nature::Human,
     },
 ];
 
@@ -140,40 +179,81 @@ pub fn tools_array() -> Value {
     )
 }
 
+/// The two kinds of door a call reaches. k10r's HTTP surface is data access
+/// (ADR-0007 as revised: HTTP is the single cross-process form); a mount is
+/// code execution on a node (ADR-0001) and only the turn can reach it, because
+/// only the turn holds the ctx.
+pub trait Doors {
+    fn post(&mut self, url: &str, body: &Value) -> Result<Value, String>;
+    fn get(&mut self, url: &str) -> Result<Value, String>;
+    /// `ctx.invoke(type_name, key, "execute", args)` — `execute` is the entry
+    /// CONVENTION every runner serves (ADR-0001 §1), never a lookup.
+    fn mount(&mut self, type_name: &str, key: &str, args: Value) -> Result<Value, String>;
+}
+
+/// The deployment facts a call reads. All of them come from the turn args and
+/// none has a default: a namespace, a mount table and a residency key are the
+/// deployment's declarations, and a guess would silently point at someone
+/// else's graph or instance (ADR-0004 §5).
+pub struct Facts<'a> {
+    pub store_url: &'a str,
+    /// k10r's namespace for this deployment's graph (facts AND skills).
+    pub memory_scope: Option<u64>,
+    /// OPERATION language → the mount type that serves it (prism's manifest).
+    pub mounts: &'a [(String, String)],
+    /// The residency key a mount call runs under (ADR-0001 §6: the caller
+    /// chooses it; gravity uses the conversation, so a script's state survives
+    /// the turns of one conversation and nothing else).
+    pub session: &'a str,
+}
+
+impl Facts<'_> {
+    fn scope(&self, tool: &str) -> Result<u64, String> {
+        self.memory_scope.ok_or_else(|| {
+            format!("{tool}: `memory_scope` is not set on this deployment (the turn args carry it)")
+        })
+    }
+
+    fn store(&self) -> &str {
+        self.store_url.trim_end_matches('/')
+    }
+
+    fn mount_for(&self, language: &str) -> Option<&str> {
+        self.mounts
+            .iter()
+            .find(|(served, _)| served == language)
+            .map(|(_, type_name)| type_name.as_str())
+    }
+}
+
 /// Execute one call against its door.
 ///
 /// Every failure is a VALUE the model reads (`{"error": …}`), never a turn
 /// failure: a wrong argument or a missing deployment fact must not cost the
-/// user their answer. `memory_scope` is the deployment fact (ADR-0004 §5) —
-/// absent, the memory tools say so by name instead of guessing a namespace.
-pub fn call(
-    name: &str,
-    args: &Value,
-    store_url: &str,
-    memory_scope: Option<u64>,
-) -> Result<Value, String> {
-    let store_url = store_url.trim_end_matches('/');
+/// user their answer.
+pub fn call(doors: &mut impl Doors, name: &str, args: &Value, facts: &Facts<'_>) -> Result<Value, String> {
+    let store_url = facts.store();
     match name {
         "recall_memory" => {
             let query = args
                 .get("query")
                 .and_then(Value::as_str)
                 .ok_or("recall_memory: `query` is required")?;
-            let scope = scope(memory_scope, "recall_memory")?;
-            post(
+            let scope = facts.scope("recall_memory")?;
+            doors.post(
                 &format!("{store_url}/memories/{scope}/recall"),
                 &json!([query]),
             )
         }
         "commit_memory" => {
-            let facts = args
+            let facts_arg = args
                 .get("facts")
                 .ok_or("commit_memory: `facts` is required")?;
-            if !facts.is_array() {
+            if !facts_arg.is_array() {
                 return Err("commit_memory: `facts` must be an array of 8-slot tuples".into());
             }
-            let scope = scope(memory_scope, "commit_memory")?;
-            post(&format!("{store_url}/memories/{scope}"), facts)
+            let scope = facts.scope("commit_memory")?;
+            doors.post(&format!("{store_url}/memories/{scope}"), facts_arg)
         }
         "resolve_skills" => {
             let query = args
@@ -182,13 +262,14 @@ pub fn call(
                 .ok_or("resolve_skills: `query` is required")?;
             // A skill is a node in the same graph as the facts (k10r ADR-0015),
             // so the scope that addresses the graph addresses its skills too.
-            let scope = scope(memory_scope, "resolve_skills")?;
+            let scope = facts.scope("resolve_skills")?;
             let mut body = json!({ "query": query });
             if let Some(limit) = args.get("limit") {
                 body["limit"] = limit.clone();
             }
-            post(&format!("{store_url}/skills/{scope}/resolve"), &body)
+            doors.post(&format!("{store_url}/skills/{scope}/resolve"), &body)
         }
+        "invoke_skill" => invoke(doors, args, facts, store_url),
         other => Err(format!(
             "unknown tool `{other}`; this deployment serves: {}",
             names().join(", ")
@@ -196,25 +277,84 @@ pub fn call(
     }
 }
 
-fn scope(memory_scope: Option<u64>, tool: &str) -> Result<u64, String> {
-    memory_scope.ok_or_else(|| {
-        format!("{tool}: `memory_scope` is not set on this deployment (the turn args carry it)")
-    })
-}
+/// `invoke_skill`: one step, resolved to a script, run on the mount that
+/// serves its language.
+///
+/// The walk is deliberately ONE step (ADR-0004 §3, Phase 4.6): ordering,
+/// retry and feeding one step's result into the next are Phase 5's, and a
+/// second meaning of "invoke" inside the same tool would make the model's
+/// control over the sequence invisible. A multi-step skill is a loop the MODEL
+/// drives — it saw the steps in the resolve answer.
+fn invoke(
+    doors: &mut impl Doors,
+    args: &Value,
+    facts: &Facts<'_>,
+    store_url: &str,
+) -> Result<Value, String> {
+    let skill_id = args
+        .get("skill_id")
+        .and_then(Value::as_u64)
+        .ok_or("invoke_skill: `skill_id` is required (the `node_id` resolve_skills answered)")?;
+    let scope = facts.scope("invoke_skill")?;
+    let skill = doors.get(&format!("{store_url}/skills/{scope}/{skill_id}"))?;
 
-/// One POST, with the door's answer as the tool result and its refusal as the
-/// error text (a 4xx is the caller's mistake to read, not a turn failure).
-fn post(url: &str, body: &Value) -> Result<Value, String> {
-    match ureq::post(url).send_json(body.clone()) {
-        Ok(resp) => resp
-            .into_json::<Value>()
-            .map_err(|e| format!("{url}: unreadable answer: {e}")),
-        Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
-            Err(format!("{url}: HTTP {code}: {text}"))
-        }
-        Err(e) => Err(format!("{url}: {e}")),
-    }
+    // The steps are TEXT in the row (the store does not parse what the producer
+    // owns) — parsing here is the walk's first act, not a second schema.
+    let steps_text = skill
+        .get("steps")
+        .and_then(Value::as_str)
+        .ok_or("invoke_skill: the skill answered no `steps`")?;
+    let steps: Vec<Value> = if steps_text.trim().is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(steps_text)
+            .map_err(|e| format!("invoke_skill: the skill's `steps` is not a JSON array: {e}"))?
+    };
+    let index = args.get("step").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let step = steps.get(index).ok_or_else(|| {
+        format!(
+            "invoke_skill: step {index} does not exist — this skill declares {} step(s)",
+            steps.len()
+        )
+    })?;
+    let code_id = step.get("code_id").and_then(Value::as_u64).ok_or_else(|| {
+        format!("invoke_skill: step {index} names no `code_id`")
+    })?;
+
+    let code = doors.get(&format!("{store_url}/code/{code_id}"))?;
+    let language = code
+        .get("language")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("invoke_skill: code row {code_id} answered no `language`"))?;
+    let source = code
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("invoke_skill: code row {code_id} answered no `source`"))?;
+
+    // Language → mount is a MATCH against the deployment's declaration, not a
+    // default: a language no mount serves cannot be called (ADR-0001 §7), and
+    // the error names what this deployment does declare.
+    let mount = facts.mount_for(language).ok_or_else(|| {
+        let served: Vec<&str> = facts.mounts.iter().map(|(l, _)| l.as_str()).collect();
+        format!(
+            "invoke_skill: no mount serves `{language}` here (this deployment declares: {})",
+            if served.is_empty() {
+                "no mounts".to_string()
+            } else {
+                served.join(", ")
+            }
+        )
+    })?;
+
+    // The script rides the call as an ARGUMENT: the mount's own source is a
+    // fixed runner, and nothing about it varies per skill or version (ADR-0001
+    // §2 — skills are data, never types).
+    let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    doors.mount(
+        mount,
+        facts.session,
+        json!({ "code": source, "args": arguments }),
+    )
 }
 
 #[cfg(test)]
@@ -222,11 +362,69 @@ fn post(url: &str, body: &Value) -> Result<Value, String> {
 mod tests {
     use super::*;
 
+    /// Every door, recorded: what the call asked of each, and canned answers
+    /// keyed by a substring of the URL. Enough to pin WHERE a call goes and
+    /// WHAT it carries — the doors' own behaviour is k10r's and the realm's.
+    #[derive(Default)]
+    struct Recorder {
+        posts: Vec<(String, Value)>,
+        gets: Vec<String>,
+        mounts: Vec<(String, String, Value)>,
+        answers: Vec<(String, Value)>,
+    }
+
+    impl Recorder {
+        fn answering(mut self, needle: &str, answer: Value) -> Self {
+            self.answers.push((needle.to_string(), answer));
+            self
+        }
+    }
+
+    impl Doors for Recorder {
+        fn post(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+            self.posts.push((url.to_string(), body.clone()));
+            Ok(json!({ "posted": true }))
+        }
+
+        fn get(&mut self, url: &str) -> Result<Value, String> {
+            self.gets.push(url.to_string());
+            self.answers
+                .iter()
+                .find(|(needle, _)| url.contains(needle.as_str()))
+                .map(|(_, answer)| answer.clone())
+                .ok_or_else(|| format!("{url}: no canned answer"))
+        }
+
+        fn mount(&mut self, type_name: &str, key: &str, args: Value) -> Result<Value, String> {
+            self.mounts
+                .push((type_name.to_string(), key.to_string(), args));
+            Ok(json!({ "ran": true }))
+        }
+    }
+
+    fn facts<'a>(mounts: &'a [(String, String)], session: &'a str) -> Facts<'a> {
+        Facts {
+            store_url: "http://mem.test/",
+            memory_scope: Some(37),
+            mounts,
+            session,
+        }
+    }
+
+    fn python_mount() -> Vec<(String, String)> {
+        vec![("python".to_string(), "runner_py".to_string())]
+    }
+
     #[test]
     fn the_list_carries_the_tool_faces_names() {
         assert_eq!(
             names(),
-            vec!["recall_memory", "commit_memory", "resolve_skills"]
+            vec![
+                "recall_memory",
+                "commit_memory",
+                "resolve_skills",
+                "invoke_skill"
+            ]
         );
     }
 
@@ -249,96 +447,138 @@ mod tests {
 
     #[test]
     fn an_unlisted_tool_is_refused_by_name() {
-        let Err(error) = call("invoke_skill", &json!({}), "http://127.0.0.1:1", Some(37)) else {
+        let mounts = python_mount();
+        let mut doors = Recorder::default();
+        let Err(error) = call(
+            &mut doors,
+            "task_open",
+            &json!({}),
+            &facts(&mounts, "s-1"),
+        ) else {
             panic!("an unlisted tool must be refused");
         };
-        assert!(error.contains("unknown tool `invoke_skill`"), "{error}");
+        assert!(error.contains("unknown tool `task_open`"), "{error}");
         assert!(error.contains("recall_memory"), "{error}");
-    }
-
-    /// A one-shot HTTP server on an OS-picked port: it records the request line
-    /// and body, then answers `answer`. Enough to prove WHERE a tool call goes
-    /// and WHAT it carries — the door's own behaviour is k10r's test.
-    fn one_shot(answer: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
-        let url = format!("http://{}", listener.local_addr().expect("an address"));
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().expect("one connection");
-            // Read until the body is there: one `read()` may stop at the end of
-            // the headers (TCP segmentation), and a test that assumes otherwise
-            // asserts against an empty body.
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let read = socket.read(&mut chunk).expect("a request");
-                if read == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..read]);
-                let complete = String::from_utf8_lossy(&request)
-                    .split_once("\r\n\r\n")
-                    .map(|(head, body)| {
-                        let length = head
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().ok())?
-                            })
-                            .unwrap_or(0);
-                        body.len() >= length
-                    })
-                    .unwrap_or(false);
-                if complete {
-                    break;
-                }
-            }
-            tx.send(String::from_utf8_lossy(&request).to_string())
-                .expect("the test is listening");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                answer.len(),
-                answer
-            );
-            socket.write_all(response.as_bytes()).expect("a reply");
-        });
-        (url, rx)
     }
 
     #[test]
     fn resolve_skills_posts_to_the_skill_door_with_the_scope_in_the_path() {
-        let (url, seen) = one_shot(r#"[{"node_id":4,"name":"github-issues","title":"issues","content":"lists them","score":0.5}]"#);
-        let answer = call(
+        let mounts = python_mount();
+        let mut doors = Recorder::default();
+        call(
+            &mut doors,
             "resolve_skills",
             &json!({ "query": "list github issues", "limit": 3 }),
-            &url,
-            Some(37),
+            &facts(&mounts, "s-1"),
         )
         .expect("the door answered");
-        assert_eq!(answer[0]["name"], "github-issues");
 
-        let request = seen.recv().expect("the server saw the call");
-        assert!(
-            request.starts_with("POST /skills/37/resolve "),
-            "a skill is a node in the graph, so the graph's scope addresses it: {request}"
+        let (url, body) = &doors.posts[0];
+        assert_eq!(
+            url, "http://mem.test/skills/37/resolve",
+            "a skill is a node in the graph, so the graph's scope addresses it"
         );
-        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-        assert!(body.contains("\"query\":\"list github issues\""), "{body}");
-        assert!(body.contains("\"limit\":3"), "the limit rides the call: {body}");
+        assert_eq!(body["query"], "list github issues");
+        assert_eq!(body["limit"], 3);
     }
 
     #[test]
     fn a_missing_scope_names_the_fact_instead_of_guessing() {
-        let Err(error) = call(
-            "recall_memory",
-            &json!({ "query": "x" }),
-            "http://127.0.0.1:1",
-            None,
-        ) else {
+        let mounts = python_mount();
+        let mut doors = Recorder::default();
+        let facts = Facts {
+            store_url: "http://mem.test",
+            memory_scope: None,
+            mounts: &mounts,
+            session: "s-1",
+        };
+        let Err(error) = call(&mut doors, "recall_memory", &json!({ "query": "x" }), &facts) else {
             panic!("a tool with no scope must be refused");
         };
         assert!(error.contains("memory_scope"), "{error}");
+    }
+
+    #[test]
+    fn invoke_skill_walks_one_step_to_the_mount_that_serves_its_language() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default()
+            .answering(
+                "/skills/37/9",
+                json!({
+                    "node_id": 9,
+                    "name": "github-issues",
+                    "steps": r#"[{"code_id":4,"note":"fetch"},{"code_id":5,"note":"format"}]"#,
+                }),
+            )
+            .answering(
+                "/code/5",
+                json!({
+                    "language": "python",
+                    "description": "formats them",
+                    "parameters": "{}",
+                    "source": "print('second step')",
+                }),
+            );
+
+        call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9, "step": 1, "arguments": { "repo": "orbsh/okra" } }),
+            &facts(&mounts, "channel-7"),
+        )
+        .expect("the mount answered");
+
+        assert_eq!(
+            doors.gets,
+            vec![
+                "http://mem.test/skills/37/9".to_string(),
+                "http://mem.test/code/5".to_string()
+            ],
+            "the skill, then the code row the CHOSEN step names — never the first step by \
+             accident"
+        );
+        let (type_name, key, args) = &doors.mounts[0];
+        assert_eq!(type_name, "runner_py", "the language chose the mount");
+        assert_eq!(key, "channel-7", "residency is the caller's (ADR-0001 §6)");
+        assert_eq!(args["code"], "print('second step')");
+        assert_eq!(args["args"]["repo"], "orbsh/okra");
+    }
+
+    #[test]
+    fn invoke_skill_refuses_a_language_no_mount_serves() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
+            .answering("/code/4", json!({ "language": "nu", "source": "1 + 1" }));
+
+        let Err(error) = call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9 }),
+            &facts(&mounts, "channel-7"),
+        ) else {
+            panic!("a language with no mount cannot be called");
+        };
+        assert!(error.contains("no mount serves `nu`"), "{error}");
+        assert!(error.contains("python"), "it names what IS declared: {error}");
+        assert!(doors.mounts.is_empty(), "nothing ran");
+    }
+
+    #[test]
+    fn invoke_skill_refuses_a_step_the_skill_does_not_have() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }));
+
+        let Err(error) = call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9, "step": 3 }),
+            &facts(&mounts, "channel-7"),
+        ) else {
+            panic!("step 3 of a one-step skill must be refused");
+        };
+        assert!(error.contains("declares 1 step(s)"), "{error}");
+        assert!(doors.mounts.is_empty(), "nothing ran");
     }
 }

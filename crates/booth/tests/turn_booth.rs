@@ -580,7 +580,12 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
             .collect();
         assert_eq!(
             names,
-            vec!["recall_memory", "commit_memory", "resolve_skills"],
+            vec![
+                "recall_memory",
+                "commit_memory",
+                "resolve_skills",
+                "invoke_skill"
+            ],
             "{body}"
         );
     }

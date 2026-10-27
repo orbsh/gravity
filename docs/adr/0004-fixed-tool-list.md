@@ -3,11 +3,11 @@
 > **Languages:** [English](0004-fixed-tool-list.md) (primary) · [中文](0004-fixed-tool-list.zh-CN.md)
 
 **Status:** Accepted (2026-10-26). Landed the same day: the turn sends the fixed
-`tools` array on every inference round and three of the four names are wired end
-to end — `recall_memory`, `commit_memory`, and `resolve_skills` (k10r ADR-0015
-landed the skill node and its resolve door). `invoke_skill` stays unlisted until
-the walk over a skill exists (Phase 4.6): resolve a step's `code_id` to a code
-row, then call the language's mount.
+`tools` array on every inference round and ALL FOUR names are wired end to end —
+`recall_memory`, `commit_memory`, `resolve_skills` (k10r ADR-0015's skill node
+and its doors) and `invoke_skill` (the walk: a skill's step → its code row → the
+mount that serves the step's language → the script runs on a node). Proven on
+the real stack by prism's `tests/turn_invoke_skill.rs`.
 **Date:** 2026-10-26
 
 **Names withdrawn in this record:** `memory_search` / `memory_recall` /
@@ -66,7 +66,7 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    | `recall_memory` | `{query}` | `POST /memories/{memory_scope}/recall` — the landing plus its community, rendered by k10r, with k10r's read budget | LISTED (gravity `crates/booth/src/tools.rs`) |
    | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}` — the graph's ingest | LISTED |
    | `resolve_skills` | `{query}`, `{limit}` | the SELECTABLE SKILL LIST — what the model consults when it cannot finish on its own; k10r answers candidates by intent | LISTED (2026-10-26): k10r ADR-0015 landed the skill node and `POST /skills/{memory_scope}/resolve` — a skill is a node in the same graph, so the graph's scope addresses it |
-   | `invoke_skill` | `{name, args}` | two steps, and only the first is k10r's: `GET /code/{id}` fetches the script, then the governed call `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` runs it on an effector node mount (SEAM.md §3) | code row door landed; the call is gravity's Phase 4.6 |
+   | `invoke_skill` | `{skill_id, step?, arguments?}` | read the skill, pick the step, `GET /code/{id}` for its script, then the governed call `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` on an effector node mount (SEAM.md §3) | LISTED (2026-10-26): ONE step per call — the sequence is the model's (§3) |
 
    The task group (`task_open` / `task_done` / `task_list`) is declared but NOT
    listed: its write face has no route yet and the read side rides the session
@@ -144,8 +144,14 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
   split between props (preconditions / steps / verification, JSON text) and its
   own incident facts (experience), with `POST /skills/{scope}` /
   `GET /skills/{scope}/{id}` / `POST /skills/{scope}/resolve` in front of it
-  (k10r ADR-0015). What gravity still owes is `invoke_skill`: the walk from a
-  resolved candidate's `steps[].code_id` to a code row and a language's mount.
+  (k10r ADR-0015). Gravity's side followed the same day: `invoke_skill` walks a
+  resolved candidate's `steps[].code_id` to its code row, matches the row's
+  `language` against the deployment's mount table, and calls that mount with the
+  script as an argument — `ctx.invoke` from the turn guest, so the turn is the
+  only place both doors exist (`tools::Doors`, implemented in `bin/turn.rs`).
+  Proven end to end by prism's `tests/turn_invoke_skill.rs`: a real node, a real
+  `runner_py`, a real k10r, and the model's own round-1 body carrying `{"sum":7}`
+  that a python child computed.
 - **A tool result is the MODEL's, not the consumer's.** The turn feeds each
   result back into the loop (the assistant's call + a `tool` message, OpenAI's
   wire shape) and keeps it in this turn's transcript; it does NOT surface on the
@@ -159,17 +165,38 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
   counter write is additive data (ADR-0003 §5), no topology moves.
 - **PLAN Phase 2.5** gets its declaration site: the entry's `nature` is static
   metadata, so "declared cold at registration" needs no runtime registry.
-- **PLAN Phase 4.6** narrows: the `run` call it was waiting for IS
-  `invoke_skill`, and the language → mount match already exists in prism's
-  `PRISM_MOUNTS` (`carrier`, `language`). What it still owes is the
-  language-default ruling for a skill whose row states no language.
+- **PLAN Phase 4.6 is PAID** (2026-10-26): the `run` call it was waiting for IS
+  `invoke_skill`, and the language → mount match it was waiting for is a
+  DEPLOYMENT FACT rather than a ruling — prism reads its own manifest
+  (`PRISM_MOUNTS`, which already names both axes) and passes `mounts` in the turn
+  args, so gravity matches a skill's declared language against what this
+  deployment actually serves and, when nothing matches, says so by name (ADR-0001
+  §7: a language with no mount cannot be called). There is no language DEFAULT to
+  rule on: the code row states the language, and a row that states none is an
+  error the model reads.
+- **Open — a multi-step skill wants a DSL body, not N calls.** One step per call
+  is the honest floor (the model drives, nothing invents ordering), and it is
+  inefficient by construction: every step is a round trip and a full context
+  re-read. The shape that removes that is a skill whose `steps` is ONE script
+  that orchestrates its own steps. The language question is a constraint, not a
+  taste: python is the only language with a process-boundary runner AND a
+  resident guest (`runner_py.py`, `runner_py_guest.py` — residency and the ctx
+  bridge both proven), which is what ADR-0001 §8 asks of a DSL host; scheme reads
+  better as DATA (steps that k10r's consolidation could rewrite in place), but
+  steel is an embedded carrier with no process boundary — ADR-0001 §2 rules that
+  out for LLM-generated code, and no scheme process runner exists. A middle path
+  keeps both properties: a python body with a step-marking convention, so the
+  script is one call and the boundary of each step stays visible to the model and
+  to the weight system. Not ruled on; the field to change first is what a skill's
+  `steps` holds, not this record's flow.
 - **Open:** the `invoke_skill` argument shape for a script that expects its own
-  parameters (the skill's `steps` and the code row's `parameters` say what it
-  takes; how they meet the model's call is Phase 4.6's), and whether the graph's
-  other entrances (`top`, `timeline`, `chain`, `anchored` — all landed as doors)
-  should ever become tools or stay what they are: doors for a caller that
-  already knows what it is looking for. The skill node's schema and namespace
-  are CLOSED (k10r ADR-0015: kind `skill` in ns 36, the scope the facts live in).
+  parameters — today `arguments` is one free-form object the model fills, and the
+  code row's `parameters` is advisory text it can read but nothing checks; a
+  schema check at the mount seam is unbuilt. And whether the graph's other
+  entrances (`top`, `timeline`, `chain`, `anchored` — all landed as doors) should
+  ever become tools or stay what they are: doors for a caller that already knows
+  what it is looking for. The skill node's schema and namespace are CLOSED (k10r
+  ADR-0015: kind `skill` in ns 36, the scope the facts live in).
 
 ## Related records
 

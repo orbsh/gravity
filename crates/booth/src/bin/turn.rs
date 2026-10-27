@@ -26,6 +26,7 @@
 
 use anyhow::Context;
 use gravity_core::surface::MemoryFormat;
+use gravity_booth::tools::Doors;
 use induction_guest::{Ctx, Guest};
 use serde_json::{json, Value};
 
@@ -243,15 +244,48 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
         let parsed = gravity_core::tool::parse_tool_calls(&json!({ "tool_calls": calls }))
             .context("turn: malformed tool calls from the provider")?;
         let memory_scope = args.get("memory_scope").and_then(Value::as_u64);
+        // The mount table the deployment declares (prism's manifest, carried in
+        // the turn args): operation language → the mount type that serves it.
+        // Empty is a fact ("this deployment declares no nodes"), absent is not.
+        let mounts: Vec<(String, String)> = args
+            .get("mounts")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        Some((
+                            entry.get("language")?.as_str()?.to_string(),
+                            entry.get("type")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Residency for a mount call is the CONVERSATION (ADR-0001 §6 leaves
+        // the key to the caller): a step script's own state survives the turns
+        // of one conversation and nothing else.
+        let session = format!("channel-{channel_id}-member-{member_id}");
         for call in parsed {
-            let content = match gravity_booth::tools::call(
-                &call.function.name,
-                &call.function.arguments,
-                &store_url,
+            let facts = gravity_booth::tools::Facts {
+                store_url: &store_url,
                 memory_scope,
-            ) {
-                Ok(value) => value.to_string(),
-                Err(error) => json!({ "error": error }).to_string(),
+                mounts: &mounts,
+                session: &session,
+            };
+            // The ctx borrow lives only for this call: the provider re-open
+            // below needs it back.
+            let content = {
+                let mut doors = VenueDoors { ctx: &mut *ctx };
+                match gravity_booth::tools::call(
+                    &mut doors,
+                    &call.function.name,
+                    &call.function.arguments,
+                    &facts,
+                ) {
+                    Ok(value) => value.to_string(),
+                    Err(error) => json!({ "error": error }).to_string(),
+                }
             };
             // The fed-back wire shape: the assistant's call + the tool's
             // result (OpenAI's loop contract). The result is the MODEL's,
@@ -311,6 +345,62 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
     // Remember the reply text accumulated so far.
     REPLY_PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(delta.clone());
     Ok((delta, sid))
+}
+
+/// The turn's two doors (tools.rs's `Doors` seam): k10r over HTTP — data
+/// access, ADR-0007 as revised — and a node mount over the ctx — code
+/// execution, ADR-0001. The turn is the only place both exist, which is why
+/// the implementation lives here and the list does not.
+struct VenueDoors<'c, 'i> {
+    ctx: &'c mut Ctx<'i>,
+}
+
+impl Doors for VenueDoors<'_, '_> {
+    fn post(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+        post_json(url, body)
+    }
+
+    fn get(&mut self, url: &str) -> Result<Value, String> {
+        get_json(url)
+    }
+
+    fn mount(&mut self, type_name: &str, key: &str, args: Value) -> Result<Value, String> {
+        // `execute` is the entry convention every runner serves (ADR-0001 §1),
+        // never a lookup: the mount's source is the runner, the code is data.
+        self.ctx
+            .invoke(type_name, key, "execute", args)
+            .map_err(|e| format!("mount `{type_name}`: {e}"))
+    }
+}
+
+/// One POST to k10r, with the door's answer as the tool result and its refusal
+/// as the error text (a 4xx is the caller's mistake to read, not a turn
+/// failure).
+fn post_json(url: &str, body: &Value) -> Result<Value, String> {
+    match ureq::post(url).send_json(body.clone()) {
+        Ok(resp) => resp
+            .into_json::<Value>()
+            .map_err(|e| format!("{url}: unreadable answer: {e}")),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(format!("{url}: HTTP {code}: {text}"))
+        }
+        Err(e) => Err(format!("{url}: {e}")),
+    }
+}
+
+/// One GET from k10r — the skill row and the code row a step names.
+fn get_json(url: &str) -> Result<Value, String> {
+    match ureq::get(url).call() {
+        Ok(resp) => resp
+            .into_json::<Value>()
+            .map_err(|e| format!("{url}: unreadable answer: {e}")),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(format!("{url}: HTTP {code}: {text}"))
+        }
+        Err(e) => Err(format!("{url}: {e}")),
+    }
 }
 
 /// The compression side branch's provider instance key. A provider guest

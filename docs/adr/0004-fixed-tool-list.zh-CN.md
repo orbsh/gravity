@@ -3,9 +3,9 @@
 > **语言：** [English](0004-fixed-tool-list.md)（主文档） · [中文](0004-fixed-tool-list.zh-CN.md)
 
 **状态：** Accepted（2026-10-26）。同日落地：turn 在每一轮推理都发送固定的 `tools` 数组，
-四个名字里有三个已端到端接上——`recall_memory`、`commit_memory`、`resolve_skills`（k10r
-ADR-0015 落地了 skill 节点与它的 resolve 门）。`invoke_skill` 在「走完一个 skill」存在之前
-不入清单（Phase 4.6：把一步的 `code_id` 解成 code 行，再调该语言的 mount）。
+四个名字**全部**端到端接上——`recall_memory`、`commit_memory`、`resolve_skills`（k10r
+ADR-0015 的 skill 节点与它的门），以及 `invoke_skill`（把一步走到它的 code 行、对到服务该
+语言的 mount、在节点上把脚本跑起来）。真实栈由 prism 的 `tests/turn_invoke_skill.rs` 证明。
 **日期：** 2026-10-26
 
 **本记录中撤回的名字：** `memory_search` / `memory_recall` / `memory_top` /
@@ -51,15 +51,22 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
    | `recall_memory` | `{query}` | `POST /memories/{memory_scope}/recall`——landing 加它所在的 community，由 k10r 渲染，读取预算也是 k10r 自己的 | 已入清单（gravity `crates/booth/src/tools.rs`） |
    | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}`——图谱的 ingest | 已入清单 |
    | `resolve_skills` | `{query}`、`{limit}` | **可选 skill 清单**——模型自己完不成时去查的东西；k10r 按意图答候选 | 已入清单（2026-10-26）：k10r ADR-0015 落地了 skill 节点与 `POST /skills/{memory_scope}/resolve`——skill 与事实同图，所以图的 scope 就地址到它 |
-   | `invoke_skill` | `{name, args}` | 两步，只有第一步是 k10r 的：`GET /code/{id}` 取脚本，然后受治理的调用 `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` 在 effector 节点 mount 上跑它（SEAM.md §3） | code 行门已落；调用是 gravity 的 Phase 4.6 |
+   | `invoke_skill` | `{skill_id, step?, arguments?}` | 读 skill、选一步、`GET /code/{id}` 取脚本，然后受治理的调用 `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` 在 effector 节点 mount 上跑它（SEAM.md §3） | 已入清单（2026-10-26）：**一次调用一步**，顺序归模型（见 §3） |
 
    task 组（`task_open` / `task_done` / `task_list`）已声明但**不入清单**：它的写面还没有
    路由，读侧骑在会话投影上（SEAM.md §2 的「Task progress」；ADR-0003 §3、PLAN Phase
    2.6）。基底办不到的工具是对模型撒谎，而调用过它的模型会连带不再信任整张清单。
 3. **流程就是工具面描述的那一条：先 resolve，再 invoke。** 当请求无法用 prompt 和 head 答
-   出来时，模型调 `resolve_skills`；候选作为工具结果回到对话里；模型挑一个，调
-   `invoke_skill`——它按 id 取回 code 行，把脚本作为参数交给 mount。任何 skill 都不会变成
-   它自己的一份工具定义，这条流程里也没有哪一步是模型得去猜的检索。
+   出来时，模型调 `resolve_skills`；候选作为工具结果回到对话里，**带上 steps**（k10r
+   ADR-0015 §4——要选就得看见这个 skill 会让你做什么，而清单里没有第五个工具去问）；模型
+   挑一个，调 `invoke_skill`——它按 id 取回 code 行，把脚本作为参数交给 mount。任何 skill
+   都不会变成它自己的一份工具定义，这条流程里也没有哪一步是模型得去猜的检索。
+
+   **一次调用走一步。** `invoke_skill` 只跑 skill 的其中一步，**顺序是模型的**：它看见了
+   各步，它把下一步需要的东西放进 `arguments`，它决定要不要继续。排序、重试、把一步的结果
+   喂给下一步，仍是 Phase 5 的事——同一个工具里长出第二个「invoke 的含义」，会把这份控制权
+   藏起来。多步 skill 的长期形态不是 N 次调用，而是**一份自己编排各步的脚本**（DSL 体）；
+   那是开放项，记在下面，改的是 skill 的 `steps` 装什么，不是这条流程。
 4. **不要运行模式。** 模式系统是把应用参数化到它并不拥有的基底上；它真正拥有的基底是
    k10r 和 aura，说一次就够。换一套 memory 平面是另一个应用，不是这个应用上的一个开关——
    会长出 profile 的胶水已经不是胶水。
@@ -116,14 +123,28 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
   的注册信息，计数是加性数据（ADR-0003 §5），拓扑不动。
 - **PLAN Phase 2.5** 拿到它的声明点：条目的 `nature` 是静态元数据，于是「注册时声明为冷」
   不需要一个运行期注册表。
-- **PLAN Phase 4.6** 收窄：它一直在等的 `run` 调用**就是** `invoke_skill`，而「语言 → mount」
-  的匹配已经写在 prism 的 `PRISM_MOUNTS` 里（`carrier`、`language`）。它还欠的是：当 skill
-  行没声明语言时，语言默认值怎么定。
-- **开放项：** `invoke_skill` 传给脚本的入参形状（skill 的 `steps` 与 code 行的
-  `parameters` 说它要什么；两者怎么与模型的调用对上，是 Phase 4.6 的）、以及图谱其它入口
-  （`top`、`timeline`、`chain`、`anchored`——都已作为门落地）该不该变成工具，还是保持它们
-  本来的样子：给已经知道要找什么的调用方用的门。skill 节点的 schema 与 namespace 已**闭合**
-  （k10r ADR-0015：ns 36 里 kind `skill`，与事实同一个 scope）。
+- **PLAN Phase 4.6 已付**（2026-10-26）：它等的 `run` 调用**就是** `invoke_skill`，它等的
+  「语言 → mount」匹配也不是一条裁决而是一个**部署事实**——prism 读它自己的 manifest
+  （`PRISM_MOUNTS` 本来就声明了两个轴），把 `mounts` 放进 turn 的 args，于是 gravity 拿
+  skill 声明的语言去对这份部署实际提供的 mount，对不上就把话说出来（ADR-0001 §7：没有
+  mount 的语言不能调）。没有语言**默认值**可裁：语言由 code 行声明，没声明就是模型读到的一个
+  错误值。
+- **开放项——多步 skill 想要的是一份 DSL 体，不是 N 次调用。** 一次一步是诚实的下限（顺序
+  由模型驱动，没有任何东西替它发明顺序），但它天生低效：每一步都是一次往返、一次完整的上
+  下文重读。去掉这份开销的形态是 skill 的 `steps` 变成**一份自己编排各步的脚本**。语言问题
+  是约束，不是口味：python 是唯一同时有进程边界 runner 和驻留 guest 的语言
+  （`runner_py.py`、`runner_py_guest.py`，residency 与 ctx 桥都实证过），这正是 ADR-0001 §8
+  对 DSL 宿主要求的东西；scheme 作为**数据**更好读（步是可被 k10r 的 consolidation 原地重写
+  的数据），但 steel 是嵌入载体、没有进程边界——ADR-0001 §2 因此否掉它承载 LLM 生成的代码，
+  而 scheme 的进程 runner 并不存在。兼得两者属性的中间路子是：python 作体，用约定标记步
+  边界，于是脚本是一次调用，而每步的边界对模型与权重系统仍然可见。此条**未裁决**；真要走，
+  先改的是 skill 的 `steps` 装什么，不是这条记录的流程。
+- **开放项：** `invoke_skill` 传给脚本的入参形状——今天 `arguments` 是模型自己填的一个自由
+  对象，code 行的 `parameters` 是它能读、但没有任何东西校验的建议文本；mount 接缝上的
+  schema 校验尚未建。以及图谱其它入口（`top`、`timeline`、`chain`、`anchored`——都已作为门
+  落地）该不该变成工具，还是保持它们本来的样子：给已经知道要找什么的调用方用的门。skill
+  节点的 schema 与 namespace 已**闭合**（k10r ADR-0015：ns 36 里 kind `skill`，与事实同一
+  个 scope）。
 
 ## 相关记录
 
