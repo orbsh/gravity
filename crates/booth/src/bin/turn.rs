@@ -61,7 +61,7 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
     }
     // The side branch advances one pull per round, on the same face: the
     // summary is produced alongside the answer, never in front of it.
-    step_compression(ctx);
+    step_tail(ctx);
     // Rounds ≥ 1: pull the provider, re-emit the delta.
     let guard = PROVIDER_STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(sid) = guard.as_ref() else {
@@ -78,8 +78,8 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
         let _ = ctx.iterate_dispose(sid);
         drop(guard);
         // The answer has streamed; the summary's tail is the only thing
-        // still owed (see drain_compression).
-        drain_compression(ctx);
+        // still owed (see drain_tails).
+        drain_tails(ctx);
         let reply = finish_turn()?;
         *PROVIDER_STREAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         return Ok(reply);
@@ -105,7 +105,7 @@ fn start_envelope(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
     *TURN_ARGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(args.clone());
     // A resident guest serves turn after turn: nothing from the previous
     // one may leak into this one (the branch slot is per turn).
-    *COMPRESSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *TAIL.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let (first_delta, _sid) = start_turn(ctx, args)?;
     Ok(json!({ "done": false, "item": { "delta": first_delta } }))
 }
@@ -165,11 +165,18 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
             }));
         }
     }
-    for entry in view
+    // The tail branches see the same records, NUMBERED: an operation that must
+    // point at one (the compression's cut) answers with an index, because the
+    // store owns positions and a model cannot see them.
+    let mut numbered: Vec<Value> = Vec::new();
+    let mut keys: Vec<(u64, u16)> = Vec::new();
+    for (index, entry) in view
         .get("increment")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+        .into_iter()
+        .enumerate()
     {
         // The entry is FLAT: `role` is the resolved NAME (null for a code
         // k10r does not police → the user's turn, the pre-existing fallback).
@@ -180,18 +187,47 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
             .unwrap_or_default()
             .to_string();
         messages.push(json!({ "role": role, "content": content }));
+        if let Some(key) = entry.get("key") {
+            let (Some(ts), Some(sub)) = (
+                key.get("ts_ms").and_then(Value::as_u64),
+                key.get("sub").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            keys.push((ts, sub as u16));
+            numbered.push(json!({
+                "role": role,
+                "content": format!("[{}] {content}", index + 1),
+            }));
+        }
     }
     // The prefix the compression side branch summarizes: head + summary +
     // history, WITHOUT this turn's new message (the span k10r proposed to
     // cover ends before it).
-    let prefix_len = messages.len();
     messages.push(json!({ "role": "user", "content": user_message }));
 
-    // 3. The compression side branch (Phase 3): k10r's verdict rode the
-    // projection, so the summary is produced HERE, concurrently with the
-    // answer and from the same prefix — the caller never states a coverage
-    // point; k10r derives it from the verdict it served (ADR-0008 §4).
-    start_compression(ctx, args, &view, &messages[..prefix_len]);
+    // 3. The tail branches (Phase 3): k10r's verdict rode the projection, so
+    // each operation here produces its product concurrently with the answer and
+    // from the same span — the caller never states a coverage point; k10r
+    // derives it from the verdict it served (ADR-0008 §4). The span is head +
+    // summary + the numbered records, WITHOUT this turn's new message: what was
+    // proposed to be covered ends before it.
+    let mut branch_prefix: Vec<Value> = Vec::new();
+    if let Some(head) = view.get("head").and_then(Value::as_str) {
+        if !head.is_empty() {
+            branch_prefix.push(json!({ "role": "system", "content": head }));
+        }
+    }
+    if let Some(summary) = view.get("summary").and_then(Value::as_str) {
+        if !summary.is_empty() {
+            branch_prefix.push(json!({
+                "role": "system",
+                "content": format!("Conversation summary so far:\n{summary}"),
+            }));
+        }
+    }
+    branch_prefix.extend(numbered);
+    start_tails(ctx, args, &view, &branch_prefix, &keys);
 
     // 3. Open the provider stream; its first reply carries the first
     // envelope (with the realm-minted stream_id merged in). A
@@ -415,30 +451,75 @@ fn get_json(url: &str) -> Result<Value, String> {
 /// holds ONE SSE connection per process, and the realm keys instances by
 /// (booth type, key), so the side branch takes its own instance — sharing
 /// the main branch's would make the two streams fight over that one slot.
+/// The provider slot every tail operation's branch runs on (a second provider
+/// instance, so the branch's pulls never interleave with the answer's).
 const SIDE_KEY: &str = "compress";
 
-/// The side branch while it is live: its provider stream and the tokens
-/// received so far (process state — the process IS the turn).
-struct Compression {
+/// A tail operation's branch while it is live: which operation it is, its
+/// provider stream, the tokens received so far, and the log pointers of the
+/// records it was shown (process state — the process IS the turn).
+///
+/// `keys` is why the branch can be resolved at all: the prompt numbers the
+/// records, so the model answers with an INDEX, and this turn — the one that
+/// built the messages — is the only place that index maps back to a position.
+struct Tail {
+    op: String,
     stream_id: String,
     parts: Vec<String>,
+    keys: Vec<(u64, u16)>,
 }
 
-static COMPRESSION: std::sync::Mutex<Option<Compression>> = std::sync::Mutex::new(None);
+static TAIL: std::sync::Mutex<Option<Tail>> = std::sync::Mutex::new(None);
 
-/// Open the compression side branch from k10r's verdict (ADR-0008 §4): the
-/// same prefix the main branch reads, the served tail prompt in place of
-/// this turn's message. It runs CONCURRENTLY with the answer — the provider
-/// pulls are interleaved by the pull face — and every failure is swallowed:
-/// compression is maintenance, and a broken side branch must never fail a
-/// turn. An unlanded summary leaves k10r's node open, which is its
-/// "compressing" marker; the next read skips it.
-fn start_compression(ctx: &mut Ctx, args: &Value, view: &Value, prefix: &[Value]) {
-    let Some(prompt) = view
-        .get("compress")
-        .and_then(|c| c.get("prompt"))
-        .and_then(Value::as_str)
-    else {
+/// Open the tail branches k10r asked for (ADR-0008 §4): the same prefix the main
+/// branch reads, the served prompt in place of this turn's message, the records
+/// NUMBERED so the operation can point at one. They run CONCURRENTLY with the
+/// answer — the provider pulls are interleaved by the pull face — and every
+/// failure is swallowed: a tail operation is maintenance, and a broken branch
+/// must never fail a turn. An unlanded compression leaves k10r's node open,
+/// which is its "compressing" marker; the next read skips it.
+///
+/// An operation this guest does not know is SKIPPED with a log, not an error:
+/// the store's list can grow before every deployed guest is upgraded, and a
+/// version skew must not take a turn down.
+fn start_tails(
+    ctx: &mut Ctx,
+    args: &Value,
+    view: &Value,
+    prefix: &[Value],
+    keys: &[(u64, u16)],
+) {
+    let tails = view
+        .get("tails")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for tail in tails {
+        let Some(name) = tail.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if name != OP_COMPRESS {
+            eprintln!("[gravity-turn] tail operation `{name}` is not known to this guest");
+            continue;
+        }
+        open_branch(ctx, args, &tail, name, prefix, keys);
+    }
+}
+
+/// The one operation this guest implements. The name is the dispatch key on both
+/// sides — k10r's `COMPRESS_OP.name` and this constant are the same string, and
+/// neither side derives it from the other.
+const OP_COMPRESS: &str = "compress";
+
+fn open_branch(
+    ctx: &mut Ctx,
+    args: &Value,
+    tail: &Value,
+    name: &str,
+    prefix: &[Value],
+    keys: &[(u64, u16)],
+) {
+    let Some(prompt) = tail.get("prompt").and_then(Value::as_str) else {
         return;
     };
     let mut messages: Vec<Value> = prefix.to_vec();
@@ -456,17 +537,17 @@ fn start_compression(ctx: &mut Ctx, args: &Value, view: &Value, prefix: &[Value]
     ) {
         Ok(value) => value,
         Err(e) => {
-            eprintln!("[gravity-turn] compression branch failed to open: {e:#}");
+            eprintln!("[gravity-turn] `{name}` branch failed to open: {e:#}");
             return;
         }
     };
     // A string reply is the provider's error value crossing the bridge.
     if let Some(err) = first.as_str() {
-        eprintln!("[gravity-turn] compression branch failed: {err}");
+        eprintln!("[gravity-turn] `{name}` branch failed: {err}");
         return;
     }
-    // A branch that closed on its first round carries no stream id (the
-    // realm merges one only for a non-terminal reply): nothing to land.
+    // A branch that closed on its first round carries no stream id (the realm
+    // merges one only for a non-terminal reply): nothing to land.
     let Some(sid) = first
         .get("stream_id")
         .and_then(Value::as_str)
@@ -482,17 +563,21 @@ fn start_compression(ctx: &mut Ctx, args: &Value, view: &Value, prefix: &[Value]
     {
         parts.push(delta.to_string());
     }
-    *COMPRESSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Compression {
+    *TAIL.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Tail {
+        op: name.to_string(),
         stream_id: sid.to_string(),
         parts,
+        keys: keys.to_vec(),
     });
 }
 
-/// One pull round of the side branch. On `done` the summary goes to k10r's
-/// checkpoint door — the summary ALONE: k10r derives the coverage point from
-/// the verdict it served, so the caller never states one.
-fn step_compression(ctx: &mut Ctx) {
-    let Some(mut branch) = COMPRESSION
+/// One pull round of the live branch. On `done` its product goes to the door the
+/// operation is responsible for. k10r derives the coverage point from the verdict
+/// it served, so the caller never states WHERE the node ends — but the record a
+/// compression says it should have ended at is the caller's observation to make,
+/// because only the caller built the messages the model read.
+fn step_tail(ctx: &mut Ctx) {
+    let Some(mut branch) = TAIL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
@@ -502,21 +587,21 @@ fn step_compression(ctx: &mut Ctx) {
     let env = match ctx.iterate_next(&branch.stream_id) {
         Ok(value) => value,
         Err(e) => {
-            eprintln!("[gravity-turn] compression pull failed: {e:#}");
+            eprintln!("[gravity-turn] `{}` pull failed: {e:#}", branch.op);
             return;
         }
     };
     if env.get("done").and_then(Value::as_bool) == Some(true) {
         let _ = ctx.iterate_dispose(&branch.stream_id);
         if let Some(err) = env.get("value").and_then(Value::as_str) {
-            eprintln!("[gravity-turn] compression branch ended without a summary: {err}");
+            eprintln!("[gravity-turn] `{}` ended without a product: {err}", branch.op);
             return;
         }
-        let summary = branch.parts.concat();
-        if summary.trim().is_empty() {
+        let text = branch.parts.concat();
+        if text.trim().is_empty() {
             return;
         }
-        land_summary(&summary);
+        land_tail(&branch, &text);
         return;
     }
     if let Some(delta) = env
@@ -526,35 +611,85 @@ fn step_compression(ctx: &mut Ctx) {
     {
         branch.parts.push(delta.to_string());
     }
-    *COMPRESSION.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(branch);
+    *TAIL.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(branch);
 }
 
-/// Drain the side branch before the turn closes. The carrier releases the
-/// turn's stream at `done` and the guest's state goes with it, so a branch
-/// still live here is pulled to completion: the summary must land before the
-/// next user message (Phase 3), and the answer has already streamed, so the
-/// only wait is the summary's own tail. The cap keeps a runaway branch from
-/// holding the turn open; what is left unlanded is k10r's open node, which
-/// its next read treats as "compressing".
-fn drain_compression(ctx: &mut Ctx) {
+/// Drain the live branch before the turn closes. The carrier releases the turn's
+/// stream at `done` and the guest's state goes with it, so a branch still live
+/// here is pulled to completion: the summary must land before the next user
+/// message (Phase 3), and the answer has already streamed, so the only wait is
+/// the product's own tail. The cap keeps a runaway branch from holding the turn
+/// open; what is left unlanded is k10r's open node, which its next read treats
+/// as "compressing".
+fn drain_tails(ctx: &mut Ctx) {
     for _ in 0..64 {
-        let live = COMPRESSION
+        let live = TAIL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
         if !live {
             return;
         }
-        step_compression(ctx);
+        step_tail(ctx);
     }
-    eprintln!("[gravity-turn] compression branch still live after 64 pulls");
+    eprintln!("[gravity-turn] a tail branch was still live after 64 pulls");
 }
 
-/// `POST …/checkpoint { summary }` — the door k10r opened when it served the
-/// verdict. 204 is the answer; anything else is REPORTED and the turn goes
-/// on (the alternative, failing the turn over maintenance, would trade a
-/// user-visible answer for a bookkeeping one).
-fn land_summary(summary: &str) {
+/// What an operation's answer MEANT. A compression answers with one JSON object
+/// carrying the summary and the cut it would have chosen; anything else is taken
+/// at face value as the summary with no opinion.
+///
+/// The fallback is deliberate: compression is necessary, and a model that
+/// ignored the format still produced a usable summary. Dropping the whole product
+/// over a shape slip would lose the only thing the branch exists to make.
+fn read_products(text: &str, keys: &[(u64, u16)]) -> (String, Option<(u64, u16)>) {
+    let trimmed = text.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let parsed: Option<Value> = serde_json::from_str(unfenced).ok();
+    let Some(parsed) = parsed.filter(|v| v.is_object()) else {
+        return (trimmed.to_string(), None);
+    };
+    let Some(summary) = parsed
+        .get("summary")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    else {
+        return (trimmed.to_string(), None);
+    };
+    // `cut` is a 1-based index over the records the branch was shown. Absent,
+    // zero, or the last one all mean "the mechanical cut was right" — the common
+    // case, and the one that must not fill the row with a useless opinion.
+    let cut = parsed.get("cut").and_then(Value::as_u64).unwrap_or(0);
+    let suggested = if cut == 0 || cut as usize >= keys.len() {
+        None
+    } else {
+        keys.get(cut as usize - 1).copied()
+    };
+    (summary.to_string(), suggested)
+}
+
+/// Hand one product to its door. 2xx is the answer; anything else is REPORTED
+/// and the turn goes on (the alternative, failing the turn over maintenance,
+/// would trade a user-visible answer for a bookkeeping one).
+fn land_tail(branch: &Tail, text: &str) {
+    if branch.op != OP_COMPRESS {
+        eprintln!("[gravity-turn] no landing door for `{}`", branch.op);
+        return;
+    }
+    let (summary, suggested) = read_products(text, &branch.keys);
+    land_summary(&summary, suggested);
+}
+
+/// `POST …/checkpoint { summary, suggested_ts?, suggested_sub? }` — the door k10r
+/// opened when it served the verdict. The suggestion rides along and is the
+/// only thing this caller states about position; k10r validates it against the
+/// span it opened.
+fn land_summary(summary: &str, suggested: Option<(u64, u16)>) {
     let Some(args) = TURN_ARGS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -573,10 +708,14 @@ fn land_summary(summary: &str) {
         "{}/channels/{channel_id}/members/{member_id}/checkpoint",
         store_url.trim_end_matches('/')
     );
-    let body = json!({ "summary": summary }).to_string();
+    let mut body = json!({ "summary": summary });
+    if let Some((ts, sub)) = suggested {
+        body["suggested_ts"] = json!(ts);
+        body["suggested_sub"] = json!(sub);
+    }
     match ureq::post(&url)
         .set("Content-Type", "application/json")
-        .send_string(&body)
+        .send_string(&body.to_string())
     {
         Ok(resp) if (200..300).contains(&resp.status()) => {}
         Ok(resp) => eprintln!("[gravity-turn] checkpoint door answered {}", resp.status()),
@@ -688,5 +827,72 @@ fn propose_composition(store_url: &str, args: &Value, ts_ms: u64) {
         Ok(resp) if (200..300).contains(&resp.status()) => {}
         Ok(resp) => eprintln!("turn: propose returned {}", resp.status()),
         Err(error) => eprintln!("turn: propose failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::read_products;
+
+    fn keys() -> Vec<(u64, u16)> {
+        vec![(100, 0), (200, 0), (300, 1)]
+    }
+
+    #[test]
+    fn a_compression_answer_carries_both_products() {
+        let (summary, cut) = read_products(
+            r#"{"summary": "they agreed on the cut", "cut": 2}"#,
+            &keys(),
+        );
+        assert_eq!(summary, "they agreed on the cut");
+        assert_eq!(
+            cut,
+            Some((200, 0)),
+            "the index the model gave is resolved by the turn that built the messages"
+        );
+    }
+
+    #[test]
+    fn the_last_index_is_the_mechanical_cut_restated() {
+        // The common answer: the span belongs together. Nothing to record —
+        // an opinion equal to the mechanical point would fill the row with a
+        // suggestion that changes nothing.
+        for cut in [3, 4, 0] {
+            let (summary, suggested) = read_products(
+                &format!(r#"{{"summary": "s", "cut": {cut}}}"#),
+                &keys(),
+            );
+            assert_eq!(summary, "s");
+            assert_eq!(suggested, None, "cut {cut} is not a better cut");
+        }
+    }
+
+    #[test]
+    fn a_fenced_answer_is_still_an_answer() {
+        let (summary, cut) = read_products(
+            "```json\n{\"summary\": \"s\", \"cut\": 1}\n```",
+            &keys(),
+        );
+        assert_eq!(summary, "s");
+        assert_eq!(cut, Some((100, 0)));
+    }
+
+    #[test]
+    fn prose_is_taken_at_face_value_rather_than_dropped() {
+        // Compression is necessary and a model that ignored the format still
+        // produced a summary. Losing the product over a shape slip would lose
+        // the only thing the branch exists to make.
+        let (summary, cut) = read_products("The user wants the cut moved earlier.", &keys());
+        assert_eq!(summary, "The user wants the cut moved earlier.");
+        assert_eq!(cut, None);
+    }
+
+    #[test]
+    fn json_without_a_summary_is_prose() {
+        let (summary, cut) = read_products(r#"{"cut": 2}"#, &keys());
+        assert_eq!(summary, r#"{"cut": 2}"#, "no summary means no products");
+        assert_eq!(cut, None);
     }
 }

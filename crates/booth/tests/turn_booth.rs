@@ -97,7 +97,7 @@ async fn sse_server_two_branches(
                             .map(str::to_string)
                     })
                     .unwrap_or_default();
-                let chunks = if asked.starts_with("Summarize the conversation span") {
+                let chunks = if asked.starts_with("Two products from the conversation span") {
                     summary
                 } else {
                     reply
@@ -728,4 +728,49 @@ async fn the_compression_branch_lands_the_served_summary() {
         "the checkpoint door took the summary the side branch produced"
     );
     assert_eq!(view.coverage_ts, 2_000, "the split k10r proposed");
+}
+
+/// The compression's SECOND product: the pass says where the span would have
+/// been better cut, the turn resolves that INDEX against the records it numbered,
+/// and the checkpoint records it beside the summary without moving the coverage
+/// point.
+// A blocking ureq call against a mem-server sharing this process would starve a
+// single-threaded runtime (the deadlock this suite already knows); two workers
+// keep the server live while the assertion's request blocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_cut_the_pass_chooses_lands_beside_the_summary() {
+    let endpoint = sse_server_two_branches(
+        vec!["hel", "lo ", "wor", "ld"],
+        vec![r#"{"summary": "the span in three lines", "cut": 1}"#],
+    )
+    .await;
+    let store_url = mem_server_with_compression().await;
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    for (ts, text) in [
+        (1_000u64, "first message of the span"),
+        (2_000, "second message of the span"),
+        (9_000, "third message of the span"),
+    ] {
+        surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
+    }
+
+    let engine = boot().await;
+    drain_turn(&engine, &store_url, &endpoint, "hi").await;
+
+    let raw: serde_json::Value = ureq::get(&format!(
+        "{store_url}/channels/7/members/1/session?format=plaintext"
+    ))
+    .call()
+    .unwrap()
+    .into_json()
+    .unwrap();
+    assert_eq!(raw["summary"], "the span in three lines", "the JSON product is unwrapped");
+    assert_eq!(
+        raw["suggested_ts"], 1_000,
+        "the index the model gave, resolved to the record it numbered"
+    );
+    assert_eq!(
+        raw["coverage_ts"], 2_000,
+        "the label does NOT move the coverage point: the node closes where the verdict said"
+    );
 }
