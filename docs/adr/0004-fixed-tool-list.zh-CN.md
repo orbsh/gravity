@@ -65,8 +65,24 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
    **一次调用走一步。** `invoke_skill` 只跑 skill 的其中一步，**顺序是模型的**：它看见了
    各步，它把下一步需要的东西放进 `arguments`，它决定要不要继续。排序、重试、把一步的结果
    喂给下一步，仍是 Phase 5 的事——同一个工具里长出第二个「invoke 的含义」，会把这份控制权
-   藏起来。多步 skill 的长期形态不是 N 次调用，而是**一份自己编排各步的脚本**（DSL 体）；
-   那是开放项，记在下面，改的是 skill 的 `steps` 装什么，不是这条流程。
+   藏起来。多步 skill 的长期形态不是 N 次调用，而是**一份自己编排各步的脚本**；这一点已在
+   ADR-0005 裁决（体是已有语言写的代码，步之间的边从体推导），它改的是 skill 的 `steps` 装
+   什么，不是这条流程。
+
+   **入参是一个 JSON map，永远不是 argv。** 一次 mount 调用只带一份 JSON 文档，每一层都保持
+   这个形状：gravity 发 `{"code": …, "args": {...}}`，载体把它框成 stdin 上的
+   `{"handler": "execute", "args": …}`，runner 再把同一份具名 map 交给脚本（两个 runner 都是：
+   `TOOLRUNNER_ARGS` 就是那份 map 的 JSON 字符串，脚本在 stdout 回一份 JSON 文档）。它不会
+   展开成 `--flag value`，也不该加：脚本不是一条命令行，而是以数据形式投递的一个体，没有
+   shell 语法可展开；argv 是无类型的，那正好会废掉入参刚得到的类型校验；而引号规则会变成每个
+   runner 各实现一遍的契约。想要命令行手感的脚本，自己解析自己那份 map。
+
+   这份校验有**两处**声明面，而且是同一种语言——这是有意的：工具面（这份清单，发给 provider）
+   的 `parameters` 是 JSON Schema，约束的是**模型**的调用；code 行的 `parameters` 也是 JSON
+   Schema，约束的是**脚本**的 `args` map。一套词汇、两个主语；走法所执行的子集
+   （`required`、`properties.*.type`、`additionalProperties: false`）本就是这两处都在写的
+   子集，所以两边都不用再学一种方言。已知边界：`args` 是经环境变量到达脚本的，超过内核单变量
+   上限的载荷是 runner 的事，不是 schema 的事。
 4. **不要运行模式。** 模式系统是把应用参数化到它并不拥有的基底上；它真正拥有的基底是
    k10r 和 aura，说一次就够。换一套 memory 平面是另一个应用，不是这个应用上的一个开关——
    会长出 profile 的胶水已经不是胶水。

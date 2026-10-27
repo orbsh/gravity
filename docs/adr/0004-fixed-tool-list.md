@@ -75,11 +75,43 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    one learns to distrust the whole list.
 3. **The flow is the one the face describes: the model resolves, then invokes.**
    When the request cannot be answered from the prompt and the head, the model
-   calls `resolve_skills`; the candidates come back as tool results; the model
-   picks one and calls `invoke_skill`, which fetches the code row by id and
-   hands the script to the mount as an argument. No skill ever becomes a tool
-   definition of its own, and no step of that flow is a retrieval the model has
-   to guess at.
+   calls `resolve_skills`; the candidates come back as tool results, steps
+   included (k10r ADR-0015 §4 — deciding needs to see what a skill would make it
+   do, and no fifth tool exists to ask); the model picks one and calls
+   `invoke_skill`, which fetches the code row by id and hands the script to the
+   mount as an argument. No skill ever becomes a tool definition of its own, and
+   no step of that flow is a retrieval the model has to guess at.
+
+   **One step per call.** `invoke_skill` runs exactly one of a skill's steps, and
+   the SEQUENCE is the model's: it saw the steps, it passes whatever the next one
+   needs in `arguments`, and it decides whether to continue. Ordering, retry and
+   feeding one step's result into the next stay Phase 5's — a second meaning of
+   "invoke" inside the same tool would hide that control. The long-term form for a
+   multi-step skill is not N calls but a single script that orchestrates its own
+   steps; that is RULED in ADR-0005 (the body is code in an existing language, and
+   the step edges are derived from it), and it changes what a skill's `steps`
+   holds, not this flow.
+
+   **Arguments are a JSON map, never argv.** A mount call carries ONE JSON document
+   and every layer keeps it that way: gravity sends `{"code": …, "args": {...}}`,
+   the carrier frames it as `{"handler": "execute", "args": …}` on stdin, and the
+   runner hands the script the same named map (both runners: `TOOLRUNNER_ARGS` is
+   that map as a JSON string, and the script answers with one JSON document on
+   stdout). There is no expansion into `--flag value`, and none should be added:
+   the script is not a command LINE, it is a body delivered as data, so there is no
+   shell grammar to expand into; argv is typeless, which would undo the type
+   checking the arguments now get; and quoting rules would become a contract every
+   runner reimplements. A script that wants CLI ergonomics can parse its own map.
+
+   That checking has TWO declaration surfaces, and they are the same language on
+   purpose: the tool face's `parameters` (this list, sent to the provider) is JSON
+   Schema, and it constrains the MODEL's call; a code row's `parameters` is JSON
+   Schema, and it constrains the SCRIPT's `args` map. One vocabulary, two subjects
+   — the subset the walk enforces (`required`, `properties.*.type`,
+   `additionalProperties: false`) is a subset of what both surfaces already write,
+   so neither side learns a second dialect. Known bound: `args` reaches the script
+   through an environment variable, so a payload past the kernel's per-variable
+   limit is a runner concern, not a schema one.
 4. **No run modes.** A mode system parameterizes the application over substrates
    it does not have; the substrates it does have are k10r and aura, named once.
    A different memory plane is a different application, not a flag on this one —
