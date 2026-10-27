@@ -147,6 +147,60 @@ static SPECS: &[ToolSpec] = &[
         // that code has (ADR-0004 §6).
         nature: Nature::Human,
     },
+    ToolSpec {
+        name: "create_skill",
+        description: "Write down a procedure worth repeating, as a skill this deployment can later \
+                      resolve and run. This is how a skill COMES INTO BEING: nothing else creates \
+                      one, and a skill that is never written down is a procedure the next \
+                      conversation has to reinvent. Use it when you worked something out that has \
+                      steps and will be needed again — not for a one-off answer, and not for a \
+                      fact (that is `commit_memory`). Declaring a name that already exists MERGES \
+                      into it: send the parts again to extend one.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Short stable identifier, snake_case or kebab-case. It IS the \
+                                       identity: declaring it twice declares it once."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "One line a reader sees in the candidate list."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "What the skill does and when to use it, in prose."
+                    },
+                    "preconditions": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "What must hold before the first step."
+                    },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "code_id": { "type": "integer" },
+                                "note": { "type": "string" }
+                            }
+                        },
+                        "description": "The steps in execution order; each names a code row this \
+                                        deployment stores and what that step is for."
+                    },
+                    "verification": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "What to check after the walk."
+                    }
+                },
+                "required": ["name", "content"]
+            })
+        },
+        nature: Nature::Human,
+    },
 ];
 
 /// The entries, in the order the model sees them.
@@ -275,12 +329,64 @@ pub fn call(
             }
             doors.post(&format!("{store_url}/skills/{scope}/resolve"), &body)
         }
+        "create_skill" => create_skill(doors, args, facts, store_url),
         "invoke_skill" => invoke(doors, args, facts, store_url, walked),
         other => Err(format!(
             "unknown tool `{other}`; this deployment serves: {}",
             names().join(", ")
         )),
     }
+}
+
+/// `create_skill`: the procedure the model decided is worth keeping (k10r
+/// ADR-0015's declaration door, ADR-0004's fifth tool).
+///
+/// The step-shaped parts arrive as ARRAYS because that is what a model writes
+/// naturally; k10r takes them as JSON TEXT and refuses to parse them, so the
+/// conversion happens here — at the boundary that owns the wire, not by teaching
+/// the store the model's habits (ADR-0012 §2: the producer owns the shape).
+fn create_skill(
+    doors: &mut impl Doors,
+    args: &Value,
+    facts: &Facts<'_>,
+    store_url: &str,
+) -> Result<Value, String> {
+    let name = args
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or("create_skill: `name` is required (it is the identity)")?;
+    let content = args
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or("create_skill: `content` is required (what the skill does)")?;
+    let scope = facts.scope("create_skill")?;
+    // Absent parts stay absent: the store merges, so sending "" would erase a
+    // part a previous declaration filled.
+    let mut body = json!({ "name": name, "content": content });
+    if let Some(title) = args.get("title").and_then(Value::as_str) {
+        body["title"] = json!(title);
+    }
+    for field in ["preconditions", "steps", "verification"] {
+        if let Some(value) = args.get(field) {
+            body[field] = json!(value.to_string());
+        }
+    }
+    doors.post(&format!("{store_url}/skills/{scope}"), &body)
+}
+
+/// Count one record of an invocation. Silent on failure: the store answers a
+/// receipt, and the receipt is not what the turn is for (ADR-0018).
+fn touch(doors: &mut impl Doors, store_url: &str, scope: u64, skill_id: u64, event: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let _ = doors.post(
+        &format!("{store_url}/skills/{scope}/{skill_id}/touch"),
+        &json!({ "event": event, "ts_ms": now }),
+    );
 }
 
 /// `invoke_skill`: one step, resolved to a script, run on the mount that
@@ -368,11 +474,24 @@ fn invoke(
         .unwrap_or_default();
     check_arguments(parameters, &arguments).map_err(|e| format!("invoke_skill: {e}"))?;
 
+    // The ATTEMPT is counted before the node is asked to run anything (k10r
+    // ADR-0018): a call that never comes back must still be visible, which is
+    // why the count is a record about the call, not part of its result. Best
+    // effort by contract — a counter that cannot be written is not a reason to
+    // fail the step the model asked for.
+    touch(doors, store_url, scope, skill_id, "attempt");
+
     let value = doors.mount(
         mount,
         facts.session,
         json!({ "code": source, "args": arguments }),
-    )?;
+    );
+    // The success is the SECOND record; a failed mount leaves `calls > ok`,
+    // which is exactly the state a reader is looking for.
+    if value.is_ok() {
+        touch(doors, store_url, scope, skill_id, "success");
+    }
+    let value = value?;
     // What this turn actually walked, in order — the turn reports the
     // composition after the loop (ADR-0016). Recorded only on SUCCESS: a step
     // that failed is not part of a run worth proposing.
@@ -627,7 +746,8 @@ mod tests {
                 "recall_memory",
                 "commit_memory",
                 "resolve_skills",
-                "invoke_skill"
+                "invoke_skill",
+                "create_skill"
             ]
         );
     }
@@ -936,5 +1056,183 @@ mod tests {
             r#"[{"code_id":4,"note":"fetch"},{"code_id":7,"note":"format"}]"#,
             "the shape a skill's steps takes, so promotion copies it (k10r ADR-0016)"
         );
+    }
+
+    #[test]
+    fn create_skill_posts_the_declaration_and_keeps_absent_parts_absent() {
+        let mut doors = Recorder::default();
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+
+        let value = call(
+            &mut doors,
+            "create_skill",
+            &json!({
+                "name": "list-github-issues",
+                "title": "List issues",
+                "content": "Lists the open issues of a repository.",
+                "steps": [{ "code_id": 4, "note": "fetch" }],
+                "preconditions": ["the repo is cloned"],
+            }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect("the declaration lands");
+        assert_eq!(value["posted"], true);
+
+        let (url, body) = &doors.posts[0];
+        assert_eq!(url, "http://mem.test/skills/37", "the scope is the deployment's");
+        assert_eq!(body["name"], "list-github-issues");
+        assert_eq!(
+            body["steps"],
+            r#"[{"code_id":4,"note":"fetch"}]"#,
+            "the array travels as the JSON TEXT k10r stores (it parses nothing)"
+        );
+        assert_eq!(body["preconditions"], r#"["the repo is cloned"]"#);
+        assert!(
+            body.get("verification").is_none(),
+            "a part the model did not state stays ABSENT — the store merges, \
+             so an empty one would erase what a previous declaration filled"
+        );
+    }
+
+    #[test]
+    fn create_skill_refuses_what_it_cannot_identify() {
+        let mut doors = Recorder::default();
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+
+        let unnamed = call(
+            &mut doors,
+            "create_skill",
+            &json!({ "content": "does a thing" }),
+            &facts,
+            &mut Vec::new(),
+        );
+        assert!(unnamed.unwrap_err().contains("`name` is required"));
+
+        let empty = call(
+            &mut doors,
+            "create_skill",
+            &json!({ "name": "  ", "content": "does a thing" }),
+            &facts,
+            &mut Vec::new(),
+        );
+        assert!(empty.unwrap_err().contains("`name` is required"));
+
+        let no_body = call(
+            &mut doors,
+            "create_skill",
+            &json!({ "name": "x" }),
+            &facts,
+            &mut Vec::new(),
+        );
+        assert!(no_body.unwrap_err().contains("`content` is required"));
+
+        assert!(
+            doors.posts.is_empty(),
+            "nothing reaches the store when the declaration cannot be made"
+        );
+    }
+
+    #[test]
+    fn an_invocation_counts_its_attempt_before_it_runs() {
+        let mut doors = Recorder::default()
+            .answering(
+                "/skills/37/9",
+                json!({ "steps": r#"[{"code_id": 4, "note": "run"}]"# }),
+            )
+            .answering(
+                "/code/4",
+                json!({ "language": "python", "description": "adds", "parameters": "{}", "source": "print(1)" }),
+            );
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+
+        call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9 }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect("the step runs");
+
+        let touches: Vec<&(String, Value)> = doors
+            .posts
+            .iter()
+            .filter(|(url, _)| url.ends_with("/touch"))
+            .collect();
+        assert_eq!(touches.len(), 2, "one attempt, one success");
+        assert_eq!(touches[0].1["event"], "attempt", "the attempt goes first");
+        assert_eq!(touches[1].1["event"], "success");
+        assert_eq!(
+            touches[0].0, "http://mem.test/skills/37/9/touch",
+            "the count lands on the skill node the call named"
+        );
+        assert!(
+            touches[0].1["ts_ms"].as_u64().is_some_and(|ts| ts > 0),
+            "the caller owns the clock"
+        );
+    }
+
+    #[test]
+    fn a_failed_step_leaves_its_attempt_counted_and_no_success() {
+        /// A mount that refuses: the node is unreachable, not the store.
+        struct Broken(Recorder);
+        impl Doors for Broken {
+            fn post(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+                self.0.post(url, body)
+            }
+            fn get(&mut self, url: &str) -> Result<Value, String> {
+                self.0.get(url)
+            }
+            fn mount(
+                &mut self,
+                _type_name: &str,
+                _key: &str,
+                _args: Value,
+            ) -> Result<Value, String> {
+                Err("the node did not answer".into())
+            }
+        }
+
+        let inner = Recorder::default()
+            .answering(
+                "/skills/37/9",
+                json!({ "steps": r#"[{"code_id": 4, "note": "run"}]"# }),
+            )
+            .answering(
+                "/code/4",
+                json!({ "language": "python", "description": "adds", "parameters": "{}", "source": "print(1)" }),
+            );
+        let mut doors = Broken(inner);
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+        let mut walked = Vec::new();
+
+        let error = call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9 }),
+            &facts,
+            &mut walked,
+        )
+        .unwrap_err();
+        assert!(error.contains("did not answer"));
+
+        let events: Vec<&str> = doors
+            .0
+            .posts
+            .iter()
+            .filter(|(url, _)| url.ends_with("/touch"))
+            .map(|(_, body)| body["event"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            vec!["attempt"],
+            "tried and broke is the state a reader is looking for — no success follows"
+        );
+        assert!(walked.is_empty(), "a step that failed is not part of a run");
     }
 }
