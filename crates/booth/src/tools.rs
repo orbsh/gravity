@@ -231,7 +231,13 @@ impl Facts<'_> {
 /// Every failure is a VALUE the model reads (`{"error": …}`), never a turn
 /// failure: a wrong argument or a missing deployment fact must not cost the
 /// user their answer.
-pub fn call(doors: &mut impl Doors, name: &str, args: &Value, facts: &Facts<'_>) -> Result<Value, String> {
+pub fn call(
+    doors: &mut impl Doors,
+    name: &str,
+    args: &Value,
+    facts: &Facts<'_>,
+    walked: &mut Vec<Walked>,
+) -> Result<Value, String> {
     let store_url = facts.store();
     match name {
         "recall_memory" => {
@@ -269,7 +275,7 @@ pub fn call(doors: &mut impl Doors, name: &str, args: &Value, facts: &Facts<'_>)
             }
             doors.post(&format!("{store_url}/skills/{scope}/resolve"), &body)
         }
-        "invoke_skill" => invoke(doors, args, facts, store_url),
+        "invoke_skill" => invoke(doors, args, facts, store_url, walked),
         other => Err(format!(
             "unknown tool `{other}`; this deployment serves: {}",
             names().join(", ")
@@ -290,6 +296,7 @@ fn invoke(
     args: &Value,
     facts: &Facts<'_>,
     store_url: &str,
+    walked: &mut Vec<Walked>,
 ) -> Result<Value, String> {
     let skill_id = args
         .get("skill_id")
@@ -361,11 +368,63 @@ fn invoke(
         .unwrap_or_default();
     check_arguments(parameters, &arguments).map_err(|e| format!("invoke_skill: {e}"))?;
 
-    doors.mount(
+    let value = doors.mount(
         mount,
         facts.session,
         json!({ "code": source, "args": arguments }),
+    )?;
+    // What this turn actually walked, in order — the turn reports the
+    // composition after the loop (ADR-0016). Recorded only on SUCCESS: a step
+    // that failed is not part of a run worth proposing.
+    walked.push(Walked {
+        code_id,
+        description: code
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    });
+    Ok(value)
+}
+
+/// One code row this turn walked, in order. The description rides along because
+/// the proposal a human reviews shows what each step does, and the walk is the
+/// only moment all of them are in hand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Walked {
+    pub code_id: u64,
+    pub description: String,
+}
+
+/// The composition as the store spells it (ADR-0016: the walker names it, since
+/// k10r does not parse `steps`).
+pub fn composition_key(walked: &[Walked]) -> String {
+    walked
+        .iter()
+        .map(|step| step.code_id.to_string())
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// The steps document a proposal carries — the same shape a skill's `steps`
+/// takes, so promotion copies it into a skill unchanged (k10r ADR-0016).
+pub fn steps_json(walked: &[Walked]) -> String {
+    Value::Array(
+        walked
+            .iter()
+            .map(|step| json!({ "code_id": step.code_id, "note": step.description }))
+            .collect(),
     )
+    .to_string()
+}
+
+/// Is this walk worth reporting? Two DIFFERENT rows ran in one turn — a single
+/// row twice is a retry, not a composition.
+pub fn is_composition(walked: &[Walked]) -> bool {
+    let mut ids: Vec<u64> = walked.iter().map(|step| step.code_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.len() >= 2
 }
 
 /// Does `arguments` honour the contract a code row declares in `parameters`?
@@ -599,6 +658,7 @@ mod tests {
             "task_open",
             &json!({}),
             &facts(&mounts, "s-1"),
+            &mut Vec::new(),
         ) else {
             panic!("an unlisted tool must be refused");
         };
@@ -615,6 +675,7 @@ mod tests {
             "resolve_skills",
             &json!({ "query": "list github issues", "limit": 3 }),
             &facts(&mounts, "s-1"),
+            &mut Vec::new(),
         )
         .expect("the door answered");
 
@@ -637,7 +698,13 @@ mod tests {
             mounts: &mounts,
             session: "s-1",
         };
-        let Err(error) = call(&mut doors, "recall_memory", &json!({ "query": "x" }), &facts) else {
+        let Err(error) = call(
+            &mut doors,
+            "recall_memory",
+            &json!({ "query": "x" }),
+            &facts,
+            &mut Vec::new(),
+        ) else {
             panic!("a tool with no scope must be refused");
         };
         assert!(error.contains("memory_scope"), "{error}");
@@ -670,6 +737,7 @@ mod tests {
             "invoke_skill",
             &json!({ "skill_id": 9, "step": 1, "arguments": { "repo": "orbsh/okra" } }),
             &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
         )
         .expect("the mount answered");
 
@@ -701,6 +769,7 @@ mod tests {
             "invoke_skill",
             &json!({ "skill_id": 9 }),
             &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
         ) else {
             panic!("a language with no mount cannot be called");
         };
@@ -720,6 +789,7 @@ mod tests {
             "invoke_skill",
             &json!({ "skill_id": 9, "step": 3 }),
             &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
         ) else {
             panic!("step 3 of a one-step skill must be refused");
         };
@@ -744,6 +814,7 @@ mod tests {
             "invoke_skill",
             &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "n": 4 } }),
             &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
         )
         .expect("a call that honours the contract runs");
         assert_eq!(doors.mounts.len(), 1);
@@ -760,6 +831,7 @@ mod tests {
             "invoke_skill",
             &json!({ "skill_id": 9, "arguments": { "n": 4 } }),
             &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
         ) else {
             panic!("a missing required key must not reach the node");
         };
@@ -779,6 +851,7 @@ mod tests {
             "invoke_skill",
             &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "n": "four" } }),
             &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
         ) else {
             panic!("a string where the row wants an integer must not reach the node");
         };
@@ -804,6 +877,7 @@ mod tests {
                 "invoke_skill",
                 &json!({ "skill_id": 9, "arguments": { "anything": [1, 2] } }),
                 &facts(&mounts, "channel-7"),
+                &mut Vec::new(),
             )
             .unwrap_or_else(|e| panic!("`{parameters}` declares no schema, so it cannot refuse: {e}"));
             assert_eq!(doors.mounts.len(), 1);
@@ -825,10 +899,42 @@ mod tests {
             "invoke_skill",
             &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "verb": "run" } }),
             &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
         ) else {
             panic!("a closed contract takes no extra key");
         };
         assert!(error.contains("takes no `verb`"), "{error}");
         assert!(doors.mounts.is_empty());
+    }
+
+    #[test]
+    fn a_composition_is_two_different_rows_and_the_wire_shape_is_the_walkers() {
+        let one = Walked {
+            code_id: 4,
+            description: "fetch".to_string(),
+        };
+        let two = Walked {
+            code_id: 7,
+            description: "format".to_string(),
+        };
+
+        assert!(!is_composition(&[]), "nothing ran");
+        assert!(
+            !is_composition(&[one.clone(), one.clone()]),
+            "one row twice is a retry, not a composition"
+        );
+        assert!(is_composition(&[one.clone(), two.clone()]), "two rows ran");
+
+        assert_eq!(composition_key(&[one.clone(), two.clone()]), "4+7");
+        assert_eq!(
+            composition_key(&[two.clone(), one.clone()]),
+            "7+4",
+            "ORDER is the composition: the reverse is a different run"
+        );
+        assert_eq!(
+            steps_json(&[one, two]),
+            r#"[{"code_id":4,"note":"fetch"},{"code_id":7,"note":"format"}]"#,
+            "the shape a skill's steps takes, so promotion copies it (k10r ADR-0016)"
+        );
     }
 }

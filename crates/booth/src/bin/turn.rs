@@ -277,12 +277,20 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
             // below needs it back.
             let content = {
                 let mut doors = VenueDoors { ctx: &mut *ctx };
-                match gravity_booth::tools::call(
+                let mut walked = WALKED
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let outcome = gravity_booth::tools::call(
                     &mut doors,
                     &call.function.name,
                     &call.function.arguments,
                     &facts,
-                ) {
+                    &mut walked,
+                );
+                // The recorder is released before the loop builds messages: a
+                // later round's call re-takes it, and nothing else touches it.
+                drop(walked);
+                match outcome {
                     Ok(value) => value.to_string(),
                     Err(error) => json!({ "error": error }).to_string(),
                 }
@@ -583,6 +591,11 @@ static REPLY_PARTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::n
 /// the guard's `{stream_id, round}` — the addressing rides state).
 static TURN_ARGS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
 
+/// The code rows this turn walked, in order (ADR-0016). Turn state like the
+/// reply parts: this guest is one turn's process.
+static WALKED: std::sync::Mutex<Vec<gravity_booth::tools::Walked>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// The terminal round: append the one-ts-two-subs exchange, return the
 /// terminal envelope (the full reply as the value).
 fn finish_turn() -> anyhow::Result<Value> {
@@ -634,5 +647,46 @@ fn finish_turn() -> anyhow::Result<Value> {
             resp.status()
         );
     }
+    // The write side of the skill loop (ADR-0016): a turn that walked two
+    // DIFFERENT code rows is a composition worth counting. Reported, never
+    // promoted — k10r keeps the count, a human decides what it becomes, and the
+    // resolver keeps showing only real skills. Best effort: a proposal is an
+    // observation ABOUT the turn, so failing to file it must not fail the turn
+    // (the reply is already durable at this point).
+    propose_composition(&store_url, &args, ts);
+
     Ok(json!({ "done": true, "value": { "reply": reply } }))
+}
+
+/// File this turn's composition, if it had one. `store_url` and the turn args
+/// are already in hand at finish time, and the recorder is the turn's own.
+fn propose_composition(store_url: &str, args: &Value, ts_ms: u64) {
+    let walked: Vec<gravity_booth::tools::Walked> = std::mem::take(
+        &mut *WALKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    if !gravity_booth::tools::is_composition(&walked) {
+        return;
+    }
+    let Some(scope) = args.get("memory_scope").and_then(Value::as_u64) else {
+        // No scope, no graph to propose into: the same rule the tools follow —
+        // a missing deployment fact is reported where it is needed, never
+        // guessed at here.
+        return;
+    };
+    let body = json!({
+        "key": gravity_booth::tools::composition_key(&walked),
+        "steps": gravity_booth::tools::steps_json(&walked),
+        "ts_ms": ts_ms,
+    });
+    let url = format!("{store_url}/skills/{scope}/propose");
+    match ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_string(&body.to_string())
+    {
+        Ok(resp) if (200..300).contains(&resp.status()) => {}
+        Ok(resp) => eprintln!("turn: propose returned {}", resp.status()),
+        Err(error) => eprintln!("turn: propose failed: {error}"),
+    }
 }

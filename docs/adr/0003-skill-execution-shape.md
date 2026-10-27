@@ -71,7 +71,10 @@ history never edits the graph's topology.**
    statistics (clustering over what was called and how it went); rewriting edges
    at runtime is not one of those statistics, and a per-session artifact
    promoted to structure would accrete as structure once per session that ran
-   it. The principle is the one Aura already applies to types: emergent data
+   it. **Landed 2026-10-26 as k10r ADR-0016**: the proposal is a row gravity files
+   at turn end, the count is application state on that row, and promotion is a
+   human's declaration that copies the run's steps — no execution path writes
+   topology. The principle is the one Aura already applies to types: emergent data
    never mints structure, because the curated graph is not the runtime's to
    edit.
 
@@ -133,9 +136,11 @@ history never edits the graph's topology.**
   start: that one stays content-addressed (ADR-0027's blob + reference), because
   an id-addressed residency source would silently keep running the old code.
 - **Open:** the task row's schema (fields, the binding edge's kind, what
-  "session" scopes the gate), whether the completion write is gravity's or the
-  runner's, and the promotion path's form (who is asked, and what evidence a
-  proposal carries).
+  "session" scopes the gate) and whether the completion write is gravity's or the
+  runner's. The promotion path's form is no longer open: k10r ADR-0016 landed it —
+  a proposal is a row (kind `skill_proposal`, counted, invisible to the resolver),
+  gravity files it at turn end when a turn walked two different code rows, and the
+  act that turns one into a skill is a HUMAN's declaration that copies the steps.
 
 ## Related records
 
