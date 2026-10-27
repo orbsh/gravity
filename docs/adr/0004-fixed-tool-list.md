@@ -183,14 +183,23 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
   per-skill (the code row's `language`), with one verification outstanding: steel
   must prove it can evaluate a delivered string before a steel body can ride a
   mount (ADR-0005 §4).
-- **Open:** the `invoke_skill` argument shape for a script that expects its own
-  parameters — today `arguments` is one free-form object the model fills, and the
-  code row's `parameters` is advisory text it can read but nothing checks; a
-  schema check at the mount seam is unbuilt. And whether the graph's other
-  entrances (`top`, `timeline`, `chain`, `anchored` — all landed as doors) should
-  ever become tools or stay what they are: doors for a caller that already knows
-  what it is looking for. The skill node's schema and namespace are CLOSED (k10r
-  ADR-0015: kind `skill` in ns 36, the scope the facts live in).
+- **PAID (2026-10-26): the arguments are checked against the row's `parameters`
+  before a node is asked to run anything.** The field is TEXT the store never
+  parses (k10r ADR-0012 §2 — the producer owns the shape), so gravity checks only
+  what a producer DECLARED, in a JSON Schema subset (`required`, `properties.*.
+  type`, `additionalProperties: false`, and `type` as a name or a list). A document
+  that declares nothing — `{}`, an empty string, prose written for a human —
+  constrains nothing, and passing it means exactly that: nothing was checked
+  because nothing was claimed. Inventing a rejection there would break rows whose
+  author chose description over schema, and the model could not fix it anyway. A
+  failure never reaches the node, names the offending key or type, and hands the
+  contract text back — so the model repairs its call in one round instead of
+  learning the shape from three layers down.
+- **Open:** whether the graph's other entrances (`top`, `timeline`, `chain`,
+  `anchored` — all landed as doors) should ever become tools or stay what they
+  are: doors for a caller that already knows what it is looking for. The skill
+  node's schema and namespace are CLOSED (k10r ADR-0015: kind `skill` in ns 36,
+  the scope the facts live in).
 
 ## Related records
 

@@ -134,12 +134,17 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
   不授权语法、步骤词汇或 JSON 组合格式。组合的体**是一步**，于是 §3 的「一次调用一步」不再是
   限制，而不是被绕开。语言问题逐 skill 定（看 code 行的 `language`），只剩一处待验证：steel
   必须证明能求值投递进来的字符串，它的体才能骑 mount（ADR-0005 §4）。
-- **开放项：** `invoke_skill` 传给脚本的入参形状——今天 `arguments` 是模型自己填的一个自由
-  对象，code 行的 `parameters` 是它能读、但没有任何东西校验的建议文本；mount 接缝上的
-  schema 校验尚未建。以及图谱其它入口（`top`、`timeline`、`chain`、`anchored`——都已作为门
-  落地）该不该变成工具，还是保持它们本来的样子：给已经知道要找什么的调用方用的门。skill
-  节点的 schema 与 namespace 已**闭合**（k10r ADR-0015：ns 36 里 kind `skill`，与事实同一
-  个 scope）。
+- **已付（2026-10-26）：入参在节点被要求跑任何东西之前，先对 code 行的 `parameters` 校验。**
+  这个字段是 store 从不解析的 TEXT（k10r ADR-0012 §2——形状归生产方），所以 gravity 只校验
+  生产方**声明**了的东西，用的是 JSON Schema 的一个子集（`required`、`properties.*.type`、
+  `additionalProperties: false`，`type` 可写一个名字或一列名字）。什么都没声明的文档——`{}`、
+  空串、为人类写的散文——不构成约束，放行就是**这个意思**：什么都没校验，因为什么都没声明。
+  在那里发明一条拒绝，会让「用描述代替 schema」的行全废，而模型对此无能为力。校验失败绝不
+  到达节点，会点名出错的键或类型，并把契约原文交回去——模型因此一轮就能改对，而不是从三层
+  之下学到形状。
+- **开放项：** 图谱其它入口（`top`、`timeline`、`chain`、`anchored`——都已作为门落地）该不该
+  变成工具，还是保持它们本来的样子：给已经知道要找什么的调用方用的门。skill 节点的 schema
+  与 namespace 已**闭合**（k10r ADR-0015：ns 36 里 kind `skill`，与事实同一个 scope）。
 
 ## 相关记录
 

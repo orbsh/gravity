@@ -350,11 +350,156 @@ fn invoke(
     // fixed runner, and nothing about it varies per skill or version (ADR-0001
     // §2 — skills are data, never types).
     let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+
+    // The code row states what the script takes. Checking here — before a node
+    // is asked to run anything — is the difference between a model that learns
+    // the contract from one error and a node that fails on a missing key three
+    // layers down.
+    let parameters = code
+        .get("parameters")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    check_arguments(parameters, &arguments).map_err(|e| format!("invoke_skill: {e}"))?;
+
     doors.mount(
         mount,
         facts.session,
         json!({ "code": source, "args": arguments }),
     )
+}
+
+/// Does `arguments` honour the contract a code row declares in `parameters`?
+///
+/// The field is TEXT the store never parses (k10r ADR-0012 §2: the producer owns
+/// the shape), so the only shape this can check is one the producer DECLARED. A
+/// document that declares nothing — `{}`, an empty string, or prose somebody wrote
+/// for a human — constrains nothing, and passing it means exactly that: nothing
+/// was checked, because nothing was claimed. Inventing a rejection for it would
+/// break rows whose author chose description over schema, and the model could do
+/// nothing about that either.
+///
+/// The declared form is a JSON Schema SUBSET, because that is what people already
+/// write and a custom format would be one more thing to learn:
+///   { "type": "object",
+///     "required": ["repo"],
+///     "properties": { "repo": {"type": "string"}, "n": {"type": "integer"} },
+///     "additionalProperties": false }
+fn check_arguments(declared: &str, given: &Value) -> Result<(), String> {
+    let text = declared.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let Ok(schema) = serde_json::from_str::<Value>(text) else {
+        // Prose, not a contract. See the doc comment: silence is the honest
+        // answer, and the review belongs on the producer's side.
+        return Ok(());
+    };
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+    let required = object.get("required").and_then(Value::as_array);
+    let properties = object.get("properties").and_then(Value::as_object);
+    if required.is_none() && properties.is_none() {
+        return Ok(());
+    }
+
+    let Some(given) = given.as_object() else {
+        return Err(format!(
+            "the code row declares parameters, so `arguments` must be an object; the contract is: {text}"
+        ));
+    };
+
+    if let Some(required) = required {
+        let missing: Vec<&str> = required
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|name| !given.contains_key(*name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "`arguments` is missing required {}: {}; the contract is: {text}",
+                if missing.len() == 1 { "key" } else { "keys" },
+                missing.join(", ")
+            ));
+        }
+    }
+
+    if let Some(properties) = properties {
+        for (name, rule) in properties {
+            let Some(value) = given.get(name) else {
+                continue;
+            };
+            let wanted = rule.get("type").and_then(type_names).unwrap_or_default();
+            if wanted.is_empty() || wanted.iter().any(|kind| is_kind(value, kind)) {
+                continue;
+            }
+            return Err(format!(
+                "`arguments.{name}` is {}, and the code row wants {}; the contract is: {text}",
+                kind_of(value),
+                wanted.join(" or ")
+            ));
+        }
+    }
+
+    if object.get("additionalProperties") == Some(&Value::Bool(false)) {
+        let unknown: Vec<&str> = given
+            .keys()
+            .filter(|name| {
+                properties
+                    .map(|declared| !declared.contains_key(*name))
+                    .unwrap_or(true)
+            })
+            .map(String::as_str)
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "the code row takes no `{}`; the contract is: {text}",
+                unknown.join("`, no `")
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// `"type": "string"` and `"type": ["string", "null"]` are both idiomatic.
+fn type_names(value: &Value) -> Option<Vec<&str>> {
+    if let Some(name) = value.as_str() {
+        return Some(vec![name]);
+    }
+    value
+        .as_array()
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+}
+
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+fn is_kind(value: &Value, kind: &str) -> bool {
+    match kind {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        // JSON has no integer, so this is a number that survived the trip
+        // whole; a float that arrived as 4.0 is still the integer 4.
+        "integer" => value
+            .as_f64()
+            .is_some_and(|n| n.is_finite() && n.fract() == 0.0),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        // An unknown keyword is not a constraint we can honour; it must not
+        // become one that rejects valid arguments.
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -580,5 +725,110 @@ mod tests {
         };
         assert!(error.contains("declares 1 step(s)"), "{error}");
         assert!(doors.mounts.is_empty(), "nothing ran");
+    }
+
+    #[test]
+    fn the_declared_parameters_are_enforced_before_the_node_runs() {
+        let schema = r#"{"type":"object","required":["repo"],"properties":{"repo":{"type":"string"},"n":{"type":"integer"}}}"#;
+        let mounts = python_mount();
+
+        // Honoured: the walk proceeds with the arguments untouched.
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
+            .answering(
+                "/code/4",
+                json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
+            );
+        call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "n": 4 } }),
+            &facts(&mounts, "channel-7"),
+        )
+        .expect("a call that honours the contract runs");
+        assert_eq!(doors.mounts.len(), 1);
+
+        // A missing required key is refused BY NAME, and nothing runs.
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
+            .answering(
+                "/code/4",
+                json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
+            );
+        let Err(error) = call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9, "arguments": { "n": 4 } }),
+            &facts(&mounts, "channel-7"),
+        ) else {
+            panic!("a missing required key must not reach the node");
+        };
+        assert!(error.contains("missing required key: repo"), "{error}");
+        assert!(error.contains("the contract is:"), "it hands back the contract: {error}");
+        assert!(doors.mounts.is_empty(), "nothing ran");
+
+        // A wrong type is refused, and says what it got and what was wanted.
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
+            .answering(
+                "/code/4",
+                json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
+            );
+        let Err(error) = call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "n": "four" } }),
+            &facts(&mounts, "channel-7"),
+        ) else {
+            panic!("a string where the row wants an integer must not reach the node");
+        };
+        assert!(error.contains("`arguments.n` is a string"), "{error}");
+        assert!(error.contains("wants integer"), "{error}");
+        assert!(doors.mounts.is_empty());
+    }
+
+    #[test]
+    fn a_row_that_declares_nothing_checks_nothing() {
+        let mounts = python_mount();
+
+        // `{}` — the shape every row in the tree has today.
+        for parameters in ["{}", "", "the repo, as owner/name"] {
+            let mut doors = Recorder::default()
+                .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
+                .answering(
+                    "/code/4",
+                    json!({ "language": "python", "parameters": parameters, "source": "print(1)" }),
+                );
+            call(
+                &mut doors,
+                "invoke_skill",
+                &json!({ "skill_id": 9, "arguments": { "anything": [1, 2] } }),
+                &facts(&mounts, "channel-7"),
+            )
+            .unwrap_or_else(|e| panic!("`{parameters}` declares no schema, so it cannot refuse: {e}"));
+            assert_eq!(doors.mounts.len(), 1);
+        }
+    }
+
+    #[test]
+    fn additional_properties_false_is_the_rows_choice_to_make() {
+        let schema = r#"{"properties":{"repo":{"type":"string"}},"additionalProperties":false}"#;
+        let mounts = python_mount();
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
+            .answering(
+                "/code/4",
+                json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
+            );
+        let Err(error) = call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "verb": "run" } }),
+            &facts(&mounts, "channel-7"),
+        ) else {
+            panic!("a closed contract takes no extra key");
+        };
+        assert!(error.contains("takes no `verb`"), "{error}");
+        assert!(doors.mounts.is_empty());
     }
 }

@@ -5,7 +5,9 @@
 **Status:** Accepted (2026-10-26). Ruling: composition inside a skill is written
 in an EXISTING language — steel or python — and never in a format this project
 invents. One part of the execution path is unverified (§4: steel's ability to
-evaluate a delivered string); that is a check, not an objection to the ruling.
+evaluate a delivered string); that is a check, not an objection to the ruling, and
+it is DEFERRED: python alone is enough to implement against, so nobody is to spend
+time on the steel path until the priority rises on its own.
 **Date:** 2026-10-26
 
 ## Context
@@ -79,13 +81,20 @@ language; no DSL is designed here.**
    - python: yes (`exec`), proven by `deploy/runners/runner_py.py`.
    - nu: no — measured (ADR-0001 §8: `source` demands a parse-time constant, nu
      0.116 has no `eval`).
-   - **steel: NOT VERIFIED.** Its carrier loads a source once at cold start, and
+   - **steel: NOT VERIFIED, AND DEFERRED.** Its carrier loads a source once at cold start, and
      nothing in this tree evaluates a runtime string; whether `steel-core` exposes
      an eval is an open check. If it does not, a steel body cannot ride a mount
      argument and would need either a per-skill type (rejected, ADR-0001 §2) or an
      in-process venue path (rejected, ADR-0001 §3) — which would leave steel as a
      WRITING form for bodies that execute as something else, or as a language the
      node carries for its own booths but not for skills.
+
+   This does not block anything that matters: python is a complete implementation
+   of the ruling (§3's second bullet: a process boundary, a one-shot runner, a
+   resident guest, and the language models write correctly first), so building
+   bodies in python is the whole of the near-term work. Steel's half becomes a
+   check worth running when a steel-shaped requirement shows up — most likely from
+   the static-analysis side (§3's first bullet), not from execution.
 
 ## Consequences
 
