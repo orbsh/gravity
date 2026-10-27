@@ -6,6 +6,8 @@
 四个名字**全部**端到端接上——`recall_memory`、`commit_memory`、`resolve_skills`（k10r
 ADR-0015 的 skill 节点与它的门），以及 `invoke_skill`（把一步走到它的 code 行、对到服务该
 语言的 mount、在节点上把脚本跑起来）。真实栈由 prism 的 `tests/turn_invoke_skill.rs` 证明。
+同日稍后加了**第五条** `create_skill`（k10r ADR-0018）：记忆有主动写入，技能也得有——一个
+从没被写下来的做法，下一轮对话要重新琢磨一遍。
 **日期：** 2026-10-26
 
 **本记录中撤回的名字：** `memory_search` / `memory_recall` / `memory_top` /
@@ -94,11 +96,19 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
 6. **每个条目声明自己的执行性质——静态、逐工具。** `fast`（进程内、幂等的读）对
    `human`（触到外部世界、花人的注意力或改状态）。这是 Phase 2.5 冷路径读的那个字段，也是
    `tool_invoke_count` 回写挂靠的字段（Phase 5）：`recall_memory` 与 `resolve_skills` 是
-   `fast`；`commit_memory` 与 `invoke_skill` 是 `human`。
-7. **turn 开头的投影仍是主读取。** head 到手时已经组装并渲染完毕；这些工具回答的是 head
+   `fast`；`commit_memory`、`invoke_skill`、`create_skill` 是 `human`。
+
+7. **调用在发生的地方计数，而不是在 turn 结束的时候。** `invoke_skill` 在请节点跑任何
+   东西之前发一条 `attempt`，答案回来时发一条 `success`（k10r ADR-0018：
+   `POST /skills/{scope}/{id}/touch`，正文 `{event, ts_ms}`）。尝试在前，因为一个永远
+   不返回的调用也必须看得见——`calls - ok` 就是失败数，而它只有在「不知道结果时就记下
+   尝试」的前提下才存在。门的答案是**回执**：计数写不下，绝不失败模型要的那一步。这里
+   没有任何东西在等 turn 结束。
+
+8. **turn 开头的投影仍是主读取。** head 到手时已经组装并渲染完毕；这些工具回答的是 head
    答不了的——某次具体查找、近似面做不了的枚举。它们不是投影的替代品，也不许变成每轮轮询：
    一个在每个步骤前都先 `recall_memory` 的 turn，已经把一份组装好的视图换成了 N 次往返。
-8. **清单按门生长，不按热情生长。** 一个条目在它的基底能应答时才发出去；上面的名字现在就
+9. **清单按门生长，不按热情生长。** 一个条目在它的基底能应答时才发出去；上面的名字现在就
    定死，免得以后改名。具体说：`recall_memory` 与 `commit_memory` 写好就出去了，
    `resolve_skills` 则在它的门落地的同一天跟上（k10r ADR-0015——当初因零客户端撤掉的
    bring-up 池读，现在有了客户端）。剩下的是 `invoke_skill`：它需要「走完一个被解析出来的

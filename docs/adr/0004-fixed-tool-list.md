@@ -67,13 +67,14 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}` — the graph's ingest | LISTED |
    | `resolve_skills` | `{query}`, `{limit}` | the SELECTABLE SKILL LIST — what the model consults when it cannot finish on its own; k10r answers candidates by intent | LISTED (2026-10-26): k10r ADR-0015 landed the skill node and `POST /skills/{memory_scope}/resolve` — a skill is a node in the same graph, so the graph's scope addresses it |
    | `invoke_skill` | `{skill_id, step?, arguments?}` | read the skill, pick the step, `GET /code/{id}` for its script, then the governed call `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` on an effector node mount (SEAM.md §3) | LISTED (2026-10-26): ONE step per call — the sequence is the model's (§3) |
+   | `create_skill` | `{name, title?, content, preconditions?, steps?, verification?}` | `POST /skills/{memory_scope}` — the declaration door k10r already serves (ADR-0015); the step-shaped parts travel as JSON TEXT, so the array→text conversion happens here, at the boundary that owns the wire | LISTED (2026-10-26, k10r ADR-0018): the model's act, symmetric with `commit_memory` — a skill that is never written down is a procedure the next conversation reinvents |
 
    The task group (`task_open` / `task_done` / `task_list`) is declared but NOT
    listed: its write face has no route yet and the read side rides the session
    projection (SEAM.md §2 "Task progress"; ADR-0003 §3, PLAN Phase 2.6). A tool
    the substrate cannot serve is a lie to the model, and a model that has called
    one learns to distrust the whole list.
-3. **The flow is the one the face describes: the model resolves, then invokes.**
+3. **The flow is the one the face describes: the model resolves, invokes — and writes down what it had to work out.**
    When the request cannot be answered from the prompt and the head, the model
    calls `resolve_skills`; the candidates come back as tool results, steps
    included (k10r ADR-0015 §4 — deciding needs to see what a skill would make it
@@ -127,15 +128,24 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    (in-process, idempotent read) versus `human` (touches the outside world, costs
    a person's attention or changes state). This is the field Phase 2.5's cold
    path reads and the field the `tool_invoke_count` write-back hangs on (Phase
-   5): `recall_memory` and `resolve_skills` are `fast`; `commit_memory` and
-   `invoke_skill` are `human`.
-7. **The turn-start projection stays the primary memory read.** The head arrives
+   5): `recall_memory` and `resolve_skills` are `fast`; `commit_memory`,
+   `invoke_skill` and `create_skill` are `human`.
+7. **A call is counted where it happens, not at the end of the turn.** `invoke_skill`
+   posts an `attempt` record before the node is asked to run anything and a `success`
+   record when the answer comes back (k10r ADR-0018: `POST /skills/{scope}/{id}/touch`
+   with `{event, ts_ms}`). The attempt goes first because a call that never returns
+   must still be visible — `calls - ok` is the failure count, and it can only exist
+   if the attempt was recorded without knowing the outcome. The door's answer is a
+   RECEIPT: a counter that cannot be written never fails the step the model asked
+   for. Nothing about this waits for the turn to end.
+
+8. **The turn-start projection stays the primary memory read.** The head arrives
    already composed and rendered; these tools answer what the head cannot — a
    specific lookup, an enumeration the approximate face cannot do. They are not
    a replacement for the projection and must not become a per-turn poll: a turn
    that calls `recall_memory` before every step has turned a composed view into
    N round trips.
-8. **The list grows by DOOR, never by enthusiasm.** An entry ships when its
+9. **The list grows by DOOR, never by enthusiasm.** An entry ships when its
    substrate answers; the names above are fixed now so nothing is renamed later.
    Concretely: `recall_memory` and `commit_memory` went out as soon as they were
    written, and `resolve_skills` followed the same day its door landed (k10r
