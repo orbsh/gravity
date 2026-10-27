@@ -67,9 +67,11 @@ static SPECS: &[ToolSpec] = &[
         description: "Write facts into the long-term graph. Each fact is an 8-slot tuple: \
                       [head value, head type, head props, relation name, relation props, \
                       tail value, tail type, tail props]. Props are JSON objects (`{}` when \
-                      empty). A functional relation at the same source is adjudicated by k10r, \
-                      not overwritten blindly — the answer says which of landed / rewritten / \
-                      dropped happened.",
+                      empty). Asserting the same head, relation and tail again does not add a \
+                      second fact: k10r adjudicates functional relations at the same source and \
+                      treats a repeated assertion as the same edge, so the answer says which of \
+                      linked / rewritten / dropped / bumped happened — `bumped` means the fact \
+                      already stood and nothing was written.",
         parameters: || {
             json!({
                 "type": "object",
