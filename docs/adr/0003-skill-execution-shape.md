@@ -72,9 +72,10 @@ history never edits the graph's topology.**
    at runtime is not one of those statistics, and a per-session artifact
    promoted to structure would accrete as structure once per session that ran
    it. **Landed 2026-10-26 as k10r ADR-0016**: the proposal is a row gravity files
-   at turn end, the count is application state on that row, and promotion is a
-   human's declaration that copies the run's steps — no execution path writes
-   topology. The principle is the one Aura already applies to types: emergent data
+   the moment the walk REACHES a composition (the turn does not have to end — the
+   record rides the step, not the reply), the count is application state on that
+   row, and promotion is a human's declaration that copies the run's steps — no
+   execution path writes topology. The principle is the one Aura already applies to types: emergent data
    never mints structure, because the curated graph is not the runtime's to
    edit.
 

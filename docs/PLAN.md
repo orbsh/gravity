@@ -47,15 +47,19 @@ critical path).
   before the node is asked to run anything, `success` when the answer comes back, both
   through `POST /skills/{scope}/{id}/touch` and both ignored on failure — a counter that
   cannot be written never fails the step the model asked for.
-  PROPOSAL WRITE SIDE LANDED 2026-10-26 (k10r ADR-0016): the turn reports what it
-  walked. `tools::call` takes a recorder beside the `Doors`, `invoke_skill` appends
-  each code row it RAN (id + description, and only on success — a failed step is not
-  part of a run worth proposing), and `finish_turn` posts
-  `{key, steps, ts_ms}` to `POST /skills/{scope}/propose` when the turn walked two
-  DIFFERENT rows (one row twice is a retry). The key is the walker's spelling —
-  ids in execution order — because k10r does not parse `steps`. Filing is best
-  effort and never fails a turn: the reply is already durable when it runs. No new
-  tool name; nothing promotes itself; `resolve` keeps showing only real skills.
+  PROPOSAL WRITE SIDE LANDED 2026-10-26 (k10r ADR-0016, amended the same day): the
+  turn reports what it walked. `tools::call` takes a recorder beside the `Doors`,
+  `invoke_skill` appends each code row it RAN (id + description, and only on
+  success — a failed step is not part of a run worth proposing), and the DISPATCH
+  files the composition the moment the walk grows to two DIFFERENT rows — not at
+  turn end, so the record rides the step rather than the reply and survives a turn
+  that dies before its terminal round. `tools::should_file(before, after, walk)`
+  is the rule in one place: only a walk that GREW files (a retry cannot count the
+  same walk twice). A three-step walk files its prefix too (`a+b`, then `a+b+c`) —
+  both were walked. The key is the walker's spelling — ids in execution order —
+  because k10r does not parse `steps`. Filing is best effort and never fails a
+  turn. No new tool name; nothing promotes itself; `resolve` keeps showing only
+  real skills.
   Proven by prism's `tests/turn_invoke_skill.rs` (two code rows in one turn → one
   proposal row, count 1, and the resolver unchanged), not by a unit test alone.
   COMPOSITION RULED 2026-10-26 (ADR-0005): a multi-step skill's body is CODE in an
