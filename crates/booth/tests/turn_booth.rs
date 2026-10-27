@@ -76,15 +76,17 @@ fn sse_body(chunks: &[&'static str]) -> String {
 /// message of the side branch (the turn appends it in place of the user's
 /// message), so a request that ends with it asks for the summary and every
 /// other request asks for the reply.
-async fn sse_server_two_branches(
+async fn sse_server_three_branches(
     reply: Vec<&'static str>,
     summary: Vec<&'static str>,
+    review: Vec<&'static str>,
 ) -> String {
     let app = axum::Router::new().route(
         "/chat/completions",
         axum::routing::post(move |body: axum::body::Bytes| {
             let reply = reply.clone();
             let summary = summary.clone();
+            let review = review.clone();
             async move {
                 let asked = serde_json::from_slice::<serde_json::Value>(&body)
                     .ok()
@@ -97,8 +99,13 @@ async fn sse_server_two_branches(
                             .map(str::to_string)
                     })
                     .unwrap_or_default();
+                // The branch is recognised by the PROMPT it was handed: k10r
+                // serves one prompt per operation, so the stub needs no ordering
+                // assumptions about which branch connects first.
                 let chunks = if asked.starts_with("Two products from the conversation span") {
                     summary
+                } else if asked.starts_with("Review the conversation span") {
+                    review
                 } else {
                     reply
                 };
@@ -705,7 +712,12 @@ async fn a_provider_that_never_stops_asking_for_tools_fails_the_turn() {
 #[tokio::test]
 async fn the_compression_branch_lands_the_served_summary() {
     let endpoint =
-        sse_server_two_branches(vec!["hel", "lo ", "wor", "ld"], vec!["compressed ", "span"]).await;
+        sse_server_three_branches(
+            vec!["hel", "lo ", "wor", "ld"],
+            vec!["compressed ", "span"],
+            vec![r#"{"facts": []}"#],
+        )
+        .await;
     let store_url = mem_server_with_compression().await;
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
     // Three records with a wide gap before the last one: the verdict's split
@@ -740,9 +752,10 @@ async fn the_compression_branch_lands_the_served_summary() {
 // keep the server live while the assertion's request blocks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_cut_the_pass_chooses_lands_beside_the_summary() {
-    let endpoint = sse_server_two_branches(
+    let endpoint = sse_server_three_branches(
         vec!["hel", "lo ", "wor", "ld"],
         vec![r#"{"summary": "the span in three lines", "cut": 1}"#],
+        vec![r#"{"facts": []}"#],
     )
     .await;
     let store_url = mem_server_with_compression().await;
@@ -773,5 +786,50 @@ async fn the_cut_the_pass_chooses_lands_beside_the_summary() {
     assert_eq!(
         raw["coverage_ts"], 2_000,
         "the label does NOT move the coverage point: the node closes where the verdict said"
+    );
+}
+
+/// The review pass (k10r ADR-0017 §4): the second operation the SAME verdict asks
+/// for. It reads the span from the cut compression suggested and writes what the
+/// conversation did not — through the memory door `commit_memory` uses, so a
+/// review needs no vocabulary of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_review_branch_writes_the_facts_it_found() {
+    let endpoint = sse_server_three_branches(
+        vec!["hel", "lo ", "wor", "ld"],
+        vec![r#"{"summary": "a span", "cut": 0}"#],
+        vec![
+            r#"{"facts": [["acme","repository",{},"OWNS",{},"issues-api","repository",{}]]}"#,
+        ],
+    )
+    .await;
+    let store_url = mem_server_with_compression().await;
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    for (ts, text) in [
+        (1_000u64, "first message of the span"),
+        (2_000, "second message of the span"),
+        (9_000, "third message of the span"),
+    ] {
+        surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
+    }
+
+    let engine = boot().await;
+    drain_turn(&engine, &store_url, &endpoint, "hi").await;
+
+    // The fact landed in the graph the review posted it to (scope 37, the turn's
+    // `memory_scope`): the proof is a node the conversation never named.
+    let graph: serde_json::Value = ureq::get(&format!("{store_url}/graph/37"))
+        .call()
+        .unwrap()
+        .into_json()
+        .unwrap();
+    // `GET /graph/{scope}` answers `{nodes, links}`; the fact is a node the
+    // conversation never named, so its presence is the review's own doing.
+    let nodes = graph["nodes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node["name"].as_str() == Some("acme")),
+        "the review's fact reached the graph: {graph}"
     );
 }

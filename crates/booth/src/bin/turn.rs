@@ -104,8 +104,11 @@ fn start_envelope(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
     // handler's args are the guard's `{stream_id, round}`).
     *TURN_ARGS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(args.clone());
     // A resident guest serves turn after turn: nothing from the previous
-    // one may leak into this one (the branch slot is per turn).
-    *TAIL.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    // one may leak into this one (the branch list is per turn).
+    TAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     let (first_delta, _sid) = start_turn(ctx, args)?;
     Ok(json!({ "done": false, "item": { "delta": first_delta } }))
 }
@@ -464,14 +467,6 @@ fn get_json(url: &str) -> Result<Value, String> {
     }
 }
 
-/// The compression side branch's provider instance key. A provider guest
-/// holds ONE SSE connection per process, and the realm keys instances by
-/// (booth type, key), so the side branch takes its own instance — sharing
-/// the main branch's would make the two streams fight over that one slot.
-/// The provider slot every tail operation's branch runs on (a second provider
-/// instance, so the branch's pulls never interleave with the answer's).
-const SIDE_KEY: &str = "compress";
-
 /// A tail operation's branch while it is live: which operation it is, its
 /// provider stream, the tokens received so far, and the log pointers of the
 /// records it was shown (process state — the process IS the turn).
@@ -486,7 +481,12 @@ struct Tail {
     keys: Vec<(u64, u16)>,
 }
 
-static TAIL: std::sync::Mutex<Option<Tail>> = std::sync::Mutex::new(None);
+/// Every live tail branch. A VECTOR, not one slot: the store asks for more than
+/// one operation on the same read (compression and a review today, ADR-0017 §4),
+/// and a single slot meant the last branch opened silently displaced the one
+/// before it — a compression whose product never landed, which k10r then reports
+/// as an open node forever.
+static TAILS: std::sync::Mutex<Vec<Tail>> = std::sync::Mutex::new(Vec::new());
 
 /// Open the tail branches k10r asked for (ADR-0008 §4): the same prefix the main
 /// branch reads, the served prompt in place of this turn's message, the records
@@ -515,7 +515,7 @@ fn start_tails(
         let Some(name) = tail.get("name").and_then(Value::as_str) else {
             continue;
         };
-        if name != OP_COMPRESS {
+        if name != OP_COMPRESS && name != OP_REVIEW {
             eprintln!("[gravity-turn] tail operation `{name}` is not known to this guest");
             continue;
         }
@@ -527,6 +527,10 @@ fn start_tails(
 /// sides — k10r's `COMPRESS_OP.name` and this constant are the same string, and
 /// neither side derives it from the other.
 const OP_COMPRESS: &str = "compress";
+/// The review pass (k10r ADR-0017 §4): what the conversation should have written
+/// down and did not. Its product lands through the memory door, the same one
+/// `commit_memory` uses — no second schema and no new gate.
+const OP_REVIEW: &str = "review";
 
 fn open_branch(
     ctx: &mut Ctx,
@@ -541,9 +545,11 @@ fn open_branch(
     };
     let mut messages: Vec<Value> = prefix.to_vec();
     messages.push(json!({ "role": "user", "content": prompt }));
+    // The operation's OWN provider instance (see the note above): the guest keeps
+    // one stream per process, so this is what keeps two branches from sharing one.
     let first = match ctx.iterate_start(
         "llm_provider",
-        SIDE_KEY,
+        name,
         "stream",
         json!({
             "endpoint": args.get("endpoint"),
@@ -580,12 +586,15 @@ fn open_branch(
     {
         parts.push(delta.to_string());
     }
-    *TAIL.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Tail {
-        op: name.to_string(),
-        stream_id: sid.to_string(),
-        parts,
-        keys: keys.to_vec(),
-    });
+    TAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(Tail {
+            op: name.to_string(),
+            stream_id: sid.to_string(),
+            parts,
+            keys: keys.to_vec(),
+        });
 }
 
 /// One pull round of the live branch. On `done` its product goes to the door the
@@ -594,12 +603,17 @@ fn open_branch(
 /// compression says it should have ended at is the caller's observation to make,
 /// because only the caller built the messages the model read.
 fn step_tail(ctx: &mut Ctx) {
-    let Some(mut branch) = TAIL
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-    else {
-        return;
+    // One round on ONE branch, taking them in turn: the branches are pulled
+    // round-robin so a long tail cannot starve the others, and each keeps its own
+    // accumulated text (`parts`) across rounds.
+    let mut branch = {
+        let mut tails = TAILS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tails.is_empty() {
+            return;
+        }
+        tails.remove(0)
     };
     let env = match ctx.iterate_next(&branch.stream_id) {
         Ok(value) => value,
@@ -628,7 +642,10 @@ fn step_tail(ctx: &mut Ctx) {
     {
         branch.parts.push(delta.to_string());
     }
-    *TAIL.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(branch);
+    TAILS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(branch);
 }
 
 /// Drain the live branch before the turn closes. The carrier releases the turn's
@@ -640,10 +657,10 @@ fn step_tail(ctx: &mut Ctx) {
 /// as "compressing".
 fn drain_tails(ctx: &mut Ctx) {
     for _ in 0..64 {
-        let live = TAIL
+        let live = !TAILS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
+            .is_empty();
         if !live {
             return;
         }
@@ -694,12 +711,74 @@ fn read_products(text: &str, keys: &[(u64, u16)]) -> (String, Option<(u64, u16)>
 /// and the turn goes on (the alternative, failing the turn over maintenance,
 /// would trade a user-visible answer for a bookkeeping one).
 fn land_tail(branch: &Tail, text: &str) {
-    if branch.op != OP_COMPRESS {
-        eprintln!("[gravity-turn] no landing door for `{}`", branch.op);
-        return;
+    match branch.op.as_str() {
+        OP_COMPRESS => {
+            let (summary, suggested) = read_products(text, &branch.keys);
+            land_summary(&summary, suggested);
+        }
+        OP_REVIEW => match read_review_facts(text) {
+            Some(facts) if facts.is_empty() => {
+                eprintln!("[gravity-turn] review: nothing worth writing down");
+            }
+            Some(facts) => land_review(&facts),
+            // A review whose answer is not the shape saves NOTHING: unlike a
+            // summary, there is no "usable" version of a fact list, and guessing
+            // what prose meant would write invented facts into the graph.
+            None => eprintln!("[gravity-turn] review: the answer was not a fact array"),
+        },
+        other => eprintln!("[gravity-turn] no landing door for `{other}`"),
     }
-    let (summary, suggested) = read_products(text, &branch.keys);
-    land_summary(&summary, suggested);
+}
+
+/// What a REVIEW's answer meant: `{"facts": [[8 slots], …]}` or nothing.
+///
+/// Tolerant of a fenced block, intolerant of anything else. Unlike compression —
+/// where prose still summarizes — prose cannot be read as facts, so the range
+/// answer is `None` and the caller writes nothing.
+fn read_review_facts(text: &str) -> Option<Vec<Value>> {
+    let trimmed = text.trim();
+    let unfenced = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    let parsed: Value = serde_json::from_str(unfenced).ok()?;
+    let facts = parsed.get("facts")?.as_array()?;
+    // Every entry must be an 8-slot tuple: the door rejects anything else, and a
+    // partial batch would be a silent half-commit.
+    let shaped = facts
+        .iter()
+        .all(|f| f.as_array().is_some_and(|slots| slots.len() == 8));
+    shaped.then(|| facts.clone())
+}
+
+/// `POST …/memories/{scope}` — the door `commit_memory` writes through. Same body
+/// shape (an array of 8-slot tuples), so a review needs no vocabulary of its own.
+fn land_review(facts: &[Value]) {
+    let Some(args) = TURN_ARGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    else {
+        return;
+    };
+    let (Some(store_url), Some(scope)) = (
+        args.get("store_url").and_then(Value::as_str),
+        args.get("memory_scope").and_then(Value::as_u64),
+    ) else {
+        eprintln!("[gravity-turn] review: no store or scope on this deployment");
+        return;
+    };
+    let url = format!("{}/memories/{scope}", store_url.trim_end_matches('/'));
+    match ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(Value::Array(facts.to_vec()))
+    {
+        Ok(resp) if (200..300).contains(&resp.status()) => {}
+        Ok(resp) => eprintln!("[gravity-turn] review door answered {}", resp.status()),
+        Err(e) => eprintln!("[gravity-turn] review door failed: {e}"),
+    }
 }
 
 /// `POST …/checkpoint { summary, suggested_ts?, suggested_sub? }` — the door k10r
@@ -838,7 +917,7 @@ fn file_composition(store_url: &str, scope: u64, walked: &[gravity_booth::tools:
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::read_products;
+    use super::{read_products, read_review_facts};
 
     fn keys() -> Vec<(u64, u16)> {
         vec![(100, 0), (200, 0), (300, 1)]
@@ -898,5 +977,36 @@ mod tests {
         let (summary, cut) = read_products(r#"{"cut": 2}"#, &keys());
         assert_eq!(summary, r#"{"cut": 2}"#, "no summary means no products");
         assert_eq!(cut, None);
+    }
+
+    /// A review's answer is a fact array or nothing: prose cannot be read as
+    /// facts, because guessing what it meant would write invented facts into the
+    /// graph (compression, by contrast, still has a summary in prose).
+    #[test]
+    fn a_review_reads_a_fact_array_and_nothing_else() {
+        let fact = r#"["acme","repository",{},"OWNS",{},"issues-api","repository",{}]"#;
+        let answer = format!("{{\"facts\": [{fact}]}}");
+        assert_eq!(
+            read_review_facts(&answer).map(|facts| facts.len()),
+            Some(1),
+            "a shaped tuple is a fact"
+        );
+        assert_eq!(
+            read_review_facts(&format!("```json\n{answer}\n```")).map(|facts| facts.len()),
+            Some(1),
+            "a fenced block is still the answer"
+        );
+        assert_eq!(
+            read_review_facts(r#"{"facts": []}"#).map(|facts| facts.len()),
+            Some(0),
+            "nothing to save is a legal answer, and not the same as a bad one"
+        );
+        assert_eq!(read_review_facts("I looked and nothing stood out."), None);
+        assert_eq!(
+            read_review_facts(r#"{"facts": [["acme","repository"]]}"#),
+            None,
+            "a tuple that is not 8 slots is not a fact the door can take"
+        );
+        assert_eq!(read_review_facts(r#"{"facts": [null]}"#), None);
     }
 }
