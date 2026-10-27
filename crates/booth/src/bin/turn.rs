@@ -316,6 +316,7 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
                 let mut walked = WALKED
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let before = walked.len();
                 let outcome = gravity_booth::tools::call(
                     &mut doors,
                     &call.function.name,
@@ -323,9 +324,25 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
                     &facts,
                     &mut walked,
                 );
+                // One report per step that EXTENDED the walk: a retried step
+                // leaves the recorder as it was, and reporting it again would
+                // count one walk twice.
+                let after = walked.len();
+                let so_far = walked.clone();
                 // The recorder is released before the loop builds messages: a
                 // later round's call re-takes it, and nothing else touches it.
                 drop(walked);
+                // The composition is filed where the walk REACHES it (ADR-0016
+                // as re-cut): the turn does not have to end, let alone append
+                // its reply first, for the record to exist. Best effort — the
+                // proposal is an observation about the walk, never a premise of
+                // the step the model asked for.
+                if let (true, Some(scope)) = (
+                    gravity_booth::tools::should_file(before, after, &so_far),
+                    memory_scope,
+                ) {
+                    file_composition(&store_url, scope, &so_far);
+                }
                 match outcome {
                     Ok(value) => value.to_string(),
                     Err(error) => json!({ "error": error }).to_string(),
@@ -786,37 +803,24 @@ fn finish_turn() -> anyhow::Result<Value> {
             resp.status()
         );
     }
-    // The write side of the skill loop (ADR-0016): a turn that walked two
-    // DIFFERENT code rows is a composition worth counting. Reported, never
-    // promoted — k10r keeps the count, a human decides what it becomes, and the
-    // resolver keeps showing only real skills. Best effort: a proposal is an
-    // observation ABOUT the turn, so failing to file it must not fail the turn
-    // (the reply is already durable at this point).
-    propose_composition(&store_url, &args, ts);
-
     Ok(json!({ "done": true, "value": { "reply": reply } }))
 }
 
-/// File this turn's composition, if it had one. `store_url` and the turn args
-/// are already in hand at finish time, and the recorder is the turn's own.
-fn propose_composition(store_url: &str, args: &Value, ts_ms: u64) {
-    let walked: Vec<gravity_booth::tools::Walked> = std::mem::take(
-        &mut *WALKED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
-    if !gravity_booth::tools::is_composition(&walked) {
-        return;
-    }
-    let Some(scope) = args.get("memory_scope").and_then(Value::as_u64) else {
-        // No scope, no graph to propose into: the same rule the tools follow —
-        // a missing deployment fact is reported where it is needed, never
-        // guessed at here.
-        return;
-    };
+/// File one composition: the code rows the walk has visited so far, in order
+/// (ADR-0016). Reported, never promoted — k10r keeps the count, a human decides
+/// what it becomes, and the resolver keeps showing only real skills.
+///
+/// Called where the walk grows, so a three-step walk files `a+b` and then
+/// `a+b+c`. That is not noise: the prefix WAS walked, and a review queue ranked
+/// by count should see both.
+fn file_composition(store_url: &str, scope: u64, walked: &[gravity_booth::tools::Walked]) {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
     let body = json!({
-        "key": gravity_booth::tools::composition_key(&walked),
-        "steps": gravity_booth::tools::steps_json(&walked),
+        "key": gravity_booth::tools::composition_key(walked),
+        "steps": gravity_booth::tools::steps_json(walked),
         "ts_ms": ts_ms,
     });
     let url = format!("{store_url}/skills/{scope}/propose");

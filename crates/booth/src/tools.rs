@@ -516,6 +516,14 @@ pub struct Walked {
 }
 
 /// The composition as the store spells it (ADR-0016: the walker names it, since
+/// Whether this call should FILE the walk it just extended (k10r ADR-0016 as
+/// re-cut): the walk must have GROWN — a retried step leaves the recorder as it
+/// was, and filing it again would count one walk twice — and what it grew to
+/// must be a composition, two different code rows.
+pub fn should_file(before: usize, after: usize, walked: &[Walked]) -> bool {
+    after > before && is_composition(walked)
+}
+
 /// k10r does not parse `steps`).
 pub fn composition_key(walked: &[Walked]) -> String {
     walked
@@ -1234,5 +1242,32 @@ mod tests {
             "tried and broke is the state a reader is looking for — no success follows"
         );
         assert!(walked.is_empty(), "a step that failed is not part of a run");
+    }
+
+    /// The filing rule (k10r ADR-0016 as re-cut): one report per step that
+    /// EXTENDED the walk, and only once the walk is a composition.
+    #[test]
+    fn a_walk_files_when_it_grows_into_a_composition() {
+        let one = vec![
+            Walked { code_id: 4, description: "fetch".into() },
+        ];
+        let two = vec![
+            Walked { code_id: 4, description: "fetch".into() },
+            Walked { code_id: 7, description: "format".into() },
+        ];
+        assert!(!should_file(0, 1, &one), "one row is not a composition");
+        assert!(should_file(1, 2, &two), "a second DIFFERENT row is");
+        assert!(
+            !should_file(1, 2, &[
+                Walked { code_id: 4, description: "fetch".into() },
+                Walked { code_id: 4, description: "fetch".into() },
+            ]),
+            "the same row twice is a retry, not a composition"
+        );
+        assert!(
+            !should_file(2, 2, &two),
+            "a step that did not grow the walk files nothing: the composition \
+             was already recorded when it appeared"
+        );
     }
 }
