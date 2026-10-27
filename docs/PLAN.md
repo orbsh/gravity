@@ -47,6 +47,19 @@ critical path).
   before the node is asked to run anything, `success` when the answer comes back, both
   through `POST /skills/{scope}/{id}/touch` and both ignored on failure — a counter that
   cannot be written never fails the step the model asked for.
+  TAIL LANDING ARMS SPLIT BY OPERATION 2026-10-26 (k10r ADR-0017 §4/§7): the turn lands
+  each tail product at the door its operation owns — `compress` at the checkpoint door,
+  `review` at the MEMORY door (`POST /memories/{scope}`), an unknown name logged and
+  dropped, never guessed. Two structural faults surfaced and were fixed on the way, both
+  invisible while one operation existed: (a) the live branches were a single slot, so a
+  second operation silently displaced the first and its product never landed (k10r kept
+  reporting an open node); they are a LIST pulled round-robin now. (b) every branch
+  shared one provider instance, and the provider guest holds ONE SSE connection per
+  process — two branches fought over it and a summary arrived half-read. A branch
+  therefore gets its own instance, keyed by the operation's name. A review whose answer
+  is not a fact array saves NOTHING: there is no usable prose version of a fact list.
+  Gate: `the_review_branch_writes_the_facts_it_found` (a node the conversation never
+  named appears in the graph), workspace 32/0, clippy clean.
   PROPOSAL WRITE SIDE LANDED 2026-10-26 (k10r ADR-0016, amended the same day): the
   turn reports what it walked. `tools::call` takes a recorder beside the `Doors`,
   `invoke_skill` appends each code row it RAN (id + description, and only on
