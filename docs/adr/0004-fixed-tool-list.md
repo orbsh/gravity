@@ -174,21 +174,15 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
   §7: a language with no mount cannot be called). There is no language DEFAULT to
   rule on: the code row states the language, and a row that states none is an
   error the model reads.
-- **Open — a multi-step skill wants a DSL body, not N calls.** One step per call
-  is the honest floor (the model drives, nothing invents ordering), and it is
-  inefficient by construction: every step is a round trip and a full context
-  re-read. The shape that removes that is a skill whose `steps` is ONE script
-  that orchestrates its own steps. The language question is a constraint, not a
-  taste: python is the only language with a process-boundary runner AND a
-  resident guest (`runner_py.py`, `runner_py_guest.py` — residency and the ctx
-  bridge both proven), which is what ADR-0001 §8 asks of a DSL host; scheme reads
-  better as DATA (steps that k10r's consolidation could rewrite in place), but
-  steel is an embedded carrier with no process boundary — ADR-0001 §2 rules that
-  out for LLM-generated code, and no scheme process runner exists. A middle path
-  keeps both properties: a python body with a step-marking convention, so the
-  script is one call and the boundary of each step stays visible to the model and
-  to the weight system. Not ruled on; the field to change first is what a skill's
-  `steps` holds, not this record's flow.
+- **RULED — a multi-step skill's body is CODE, not a DSL** (ADR-0005,
+  2026-10-26): the composition is a script in an existing language (steel or
+  python), the step edges are DERIVED from that body rather than hand-kept in
+  JSON, and no grammar, step vocabulary or JSON composition format is authorized
+  anywhere. A composed body is ONE step, so §3's one-step-per-call rule stops
+  being a limitation instead of being worked around. The language question is
+  per-skill (the code row's `language`), with one verification outstanding: steel
+  must prove it can evaluate a delivered string before a steel body can ride a
+  mount (ADR-0005 §4).
 - **Open:** the `invoke_skill` argument shape for a script that expects its own
   parameters — today `arguments` is one free-form object the model fills, and the
   code row's `parameters` is advisory text it can read but nothing checks; a
