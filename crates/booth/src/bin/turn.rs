@@ -314,6 +314,9 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
         // the key to the caller): a step script's own state survives the turns
         // of one conversation and nothing else.
         let session = format!("channel-{channel_id}-member-{member_id}");
+        // The call round itself, once: the wire shape of "the assistant asked
+        // for these N tools", which the results below answer one by one.
+        messages.push(json!({ "role": "assistant", "tool_calls": calls }));
         for call in parsed {
             let facts = gravity_booth::tools::Facts {
                 store_url: &store_url,
@@ -360,14 +363,19 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
                     Err(error) => json!({ "error": error }).to_string(),
                 }
             };
-            // The fed-back wire shape: the assistant's call + the tool's
-            // result (OpenAI's loop contract). The result is the MODEL's,
-            // not the consumer's: prism's turn stream carries text deltas
-            // (`item.delta`) and refuses anything else, so the loop's
-            // progress stays inside the turn (PLAN Phase 2.5's transcript).
-            // A tool PROGRESS frame for a UI is prism's protocol to add,
-            // not a frame gravity invents behind its back.
-            messages.push(json!({ "role": "assistant", "tool_calls": calls }));
+            // The fed-back wire shape: the tool's result (OpenAI's loop
+            // contract). The result is the MODEL's, not the consumer's:
+            // prism's turn stream carries text deltas (`item.delta`) and
+            // refuses anything else, so the loop's progress stays inside the
+            // turn (PLAN Phase 2.5's transcript). A tool PROGRESS frame for a
+            // UI is prism's protocol to add, not a frame gravity invents
+            // behind its back.
+            //
+            // ONE assistant message carries ALL the calls, and it is pushed
+            // before this loop: a model that answers two requests in one
+            // round produces one message with two calls, and pushing it per
+            // call fed the model its own round twice — the endpoint answered
+            // an empty string and the user lost the answer.
             messages.push(json!({
                 "role": "tool",
                 "tool_call_id": call.id,

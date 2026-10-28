@@ -641,6 +641,152 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
     );
 }
 
+/// Two requests answered in ONE round: one assistant message carrying both
+/// calls, one result per call, and the user still gets an answer.
+///
+/// The fragments are split the way a real endpoint splits them (id and name
+/// first, then slices of the argument document, calls interleaved by `index`),
+/// because that is what made this defect invisible: a stub that streams one
+/// whole call per delta never exercises either half.
+#[tokio::test]
+async fn two_calls_in_one_round_reach_the_model_as_one_round() {
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let hits_for_route = hits.clone();
+    let bodies_for_route = bodies.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move |request: axum::extract::Request| {
+            let bodies = bodies_for_route.clone();
+            async move {
+                let n = hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&bytes).to_string());
+                let mut sse = String::new();
+                if n == 0 {
+                    for fragment in [
+                        r#"{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"open_task","arguments":""}}]}}"#,
+                        r#"{"delta":{"tool_calls":[{"index":1,"id":"c2","type":"function","function":{"name":"open_task","arguments":""}}]}}"#,
+                        r#"{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"name\":\"alpha\","}}]}}"#,
+                        r#"{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"name\":\"beta\"}"}}]}}"#,
+                        r#"{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"next\":\"a\"}"}}]}}"#,
+                    ] {
+                        sse.push_str(&format!("data: {{\"choices\":[{fragment}]}}\n\n"));
+                    }
+                } else {
+                    sse.push_str(r#"data: {"choices":[{"delta":{"content":"both opened"}}]}"#);
+                }
+                sse.push_str("\n\ndata: [DONE]\n\n");
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{addr}");
+    let store_url = mem_server().await;
+    let engine = boot().await;
+
+    let slot = Realm::iterate(
+        &engine.realm,
+        IterateOp::Start {
+            target: InstanceId {
+                booth_type: TURN_TYPE.into(),
+                key: InstanceKey::Named("s1".into()),
+            },
+            handler: "turn".into(),
+            args: turn_args(&store_url, &endpoint, "open alpha and beta"),
+        },
+    )
+    .await
+    .unwrap();
+    let (mut rx, mut stream_id) = match slot {
+        CallSlot::Hot { rx, .. } => (rx, None),
+        _ => panic!("iterate is hot-only"),
+    };
+    let mut reply = String::new();
+    loop {
+        let v = match rx.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => panic!("pull failed: {e}"),
+            Err(_) => panic!("reply dropped"),
+        };
+        if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
+            break;
+        }
+        if stream_id.is_none() {
+            stream_id = Some(
+                v.get("stream_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+        if let Some(delta) = v.get("item").and_then(|i| i.get("delta")).and_then(|d| d.as_str()) {
+            reply.push_str(delta);
+        }
+        let id = stream_id.clone().unwrap();
+        match Realm::iterate(&engine.realm, IterateOp::Next { stream_id: id })
+            .await
+            .unwrap()
+        {
+            CallSlot::Hot { rx: next, .. } => rx = next,
+            _ => panic!("iterate is hot-only"),
+        }
+    }
+    assert_eq!(reply, "both opened", "the round's answer reached the user");
+
+    // One assistant message, two calls — not one per call. This is the shape the
+    // endpoint reported as malformed by answering an empty string.
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "two inference rounds: the round of calls, then the answer");
+    let second: serde_json::Value = serde_json::from_str(&bodies[1]).expect("a JSON request");
+    let messages = second["messages"].as_array().expect("messages");
+    let assistants: Vec<&serde_json::Value> = messages
+        .iter()
+        .filter(|message| message["role"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 1, "the call round is fed back once: {messages:?}");
+    let round = assistants[0]["tool_calls"]
+        .as_array()
+        .expect("the one assistant message carries the calls");
+    assert_eq!(round.len(), 2, "and it carries both of them");
+    let ids: Vec<&str> = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| message["tool_call_id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(ids, vec!["c1", "c2"], "one result per call, in the calls' order");
+
+    // Both doors ran: the fragments reassembled into two complete argument documents.
+    let tasks_url = format!("{store_url}/tasks/37");
+    let tasks = tokio::task::spawn_blocking(move || {
+        ureq::get(&tasks_url)
+            .call()
+            .unwrap()
+            .into_json::<serde_json::Value>()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let names: Vec<String> = tasks
+        .as_array()
+        .expect("a task list")
+        .iter()
+        .map(|task| task["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(names, vec!["alpha", "beta"], "the store kept both: {tasks}");
+}
+
 /// The dispatch loop's cap is a runaway stop, not a budget to spend
 /// quietly: a provider that answers tool calls to EVERY inference round
 /// never hands the turn a content stream, and the turn fails with a

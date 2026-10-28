@@ -84,8 +84,8 @@ impl ToolCallAccumulator {
             return None;
         }
         let calls: Vec<Value> = std::mem::take(&mut self.calls)
-            .into_iter()
-            .map(|(_, call)| {
+            .into_values()
+            .map(|call| {
                 json!({
                     "id": call.id,
                     "type": if call.kind.is_empty() { "function".to_string() } else { call.kind },
