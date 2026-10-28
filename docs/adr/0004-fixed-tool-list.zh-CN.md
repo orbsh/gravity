@@ -7,7 +7,12 @@
 ADR-0015 的 skill 节点与它的门），以及 `invoke_skill`（把一步走到它的 code 行、对到服务该
 语言的 mount、在节点上把脚本跑起来）。真实栈由 prism 的 `tests/turn_invoke_skill.rs` 证明。
 同日稍后加了**第五条** `create_skill`（k10r ADR-0018）：记忆有主动写入，技能也得有——一个
-从没被写下来的做法，下一轮对话要重新琢磨一遍。
+
+同日再补三条**任务**工具（2026-10-27，k10r ADR-0021）：
+
+   | `open_task` | `{name, next?, state?}` | `POST /tasks/{memory_scope}` —— k10r 的任务门：任务是事实图里**普通**的顶点，任务单在 ns 44，所以依赖、标签都是 `commit_memory` 的事实，不需要工具 | 2026-10-27 列入 |
+   | `move_task` | `{task_id, state?, next?}` | `POST /tasks/{memory_scope}/{task_id}/move` —— 缺席的字段**不动**；状态是闭集，打错在门口就拒，因为一个活在没人查的状态名下的任务就是没人找得到的任务 | 2026-10-27 列入 |
+   | `list_tasks` | `{state?}` | `GET /tasks/{memory_scope}?state=` —— 给状态走任务单的 `by_state` 面，不给就 kind 扫描 | 2026-10-27 列入；turn 也调它来以「还欠着什么」开头 |从没被写下来的做法，下一轮对话要重新琢磨一遍。
 **日期：** 2026-10-26
 
 **本记录中撤回的名字：** `memory_search` / `memory_recall` / `memory_top` /

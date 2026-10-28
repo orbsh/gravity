@@ -75,6 +75,14 @@ critical path).
   real skills.
   Proven by prism's `tests/turn_invoke_skill.rs` (two code rows in one turn → one
   proposal row, count 1, and the resolver unchanged), not by a unit test alone.
+  TASK TOOLS LANDED 2026-10-27 (gravity ADR-0004 amended; k10r ADR-0021): the
+  fixed list grew from five to eight — `open_task`, `move_task`, `list_tasks` — and
+  a turn now OPENS by listing what is open (`open_tasks()` in `bin/turn.rs`, one
+  system block, best effort: a store that cannot answer does not fail the turn).
+  The division the tools encode: a task is an ordinary vertex of the fact graph, so
+  dependencies, parents, tags and references are `commit_memory` facts — there is no
+  dependency tool, because one graph does not need a second edge vocabulary.
+  Gates: booth 21/0 lib + 6 + 10, workspace green, clippy clean.
   COMPOSITION RULED 2026-10-26 (ADR-0005): a multi-step skill's body is CODE in an
   existing language (steel or python), never an invented DSL and never a JSON step
   graph — an invented step language ends as a poor lisp dialect with a hand-written

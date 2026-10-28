@@ -2,8 +2,10 @@
 
 > **Languages:** [English](0004-fixed-tool-list.md) (primary) · [中文](0004-fixed-tool-list.zh-CN.md)
 
-**Status:** Accepted (2026-10-26). Landed the same day: the turn sends the fixed
-`tools` array on every inference round and ALL FOUR names are wired end to end —
+**Status:** Accepted (2026-10-26), amended (2026-10-27: the list is EIGHT — the
+three task tools closed the gap this record's own grouping named). Landed the same
+day: the turn sends the fixed `tools` array on every inference round and every name
+in it is wired end to end —
 `recall_memory`, `commit_memory`, `resolve_skills` (k10r ADR-0015's skill node
 and its doors) and `invoke_skill` (the walk: a skill's step → its code row → the
 mount that serves the step's language → the script runs on a node). Proven on
@@ -67,7 +69,10 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}` — the graph's ingest | LISTED |
    | `resolve_skills` | `{query}`, `{limit}` | the SELECTABLE SKILL LIST — what the model consults when it cannot finish on its own; k10r answers candidates by intent | LISTED (2026-10-26): k10r ADR-0015 landed the skill node and `POST /skills/{memory_scope}/resolve` — a skill is a node in the same graph, so the graph's scope addresses it |
    | `invoke_skill` | `{skill_id, step?, arguments?}` | read the skill, pick the step, `GET /code/{id}` for its script, then the governed call `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` on an effector node mount (SEAM.md §3) | LISTED (2026-10-26): ONE step per call — the sequence is the model's (§3) |
-   | `create_skill` | `{name, title?, content, preconditions?, steps?, verification?}` | `POST /skills/{memory_scope}` — the declaration door k10r already serves (ADR-0015); the step-shaped parts travel as JSON TEXT, so the array→text conversion happens here, at the boundary that owns the wire | LISTED (2026-10-26, k10r ADR-0018): the model's act, symmetric with `commit_memory` — a skill that is never written down is a procedure the next conversation reinvents |
+   | `create_skill` | `{name, title?, content, preconditions?, steps?, verification?}` | `POST /skills/{memory_scope}` — the declaration door k10r already serves (ADR-0015); the step-shaped parts travel as JSON TEXT, so the array→text conversion happens here, at the boundary that owns the wire | LISTED (2026-10-26, k10r ADR-0018): the model's act, symmetric with `commit_memory` — a skill that is never written down is a procedure the next conversation reinvents |   | `create_skill` | `{name, title?, content, preconditions?, steps?, verification?}` | `POST /skills/{memory_scope}` — the declaration door k10r already serves (ADR-0015); the step-shaped parts travel as JSON TEXT, so the array→text conversion happens here, at the boundary that owns the wire | LISTED (2026-10-26, k10r ADR-0018): the model's act, symmetric with `commit_memory` — a skill that is never written down is a procedure the next conversation reinvents |
+   | `open_task` | `{name, next?, state?}` | `POST /tasks/{memory_scope}` — k10r's task door (k10r ADR-0021): a task is an ORDINARY vertex of the fact graph with its sheet in ns 44, so a dependency or a tag is a `commit_memory` fact and needs no tool | LISTED (2026-10-27): without it the third group of ADR-0016's list stayed a promise |
+   | `move_task` | `{task_id, state?, next?}` | `POST /tasks/{memory_scope}/{task_id}/move` — absent fields are LEFT ALONE; the state is a closed set and a typo is refused at the door, because a task in a state no listing looks for is a task nobody finds | LISTED (2026-10-27) |
+   | `list_tasks` | `{state?}` | `GET /tasks/{memory_scope}?state=` — the sheet's `by_state` face with a state, the kind scan without one | LISTED (2026-10-27); the turn also calls it to open its prompt with what is owed |
 
    The task group (`task_open` / `task_done` / `task_list`) is declared but NOT
    listed: its write face has no route yet and the read side rides the session
