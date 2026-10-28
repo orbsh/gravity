@@ -168,6 +168,15 @@ fn start_turn(ctx: &mut Ctx, args: &Value) -> anyhow::Result<(String, String)> {
             }));
         }
     }
+    // What is OPEN is what the work is: a turn that cannot see its own tasks
+    // starts every conversation from zero, which is the state this whole stack
+    // exists to end. Best effort — a store that cannot answer is the store's
+    // problem, and the model can still ask with `list_tasks`.
+    if let Some(scope) = args.get("memory_scope").and_then(Value::as_u64) {
+        if let Some(open) = open_tasks(&store_url, scope) {
+            messages.push(json!({ "role": "system", "content": open }));
+        }
+    }
     // The tail branches see the same records, NUMBERED: an operation that must
     // point at one (the compression's cut) answers with an index, because the
     // store owns positions and a model cannot see them.
@@ -1009,4 +1018,33 @@ mod tests {
         );
         assert_eq!(read_review_facts(r#"{"facts": [null]}"#), None);
     }
+}
+
+
+/// The open tasks of a scope, as one system block. `None` when nothing is open or
+/// the store cannot answer: an empty preamble is noise, and a store error is not
+/// this executor's to report.
+fn open_tasks(store_url: &str, scope: u64) -> Option<String> {
+    let resp = ureq::get(&format!("{store_url}/tasks/{scope}?state=open"))
+        .call()
+        .ok()?;
+    let tasks: Value = serde_json::from_reader(resp.into_reader()).ok()?;
+    let tasks = tasks.as_array()?;
+    if tasks.is_empty() {
+        return None;
+    }
+    let mut block = String::from("Open tasks in this memory (id - name - next action):");
+    for task in tasks {
+        let id = task.get("node_id").and_then(Value::as_u64).unwrap_or_default();
+        let name = task.get("name").and_then(Value::as_str).unwrap_or_default();
+        let next = task.get("next").and_then(Value::as_str).unwrap_or_default();
+        block.push_str(&format!("\n- {id} - {name}"));
+        if !next.is_empty() {
+            block.push_str(&format!(" - {next}"));
+        }
+    }
+    block.push_str(
+        "\nMove or close them with `move_task`; add work with `open_task`.",
+    );
+    Some(block)
 }

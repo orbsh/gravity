@@ -203,6 +203,88 @@ static SPECS: &[ToolSpec] = &[
         },
         nature: Nature::Human,
     },
+    ToolSpec {
+        name: "open_task",
+        description: "Open a task: work somebody has taken on and has not finished. A task is a \
+                      VERTEX in the same graph as memory, not a separate list — so a dependency, a \
+                      parent, a tag or a reference is an ordinary fact (`commit_memory` with type \
+                      `task` and the task's name as the value), and a fact about a task is an \
+                      ordinary fact. Opening a name that already exists restates it; the answer says \
+                      whether this call created the task. Use it for work that outlives this turn.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Stable identifier, snake_case or kebab-case. It IS the \
+                                       identity: facts reach the task by this name, and opening it \
+                                       twice opens it once."
+                    },
+                    "next": {
+                        "type": "string",
+                        "description": "The next action, in your own words. Optional; it is what \
+                                       the next turn starts from."
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["open", "doing", "blocked", "done"],
+                        "description": "Defaults to `open`."
+                    }
+                },
+                "required": ["name"]
+            })
+        },
+        nature: Nature::Human,
+    },
+    ToolSpec {
+        name: "move_task",
+        description: "Move a task: a new state, a new next action, or both. Absent fields are \
+                      LEFT ALONE, so send only what changed — an empty string clears the next \
+                      action, silence never does. A state outside the four is refused rather than \
+                      stored, because a task in a state no listing looks for is a task nobody finds.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "integer",
+                        "description": "The `node_id` a task was opened with or listed with."
+                    },
+                    "state": {
+                        "type": "string",
+                        "enum": ["open", "doing", "blocked", "done"]
+                    },
+                    "next": {
+                        "type": "string",
+                        "description": "The next action; `\"\"` clears it."
+                    }
+                },
+                "required": ["task_id"]
+            })
+        },
+        nature: Nature::Human,
+    },
+    ToolSpec {
+        name: "list_tasks",
+        description: "The tasks of this memory scope, oldest id first. This is where a turn \
+                      starts: what is open is what the work is. `state` narrows the answer to one \
+                      state; without it, every task the scope holds comes back.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "state": {
+                        "type": "string",
+                        "enum": ["open", "doing", "blocked", "done"],
+                        "description": "Only tasks in this state."
+                    }
+                },
+                "required": []
+            })
+        },
+        nature: Nature::Human,
+    },
 ];
 
 /// The entries, in the order the model sees them.
@@ -330,6 +412,50 @@ pub fn call(
                 body["limit"] = limit.clone();
             }
             doors.post(&format!("{store_url}/skills/{scope}/resolve"), &body)
+        }
+        "open_task" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("open_task: `name` is required")?;
+            let scope = facts.scope("open_task")?;
+            let mut body = json!({ "name": name });
+            if let Some(next) = args.get("next") {
+                body["next"] = next.clone();
+            }
+            if let Some(state) = args.get("state") {
+                body["state"] = state.clone();
+            }
+            doors.post(&format!("{store_url}/tasks/{scope}"), &body)
+        }
+        "move_task" => {
+            let task_id = args
+                .get("task_id")
+                .and_then(Value::as_u64)
+                .ok_or("move_task: `task_id` is required")?;
+            let mut body = json!({});
+            if let Some(state) = args.get("state") {
+                body["state"] = state.clone();
+            }
+            if let Some(next) = args.get("next") {
+                body["next"] = next.clone();
+            }
+            if body.as_object().is_some_and(|map| map.is_empty()) {
+                return Err("move_task: send `state`, `next`, or both".into());
+            }
+            let scope = facts.scope("move_task")?;
+            doors.post(
+                &format!("{store_url}/tasks/{scope}/{task_id}/move"),
+                &body,
+            )
+        }
+        "list_tasks" => {
+            let scope = facts.scope("list_tasks")?;
+            let url = match args.get("state").and_then(Value::as_str) {
+                Some(state) => format!("{store_url}/tasks/{scope}?state={state}"),
+                None => format!("{store_url}/tasks/{scope}"),
+            };
+            doors.get(&url)
         }
         "create_skill" => create_skill(doors, args, facts, store_url),
         "invoke_skill" => invoke(doors, args, facts, store_url, walked),
@@ -757,7 +883,10 @@ mod tests {
                 "commit_memory",
                 "resolve_skills",
                 "invoke_skill",
-                "create_skill"
+                "create_skill",
+                "open_task",
+                "move_task",
+                "list_tasks"
             ]
         );
     }
@@ -1272,4 +1401,95 @@ mod tests {
              was already recorded when it appeared"
         );
     }
+
+    // ---- tasks (k10r ADR-0021) ------------------------------------------
+
+    #[test]
+    fn open_task_posts_the_name_and_only_what_was_stated() {
+        let mut doors = Recorder::default();
+        call(
+            &mut doors,
+            "open_task",
+            &json!({ "name": "ship-the-face-change" }),
+            &facts(&[], "channel-7"),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(doors.posts.len(), 1);
+        assert_eq!(doors.posts[0].0, "http://mem.test/tasks/37");
+        assert_eq!(doors.posts[0].1, json!({ "name": "ship-the-face-change" }));
+
+        // Stated parts ride along; absent ones are absent, not null.
+        let mut doors = Recorder::default();
+        call(
+            &mut doors,
+            "open_task",
+            &json!({ "name": "x", "state": "doing", "next": "read the diff" }),
+            &facts(&[], "channel-7"),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            doors.posts[0].1,
+            json!({ "name": "x", "state": "doing", "next": "read the diff" })
+        );
+    }
+
+    #[test]
+    fn move_task_sends_only_the_move() {
+        let mut doors = Recorder::default();
+        call(
+            &mut doors,
+            "move_task",
+            &json!({ "task_id": 9, "state": "blocked" }),
+            &facts(&[], "channel-7"),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(doors.posts[0].0, "http://mem.test/tasks/37/9/move");
+        assert_eq!(doors.posts[0].1, json!({ "state": "blocked" }));
+    }
+
+    #[test]
+    fn move_task_with_nothing_to_move_is_refused_before_the_door() {
+        let mut doors = Recorder::default();
+        let Err(error) = call(
+            &mut doors,
+            "move_task",
+            &json!({ "task_id": 9 }),
+            &facts(&[], "channel-7"),
+            &mut Vec::new(),
+        ) else {
+            panic!("a move that names nothing is a mistake, not a no-op");
+        };
+        assert!(error.contains("send `state`, `next`, or both"), "{error}");
+        assert!(doors.posts.is_empty(), "nothing was sent");
+    }
+
+    #[test]
+    fn list_tasks_asks_for_the_state_it_was_given() {
+        let mut doors = Recorder::default().answering("/tasks/37?state=open", json!([]));
+        call(
+            &mut doors,
+            "list_tasks",
+            &json!({ "state": "open" }),
+            &facts(&[], "channel-7"),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(doors.gets, vec!["http://mem.test/tasks/37?state=open"]);
+
+        // No state: every task the scope holds.
+        let mut doors = Recorder::default().answering("/tasks/37", json!([]));
+        call(
+            &mut doors,
+            "list_tasks",
+            &json!({}),
+            &facts(&[], "channel-7"),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(doors.gets, vec!["http://mem.test/tasks/37"]);
+    }
+
 }
