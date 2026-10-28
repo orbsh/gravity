@@ -209,8 +209,9 @@ static SPECS: &[ToolSpec] = &[
                       VERTEX in the same graph as memory, not a separate list — so a dependency, a \
                       parent, a tag or a reference is an ordinary fact (`commit_memory` with type \
                       `task` and the task's name as the value), and a fact about a task is an \
-                      ordinary fact. Opening a name that already exists restates it; the answer says \
-                      whether this call created the task. Use it for work that outlives this turn.",
+                      ordinary fact. Opening a name that already exists only RESTATES it — its state, \
+                      next action and clock are untouched, so calling this twice is \
+                      safe — and the answer says whether this call created it. Use it for work that outlives this turn.",
         parameters: || {
             json!({
                 "type": "object",
