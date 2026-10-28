@@ -1,6 +1,6 @@
 # Gravity
 
-Turn executor of the stateless agent architecture. Design: [stateless-agent-architecture.md](../../.hermes/wiki/stateless-agent-architecture.md) (wiki), Krystallizer (memory), Probe (skill runtime).
+Turn executor of the stateless agent architecture. Design: [stateless-agent-architecture.md](https://github.com/orbsh/wiki/blob/main/stateless-agent-architecture.md) (wiki), Krystallizer (memory), Effector (skill runtime).
 
 Pure Rust. The booth face runs as induction guest processes (stdio pipe protocol, `~/world/induction`): the turn streams as envelope frames on stdout and closes with `done: true` — single-call and stream share the one envelope shape.
 
