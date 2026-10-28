@@ -9,8 +9,12 @@
 //! Submodules:
 //! - [`sse`] — the SSE wire decoder (the one home for the framing and
 //!   chunk shape; the provider guest and any streaming consumer ride it).
+//! - [`tool_stream`] — assembling a streamed tool call from its fragments
+//!   (a real endpoint splits the argument document across deltas; a stub
+//!   never does, so this is the half a test cannot teach you).
 
 pub mod sse;
+pub mod tool_stream;
 
 use anyhow::Context;
 

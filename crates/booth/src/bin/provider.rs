@@ -68,6 +68,14 @@ struct Stream {
     /// module.
     sse: SseDecoder,
     reader: Box<dyn std::io::Read + Send>,
+    /// Tool-call fragments gathered since the last non-call event. A real
+    /// endpoint sends the call in pieces (id and name first, then slices of the
+    /// argument document), so the envelope may only be emitted once the stream
+    /// stops talking about calls.
+    calls: gravity_core::llm::tool_stream::ToolCallAccumulator,
+    /// At most one envelope waiting for its turn: a provider that ends a call
+    /// stream AND sends content in the same round must not lose either.
+    queued: Option<Value>,
 }
 
 impl Stream {
@@ -91,18 +99,42 @@ impl Stream {
 /// The caller owns the stream (taken from the slot); a non-terminal
 /// reply means the caller puts it back (the connection persists).
 fn next_envelope(stream: &mut Stream) -> anyhow::Result<Value> {
+    if let Some(queued) = stream.queued.take() {
+        return Ok(queued);
+    }
     loop {
         if let Some(ev) = stream.sse.decode()? {
-            return Ok(match ev {
-                SseEvent::Delta(delta) => json!({ "done": false, "item": { "delta": delta } }),
-                // Tool calls ride the envelope verbatim — the TURN
-                // parses and dispatches them (the provider is transport,
-                // not policy).
-                SseEvent::ToolCalls(calls) => {
-                    json!({ "done": false, "item": { "tool_calls": calls } })
+            match ev {
+                // Fragments accumulate; the envelope is emitted only once the
+                // stream stops talking about calls (a delta, or the end). This
+                // is where a real endpoint differs from every stub: it splits
+                // the argument document, and dispatching the first piece
+                // dispatches an empty call.
+                SseEvent::ToolCalls(fragments) => {
+                    if let Some(fragments) = fragments.as_array() {
+                        stream.calls.push(fragments);
+                    }
+                    continue;
                 }
-                SseEvent::Done => json!({ "done": true }),
-            });
+                SseEvent::Delta(delta) => {
+                    let envelope = json!({ "done": false, "item": { "delta": delta } });
+                    if let Some(calls) = stream.calls.take() {
+                        stream.queued = Some(envelope);
+                        return Ok(json!({ "done": false, "item": { "tool_calls": calls } }));
+                    }
+                    return Ok(envelope);
+                }
+                SseEvent::Done => {
+                    // The calls are complete even when the provider sends no
+                    // trailing content — and they must arrive BEFORE the done,
+                    // or the turn ends without ever dispatching them.
+                    if let Some(calls) = stream.calls.take() {
+                        stream.queued = Some(json!({ "done": true }));
+                        return Ok(json!({ "done": false, "item": { "tool_calls": calls } }));
+                    }
+                    return Ok(json!({ "done": true }));
+                }
+            }
         }
         stream.fill()?;
     }
@@ -159,6 +191,8 @@ fn open_stream(args: &Value) -> anyhow::Result<Stream> {
                 return Ok(Stream {
                     sse: SseDecoder::new(),
                     reader: resp.into_reader(),
+                    calls: gravity_core::llm::tool_stream::ToolCallAccumulator::new(),
+                    queued: None,
                 });
             }
             Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) => {
