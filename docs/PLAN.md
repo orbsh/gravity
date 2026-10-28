@@ -77,12 +77,18 @@ critical path).
   proposal row, count 1, and the resolver unchanged), not by a unit test alone.
   TASK TOOLS LANDED 2026-10-27 (gravity ADR-0004 amended; k10r ADR-0021): the
   fixed list grew from five to eight — `open_task`, `move_task`, `list_tasks` — and
-  a turn now OPENS by listing what is open (`open_tasks()` in `bin/turn.rs`, one
-  system block, best effort: a store that cannot answer does not fail the turn).
+  a turn now OPENS by listing every task it still OWES — any state but `done`
+  (`open_tasks()` fetches, `booth::tasks::render_owed` renders, best effort: a store
+  that cannot answer does not fail the turn). Filtering the fetch by `state=open` was
+  the first version and it hid the work in progress: a task moved to `doing` fell out
+  of the next turn's view. Prism's `tests/turn_tasks.rs` drives three turns through
+  the real stack to hold that line — opened in turn 1, in the prompt in turn 2, still
+  there after the move to `doing`.
   The division the tools encode: a task is an ordinary vertex of the fact graph, so
   dependencies, parents, tags and references are `commit_memory` facts — there is no
   dependency tool, because one graph does not need a second edge vocabulary.
-  Gates: booth 21/0 lib + 6 + 10, workspace green, clippy clean.
+  Gates: booth 25/0 lib (4 of them the task block's renderer) + 6 + 10, workspace
+  green, clippy clean.
   COMPOSITION RULED 2026-10-26 (ADR-0005): a multi-step skill's body is CODE in an
   existing language (steel or python), never an invented DSL and never a JSON step
   graph — an invented step language ends as a poor lisp dialect with a hand-written
