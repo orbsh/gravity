@@ -54,6 +54,101 @@ fn main() -> anyhow::Result<()> {
 /// process state — the process IS the turn).
 static PROVIDER_STREAM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Where the frames go when the caller asked for the view protocol. THE CALLER DECLARES
+/// THEM (gravity does not own a layout, so it cannot know a slot's name): `slots.rack` is
+/// the list the turn appends to, `slots.text` the region the answer streams into.
+struct View {
+    rack: String,
+    text: String,
+}
+
+/// `protocol` absent or `data` = raw deltas (the CLI and every non-UI consumer). `fluxen` =
+/// Accrete frames: the venue forwards them to a renderer that only knows how to draw.
+fn view_of(args: &Value) -> Option<View> {
+    if args.get("protocol").and_then(Value::as_str) != Some("fluxen") {
+        return None;
+    }
+    let slots = args.get("slots")?;
+    Some(View {
+        rack: slots.get("rack").and_then(Value::as_str)?.to_string(),
+        text: slots.get("text").and_then(Value::as_str)?.to_string(),
+    })
+}
+
+/// The text region the answer streams into: an empty text node bound to a default value.
+fn frame_text_region(text: &str) -> Value {
+    json!({
+        "action": "set",
+        "event": text,
+        "data": {"type": "text", "bind": {"value": {"kind": "default", "default": ""}}},
+    })
+}
+
+/// One bubble in the rack whose text child reads the streaming region — so a patch of the
+/// region re-renders the paragraph, not the box (fluxen's walkthrough rule).
+fn frame_answer_bubble(rack: &str, text: &str) -> Value {
+    json!({
+        "action": "append",
+        "event": rack,
+        "data": {
+            "type": "case",
+            "attrs": {"class": ["nogrow", "as-stretch", "box", "border", "round", "shadow"]},
+            "children": [{
+                "type": "text",
+                "bind": {"value": {"kind": "source", "source": text}},
+            }],
+        },
+    })
+}
+
+/// The user's own line, so the rack shows the question above the answer.
+fn frame_ask_bubble(rack: &str, ask: &str) -> Value {
+    json!({
+        "action": "append",
+        "event": rack,
+        "data": {
+            "type": "case",
+            "attrs": {
+                "class": ["nogrow", "as-end", "accent", "box", "border", "round", "shadow"],
+                "selector": "ask",
+            },
+            "children": [{
+                "type": "text",
+                "bind": {"value": {"kind": "default", "default": ask}},
+            }],
+        },
+    })
+}
+
+/// One streamed chunk into the region (fluxen's frame vocabulary: patch, append, value).
+fn frame_chunk(text: &str, chunk: &str) -> Value {
+    json!({
+        "action": "patch",
+        "event": text,
+        "path": "/bind/value/default",
+        "op": "append",
+        "value": chunk,
+    })
+}
+
+/// The envelope's item: frames when the caller asked for them, else the raw delta. The
+/// first round also sets the stage (question, region, bubble) — one batch, in order.
+fn item_for(args: &Value, first: Option<&str>, delta: &str) -> Value {
+    match view_of(args) {
+        Some(v) => {
+            let mut frames: Vec<Value> = Vec::new();
+            if let Some(ask) = first {
+                frames.push(frame_ask_bubble(&v.rack, ask));
+                frames.push(frame_text_region(&v.text));
+                frames.push(frame_answer_bubble(&v.rack, &v.text));
+            }
+            frames.push(frame_chunk(&v.text, delta));
+            json!({ "frames": frames })
+        }
+        None => json!({ "delta": delta }),
+    }
+}
+
 fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
     let round = args.get("round").and_then(Value::as_u64).unwrap_or(0);
     if round == 0 {
@@ -93,7 +188,12 @@ fn turn_round(ctx: &mut Ctx, args: Value) -> anyhow::Result<Value> {
         .unwrap_or_default()
         .to_string();
     REPLY_PARTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(delta.clone());
-    Ok(json!({ "done": false, "item": { "delta": delta } }))
+    let turn_args = TURN_ARGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or(Value::Null);
+    Ok(json!({ "done": false, "item": item_for(&turn_args, None, &delta) }))
 }
 
 /// The Start handler (`turn`): fetch the projection, assemble the
@@ -110,7 +210,8 @@ fn start_envelope(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
     let (first_delta, _sid) = start_turn(ctx, args)?;
-    Ok(json!({ "done": false, "item": { "delta": first_delta } }))
+    let ask = args.get("user_message").and_then(Value::as_str).map(String::from);
+    Ok(json!({ "done": false, "item": item_for(args, ask.as_deref(), &first_delta) }))
 }
 
 /// Round 0: fetch the projection, assemble the prompt, open the
