@@ -85,6 +85,17 @@ critical path).
     trace), and so is a cancel EVENT (the busy instance's own queue delivers it after the turn).
     Owed: where the marker lives so a BUSY turn can read it and an idle component can write it
     — a field-store row (write needs a path into that ns) or `ctx.queue_depth` read as a level.
+  - TWO RENDERINGS ARE RULED (2026-10-30, ADR-0009): `protocol` selects frames (`fluxen`, Accrete
+    operations against the slots the caller declared) or raw deltas (the caller names its event);
+    the names are the caller's in both modes, the two shapes are NOT isomorphic (view carries the
+    drawing of the answer, raw carries its text), and both consumers — a web surface and the CLI —
+    are clients of the venue rather than two implementations. This shape landed WITH the turn
+    rewrite, so the record is the one artifact of it.
+  - THE CONNECTION LIFECYCLE IS PRISM'S EVENT STREAM (2026-10-30, prism `docs/MODELING.md`):
+    `view:connect` / `view:login` / `view:logout` / `view:disconnect`, named as the FACTS they are.
+    gravity declares none of them and answers none: a turn is opened by a page's own event
+    (`view:turn.submit`), and an application that wants to re-render on login subscribes with a
+    booth of its own rather than inheriting a lifecycle hook here.
   - TWO WIRE DRIFTS prism OWES under its own ADRs, to land with the turn deletion: (a) the
     uplink payload is `{…, data}`, not `{…, args}` (ADR-0017 §Update 2026-10-29) — gravity now
     reads `data`, so prism must SEND `data`; (b) `channel_id` leaves the wire and the address is
