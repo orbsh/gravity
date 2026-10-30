@@ -1,23 +1,42 @@
-//! The booth binding contract (PLAN Phase 4, re-landed on induction):
-//! the turn execution as a Rust guest process, the provider as a
-//! sibling guest — one realm, the turn producer pulling the provider's
-//! stream through the ctx iterate arms and re-emitting each delta as
-//! its own envelope item. The LLM wire is stubbed by a local SSE
-//! server, the memory seam rides a real mem-server. What is pinned:
+//! The booth binding contract (PLAN Phase 4): the turn execution as a Rust guest process,
+//! the provider as a sibling guest, one realm, and the venue's own wire as the output.
 //!
-//! - the STREAMING round trip: each token arrives as an envelope item
-//!   while the stream is live (not one buffered answer), the deltas
-//!   assemble the reply, and the memory seam sees the one-ts-two-subs
-//!   exchange after the stream ends;
-//! - a failed provider pull appends nothing (the turn function's
-//!   oldest rule, through the booth form).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unwrap_in_result, clippy::panic_in_result_fn)]
+//! The shape under test is the one prism serves: the venue emits `view:turn.submit` with an
+//! envelope (`{name, channel_id, sender, args}`), the turn runs to its end inside one
+//! handler call, and every chunk it draws is its OWN emit — nothing pulls, so a pull face
+//! that stopped existing cannot break the turn. The LLM wire is stubbed by a local SSE
+//! server, the memory seam rides a real mem-server, and a compiled collector booth
+//! subscribed to the `view:` prefix is the renderer's stand-in.
+//!
+//! What is pinned:
+//!
+//! - the STREAMING round trip: each token arrives as its own emit while the stream is live
+//!   (not one buffered answer), the chunks assemble the reply, and the memory seam sees the
+//!   one-ts-two-subs exchange after the stream ends;
+//! - the ENVELOPE the venue reads: `name` names the event, `channel_id` the address, and
+//!   the frames hang off `data` (a delivery, not a request);
+//! - a failed provider appends nothing (the turn function's oldest rule, through the booth
+//!   form) and the failure crosses as a value.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_in_result,
+    clippy::panic_in_result_fn
+)]
 
-use aura_booth::{call::CallSlot, InstanceId, InstanceKey, IterateOp};
+use std::sync::Arc;
+use std::time::Duration;
+
+use aura_booth::{
+    call::CallSlot, Body, BoothType, InstanceId, InstanceKey, IterateOp, ReceiveDecl,
+    RouteResolution,
+};
 use aura_engine::Engine;
 use aura_realm::Realm;
 use gravity_booth::TURN_TYPE;
 use gravity_core::surface::MemorySurface;
+use serde_json::{json, Value};
 
 /// The two guest binaries — cargo builds this package's own bins for
 /// its integration tests and exports `CARGO_BIN_EXE_<name>`, so the
@@ -30,8 +49,44 @@ fn turn_bin() -> String {
     env!("CARGO_BIN_EXE_gravity-turn").to_string()
 }
 
+/// What the collector booth saw: the `data` payload of every `view:` emit, in arrival
+/// order. The renderer's stand-in — a compiled body, because a script would need the frame
+/// vocabulary to say what it observed.
+#[derive(Clone, Default)]
+struct Seen(Arc<std::sync::Mutex<Vec<Value>>>);
+
+impl Seen {
+    fn push(&self, value: Value) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(value);
+    }
+
+    fn events(&self) -> Vec<Value> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn len(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    fn all(&self, event: &str) -> Vec<Value> {
+        self.events()
+            .into_iter()
+            .filter(|e| e.get("name").and_then(Value::as_str) == Some(event))
+            .collect()
+    }
+}
+
 /// A minimal OpenAI-compatible SSE endpoint: answers one streamed
-/// reply assembled from `CHUNKS`, then `[DONE]`.
+/// reply assembled from `body_chunks`, then `[DONE]`.
 async fn sse_server(body_chunks: Vec<&'static str>) -> String {
     let app = axum::Router::new().route(
         "/chat/completions",
@@ -40,9 +95,7 @@ async fn sse_server(body_chunks: Vec<&'static str>) -> String {
             async move {
                 let mut sse = String::new();
                 for c in chunks {
-                    let payload = serde_json::json!({
-                        "choices": [{"delta": {"content": c}}]
-                    });
+                    let payload = json!({ "choices": [{"delta": {"content": c}}] });
                     sse.push_str(&format!("data: {payload}\n\n"));
                 }
                 sse.push_str("data: [DONE]\n\n");
@@ -64,15 +117,15 @@ async fn sse_server(body_chunks: Vec<&'static str>) -> String {
 fn sse_body(chunks: &[&'static str]) -> String {
     let mut sse = String::new();
     for c in chunks {
-        let payload = serde_json::json!({ "choices": [{ "delta": { "content": c } }] });
+        let payload = json!({ "choices": [{ "delta": { "content": c } }] });
         sse.push_str(&format!("data: {payload}\n\n"));
     }
     sse.push_str("data: [DONE]\n\n");
     sse
 }
 
-/// An SSE stub that answers the answer and the compression branch
-/// DIFFERENTLY, keyed on the request itself: k10r's tail prompt is the last
+/// An SSE stub that answers the answer, the compression branch and the review
+/// branch DIFFERENTLY, keyed on the request itself: k10r's tail prompt is the last
 /// message of the side branch (the turn appends it in place of the user's
 /// message), so a request that ends with it asks for the summary and every
 /// other request asks for the reply.
@@ -88,7 +141,7 @@ async fn sse_server_three_branches(
             let summary = summary.clone();
             let review = review.clone();
             async move {
-                let asked = serde_json::from_slice::<serde_json::Value>(&body)
+                let asked = serde_json::from_slice::<Value>(&body)
                     .ok()
                     .and_then(|v| {
                         v.get("messages")
@@ -122,7 +175,10 @@ async fn sse_server_three_branches(
     format!("http://{addr}")
 }
 
-async fn boot() -> Engine {
+/// Boot the realm: both guests, the turn registered with the venue's subscription route
+/// (what `gravity_booth::register` does in a deployment), and a collector standing in for
+/// the renderer.
+async fn boot() -> (Engine, Seen) {
     // The provider guest reads the LLM key from the env var its args NAME
     // (`key_env`), and that var rides the PROCESS environment the guest
     // child inherits. The fixture owns the requirement — without it the
@@ -134,7 +190,7 @@ async fn boot() -> Engine {
         .await
         .expect("engine boot");
     engine
-        .register(aura_booth::BoothType::script(
+        .register(BoothType::script(
             "llm_provider",
             "induction",
             // The spawn spec is argv; the fixture bin path is absolute
@@ -144,14 +200,51 @@ async fn boot() -> Engine {
         .await
         .unwrap();
     engine
-        .register(aura_booth::BoothType::script(
-            "gravity_turn",
-            "induction",
-            turn_bin(),
-        ))
+        .register(
+            BoothType::script(TURN_TYPE, "induction", turn_bin())
+                // The venue's own word for "run a turn", exactly as `register` declares it:
+                // the entry is `turn`, the address field is the envelope's `channel_id`.
+                .on_as("view:turn.submit", "device", "turn"),
+        )
         .await
         .unwrap();
+    let seen = Seen::default();
+    let collector = seen.clone();
     engine
+        .register(BoothType {
+            name: "collector".into(),
+            body: Body::Rust(Arc::new(move |_ctx, args| {
+                let collector = collector.clone();
+                Box::pin(async move {
+                    collector.push(args);
+                    Ok(Value::Null)
+                })
+            })),
+            idle_ttl: None,
+            max_exec: None,
+            hooks: std::collections::BTreeMap::new(),
+            // TWO ROUTES: the prefix every UI-facing emit uses (the renderer's declaration,
+            // prism's `install`) and the data event this fixture's callers name — a booth
+            // sees exactly what it declared, and the data protocol is a DIFFERENT event, not
+            // a `view:` one.
+            receives: vec![
+                ReceiveDecl {
+                    event: "view:*".into(),
+                    entry: None,
+                    resolution: RouteResolution::Singleton,
+                    wildcard: true,
+                },
+                ReceiveDecl {
+                    event: "turn.delta".into(),
+                    entry: None,
+                    resolution: RouteResolution::Singleton,
+                    wildcard: false,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    (engine, seen)
 }
 
 async fn mem_server() -> String {
@@ -191,8 +284,10 @@ async fn mem_server_with_compression() -> String {
     format!("http://{addr}")
 }
 
-fn turn_args(store_url: &str, endpoint: &str, msg: &str) -> serde_json::Value {
-    serde_json::json!({
+/// The caller's payload. `event` is the data protocol's name for its chunks — gravity owns
+/// no event names, so a consumer that wants `{"delta": …}` says what to call it.
+fn turn_args(store_url: &str, endpoint: &str, msg: &str) -> Value {
+    json!({
         "channel_id": 7,
         "member_id": 1,
         "user_message": msg,
@@ -203,12 +298,24 @@ fn turn_args(store_url: &str, endpoint: &str, msg: &str) -> serde_json::Value {
         // The k10r namespace the memory tools reach (ADR-0004 §5): k10r's
         // FACT_NS, the only scope a fact tuple can land in.
         "memory_scope": 37,
+        "event": "turn.delta",
     })
 }
 
-/// The gateway's shape (prism turn.submit does exactly this): Start,
-/// then Next pulls in a loop, collecting `item.delta` per envelope.
-async fn drain_turn(engine: &Engine, store_url: &str, endpoint: &str, msg: &str) -> Vec<String> {
+/// The same payload asking for FRAMES: the drawing caller names its slots (gravity does not
+/// own a layout, so it cannot know them).
+fn view_args(store_url: &str, endpoint: &str, msg: &str) -> Value {
+    let mut args = turn_args(store_url, endpoint, msg);
+    args["protocol"] = json!("fluxen");
+    args["slots"] = json!({ "rack": "chat", "text": "say" });
+    args
+}
+
+/// Drive the handler directly (the sibling-booth / test shape: flat args, no envelope) and
+/// await the turn's terminal. Returns the failure text when the turn failed — a guest
+/// handler's error crosses the seam as a STRING value, so reading `done` alone would turn
+/// "the provider never started" into "the model said nothing".
+async fn start_turn(engine: &Engine, args: Value) -> Result<(), String> {
     let slot = Realm::iterate(
         &engine.realm,
         IterateOp::Start {
@@ -217,82 +324,95 @@ async fn drain_turn(engine: &Engine, store_url: &str, endpoint: &str, msg: &str)
                 key: InstanceKey::Named("s1".into()),
             },
             handler: "turn".into(),
-            args: turn_args(store_url, endpoint, msg),
+            args,
         },
     )
     .await
     .unwrap();
-    let (mut rx, mut stream_id) = match slot {
-        CallSlot::Hot { rx, .. } => (rx, None),
+    let rx = match slot {
+        CallSlot::Hot { rx, .. } => rx,
         _ => panic!("iterate is hot-only"),
     };
-    let mut deltas = Vec::new();
-    loop {
-        let v = match tokio::time::timeout(std::time::Duration::from_secs(20), rx).await {
-            Ok(Ok(Ok(v))) => v,
-            Ok(Ok(Err(e))) => panic!("pull failed: {e}"),
-            Ok(Err(_)) => panic!("reply dropped"),
-            Err(_) => panic!("pull {stream_id:?} stalled for 20s"),
-        };
-        if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-            // A failed guest answers a STRING value (the carrier wraps a
-            // bare error reply as `{done:true, value:"…"}`), while a
-            // finished turn answers `{value:{reply}}`. Reading `done`
-            // alone turns "the provider never started" into "the model
-            // said nothing" — the exact failure this fixture is here to
-            // catch, so it fails loudly instead.
-            if let Some(err) = v.get("value").and_then(|value| value.as_str()) {
-                panic!("turn failed: {err}");
+    let v = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        Ok(Ok(Ok(v))) => v,
+        Ok(Ok(Err(e))) => return Err(e.to_string()),
+        Ok(Err(_)) => panic!("reply dropped"),
+        Err(_) => panic!("the turn stalled for 30s"),
+    };
+    assert_eq!(
+        v.get("done").and_then(Value::as_bool),
+        Some(true),
+        "a handler that opens no stream answers the terminal shape: {v}"
+    );
+    match v.get("value").and_then(Value::as_str) {
+        Some(error) => Err(error.to_string()),
+        None => Ok(()),
+    }
+}
+
+/// Emitted events are queued on the realm MQ and drained by the consumer's own instance, so
+/// "the guest has written them" and "the collector has read them" are two moments. The pipe
+/// order is fixed (every emit precedes the handler's reply on the same channel), so a quiet
+/// window after the terminal is enough — and it is the only wait this fixture has.
+async fn settle(seen: &Seen) {
+    let mut last = seen.len();
+    let mut quiet = 0;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let now = seen.len();
+        if now == last {
+            quiet += 1;
+            if quiet >= 10 {
+                return;
             }
-            return deltas;
-        }
-        if stream_id.is_none() {
-            stream_id = Some(
-                v.get("stream_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap()
-                    .to_string(),
-            );
-        }
-        if let Some(d) = v
-            .get("item")
-            .and_then(|i| i.get("delta"))
-            .and_then(|d| d.as_str())
-        {
-            deltas.push(d.to_string());
-        }
-        let id = stream_id.clone().unwrap();
-        match Realm::iterate(&engine.realm, IterateOp::Next { stream_id: id })
-            .await
-            .unwrap()
-        {
-            CallSlot::Hot { rx: next, .. } => rx = next,
-            _ => panic!("iterate is hot-only"),
+        } else {
+            last = now;
+            quiet = 0;
         }
     }
 }
 
+/// One turn through the direct route, returning the deltas the caller's event saw.
+async fn run_turn(engine: &Engine, seen: &Seen, args: Value) -> Result<Vec<String>, String> {
+    let before = seen.len();
+    let outcome = start_turn(engine, args).await;
+    settle(seen).await;
+    // An emit's payload is the ENVELOPE the venue reads: `{name, data}` — the chunk is the
+    // envelope's `data`, which is what a consumer destructures.
+    let deltas = seen.events()[before..]
+        .iter()
+        .filter_map(|e| e.get("data").and_then(|d| d.get("delta")))
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    outcome.map(|()| deltas)
+}
+
 #[tokio::test]
-async fn turn_booth_streams_deltas() {
+async fn the_turn_streams_its_chunks_as_events() {
     let endpoint = sse_server(vec!["hel", "lo ", "wor", "ld"]).await;
     let store_url = mem_server().await;
-    let engine = boot().await;
+    let (engine, seen) = boot().await;
 
-    let deltas = drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap();
     assert_eq!(
         deltas.join(""),
         "hello world",
-        "tokens stream one per envelope"
+        "tokens arrive as their own events, in order"
     );
 }
 
 #[tokio::test]
-async fn stream_appends_the_exchange_after_done() {
+async fn the_exchange_lands_after_the_stream_ends() {
     let endpoint = sse_server(vec!["hel", "lo"]).await;
     let store_url = mem_server().await;
-    let engine = boot().await;
+    let (engine, seen) = boot().await;
 
-    let deltas = drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap();
     assert_eq!(deltas.join(""), "hello");
 
     // The memory seam saw the exchange: user + assistant, one ts, subs
@@ -314,10 +434,9 @@ async fn stream_appends_the_exchange_after_done() {
 }
 
 #[tokio::test]
-async fn failed_provider_pull_appends_nothing() {
+async fn failed_provider_appends_nothing() {
     // A server that rejects the request — the provider's open fails,
-    // the turn's Start errors, the pull that observed it fails as a
-    // value, and nothing appends.
+    // the turn fails through as a value, and nothing appends.
     let app = axum::Router::new().route(
         "/chat/completions",
         axum::routing::post(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
@@ -327,39 +446,20 @@ async fn failed_provider_pull_appends_nothing() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let engine = boot().await;
+    let (engine, seen) = boot().await;
 
-    let slot = Realm::iterate(
-        &engine.realm,
-        IterateOp::Start {
-            target: InstanceId {
-                booth_type: TURN_TYPE.into(),
-                key: InstanceKey::Named("s1".into()),
-            },
-            handler: "turn".into(),
-            args: turn_args(&store_url, &endpoint, "hi"),
-        },
-    )
-    .await
-    .unwrap();
-    // The failure surfaces as a terminal envelope whose value carries the
-    // error (a guest handler that dies before opening a stream = the
-    // invoke shape, ADR-0036 §2 — the error never silently swallows).
-    let failed = match slot {
-        CallSlot::Hot { rx, .. } => match rx.await {
-            Ok(Err(_)) => true,
-            Ok(Ok(v)) => {
-                v.get("done").and_then(|d| d.as_bool()) == Some(true)
-                    && v.get("value")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.contains("provider stream failed to open"))
-                        .unwrap_or(false)
-            }
-            Err(_) => false,
-        },
-        _ => panic!("hot-only"),
-    };
-    assert!(failed, "the turn fails through (no silent swallow)");
+    let failure = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap_err();
+    assert!(
+        failure.contains("provider stream failed to open"),
+        "the failure names itself: {failure}"
+    );
+    assert!(
+        seen.events().is_empty(),
+        "a failed turn draws nothing: {:?}",
+        seen.events()
+    );
 
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
     let view = surface.fetch_session(7, 1).await.unwrap();
@@ -372,7 +472,7 @@ async fn failed_provider_pull_appends_nothing() {
 /// on the first attempt.
 #[tokio::test]
 async fn transient_endpoint_failures_are_retried() {
-    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hits_for_route = hits.clone();
     let app = axum::Router::new().route(
         "/chat/completions",
@@ -401,9 +501,11 @@ async fn transient_endpoint_failures_are_retried() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let engine = boot().await;
+    let (engine, seen) = boot().await;
 
-    let deltas = drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap();
     assert_eq!(deltas.join(""), "recovered", "the retry landed the stream");
     assert!(
         hits.load(std::sync::atomic::Ordering::SeqCst) >= 3,
@@ -413,7 +515,7 @@ async fn transient_endpoint_failures_are_retried() {
 
 #[tokio::test]
 async fn client_errors_fail_through_without_retry() {
-    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hits_for_route = hits.clone();
     let app = axum::Router::new().route(
         "/chat/completions",
@@ -433,34 +535,15 @@ async fn client_errors_fail_through_without_retry() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let engine = boot().await;
+    let (engine, seen) = boot().await;
 
-    let slot = Realm::iterate(
-        &engine.realm,
-        IterateOp::Start {
-            target: InstanceId {
-                booth_type: TURN_TYPE.into(),
-                key: InstanceKey::Named("s1".into()),
-            },
-            handler: "turn".into(),
-            args: turn_args(&store_url, &endpoint, "hi"),
-        },
-    )
-    .await
-    .unwrap();
-    let failed = match slot {
-        CallSlot::Hot { rx, .. } => match rx.await {
-            Ok(Err(_)) => true,
-            Ok(Ok(v)) => v
-                .get("value")
-                .and_then(|v| v.as_str())
-                .map(|s| s.contains("rejected the request (401)"))
-                .unwrap_or(false),
-            Err(_) => false,
-        },
-        _ => panic!("hot-only"),
-    };
-    assert!(failed, "the 401 fails through");
+    let failure = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap_err();
+    assert!(
+        failure.contains("rejected the request (401)"),
+        "the 401 fails through: {failure}"
+    );
     assert_eq!(
         hits.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -483,8 +566,8 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
     // endpoint does: the first asks for the tool, the SECOND (the re-open
     // carrying the fed-back result) answers content. The bodies are kept so
     // the test can assert what the model was OFFERED, not just what it got.
-    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let hits_for_route = hits.clone();
     let bodies_for_route = bodies.clone();
     let app = axum::Router::new().route(
@@ -521,66 +604,27 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let engine = boot().await;
+    let (engine, seen) = boot().await;
 
-    let slot = Realm::iterate(
-        &engine.realm,
-        IterateOp::Start {
-            target: InstanceId {
-                booth_type: TURN_TYPE.into(),
-                key: InstanceKey::Named("s1".into()),
-            },
-            handler: "turn".into(),
-            args: turn_args(&store_url, &endpoint, "hi"),
-        },
-    )
-    .await
-    .unwrap();
-    let (mut rx, mut stream_id) = match slot {
-        CallSlot::Hot { rx, .. } => (rx, None),
-        _ => panic!("iterate is hot-only"),
-    };
-    let mut reply = String::new();
-    loop {
-        let v = match rx.await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => panic!("pull failed: {e}"),
-            Err(_) => panic!("reply dropped"),
-        };
-        if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-            break;
-        }
-        if stream_id.is_none() {
-            stream_id = Some(
-                v.get("stream_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap()
-                    .to_string(),
-            );
-        }
-        if let Some(delta) = v.get("item").and_then(|i| i.get("delta")).and_then(|d| d.as_str()) {
-            reply.push_str(delta);
-        }
-        let id = stream_id.clone().unwrap();
-        match Realm::iterate(&engine.realm, IterateOp::Next { stream_id: id })
-            .await
-            .unwrap()
-        {
-            CallSlot::Hot { rx: next, .. } => rx = next,
-            _ => panic!("iterate is hot-only"),
-        }
-    }
-    // The stream carries the ANSWER and nothing else (prism's face takes
-    // `item.delta`; a tool_result item would kill the turn at the pump).
-    assert_eq!(reply, "all good", "the answer streamed after the tool round");
+    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap();
+    // The wire carries the ANSWER and nothing else (a tool result is the model's).
+    assert_eq!(
+        deltas.join(""),
+        "all good",
+        "the answer streamed after the tool round"
+    );
 
     // The list rode BOTH rounds: the first request offered it, and the
     // re-open (the next inference round) carried the same affordances.
     let bodies = bodies.lock().unwrap().clone();
     assert_eq!(bodies.len(), 2, "two inference rounds");
     for body in &bodies {
-        let request: serde_json::Value = serde_json::from_str(body).expect("a JSON request");
-        let tools = request["tools"].as_array().expect("the tools array is sent");
+        let request: Value = serde_json::from_str(body).expect("a JSON request");
+        let tools = request["tools"]
+            .as_array()
+            .expect("the tools array is sent");
         let names: Vec<&str> = tools
             .iter()
             .map(|tool| tool["function"]["name"].as_str().unwrap_or_default())
@@ -603,7 +647,7 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
     // The tool's answer rode back INTO the loop: the re-open carries the
     // assistant's call and the tool message (OpenAI's wire shape), which is
     // the only place a tool result belongs.
-    let second: serde_json::Value = serde_json::from_str(&bodies[1]).expect("a JSON request");
+    let second: Value = serde_json::from_str(&bodies[1]).expect("a JSON request");
     let tool_message = second["messages"]
         .as_array()
         .expect("messages")
@@ -612,20 +656,20 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
         .expect("the tool result is fed back to the model");
     assert_eq!(tool_message["tool_call_id"], "c1");
     assert!(
-        tool_message["content"].as_str().unwrap_or("").contains("outcome"),
+        tool_message["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("outcome"),
         "the ingest's answer reached the model: {tool_message}"
     );
 
     // And the write LANDED: the graph door shows the entity the tuple named.
-    // The read runs on a BLOCKING thread: mem-server lives in this process, so
-    // a blocking client call on the test's single-threaded runtime would starve
-    // the very server it is asking (the fixture deadlock, not the product's).
     let graph_url = format!("{store_url}/graph/37");
     let graph = tokio::task::spawn_blocking(move || {
         ureq::get(&graph_url)
             .call()
             .unwrap()
-            .into_json::<serde_json::Value>()
+            .into_json::<Value>()
             .unwrap()
     })
     .await
@@ -650,8 +694,8 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
 /// whole call per delta never exercises either half.
 #[tokio::test]
 async fn two_calls_in_one_round_reach_the_model_as_one_round() {
-    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let hits_for_route = hits.clone();
     let bodies_for_route = bodies.clone();
     let app = axum::Router::new().route(
@@ -694,68 +738,40 @@ async fn two_calls_in_one_round_reach_the_model_as_one_round() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let engine = boot().await;
+    let (engine, seen) = boot().await;
 
-    let slot = Realm::iterate(
-        &engine.realm,
-        IterateOp::Start {
-            target: InstanceId {
-                booth_type: TURN_TYPE.into(),
-                key: InstanceKey::Named("s1".into()),
-            },
-            handler: "turn".into(),
-            args: turn_args(&store_url, &endpoint, "open alpha and beta"),
-        },
+    let deltas = run_turn(
+        &engine,
+        &seen,
+        turn_args(&store_url, &endpoint, "open alpha and beta"),
     )
     .await
     .unwrap();
-    let (mut rx, mut stream_id) = match slot {
-        CallSlot::Hot { rx, .. } => (rx, None),
-        _ => panic!("iterate is hot-only"),
-    };
-    let mut reply = String::new();
-    loop {
-        let v = match rx.await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => panic!("pull failed: {e}"),
-            Err(_) => panic!("reply dropped"),
-        };
-        if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
-            break;
-        }
-        if stream_id.is_none() {
-            stream_id = Some(
-                v.get("stream_id")
-                    .and_then(|s| s.as_str())
-                    .unwrap()
-                    .to_string(),
-            );
-        }
-        if let Some(delta) = v.get("item").and_then(|i| i.get("delta")).and_then(|d| d.as_str()) {
-            reply.push_str(delta);
-        }
-        let id = stream_id.clone().unwrap();
-        match Realm::iterate(&engine.realm, IterateOp::Next { stream_id: id })
-            .await
-            .unwrap()
-        {
-            CallSlot::Hot { rx: next, .. } => rx = next,
-            _ => panic!("iterate is hot-only"),
-        }
-    }
-    assert_eq!(reply, "both opened", "the round's answer reached the user");
+    assert_eq!(
+        deltas.join(""),
+        "both opened",
+        "the round's answer reached the user"
+    );
 
     // One assistant message, two calls — not one per call. This is the shape the
     // endpoint reported as malformed by answering an empty string.
     let bodies = bodies.lock().unwrap().clone();
-    assert_eq!(bodies.len(), 2, "two inference rounds: the round of calls, then the answer");
-    let second: serde_json::Value = serde_json::from_str(&bodies[1]).expect("a JSON request");
+    assert_eq!(
+        bodies.len(),
+        2,
+        "two inference rounds: the round of calls, then the answer"
+    );
+    let second: Value = serde_json::from_str(&bodies[1]).expect("a JSON request");
     let messages = second["messages"].as_array().expect("messages");
-    let assistants: Vec<&serde_json::Value> = messages
+    let assistants: Vec<&Value> = messages
         .iter()
         .filter(|message| message["role"] == "assistant")
         .collect();
-    assert_eq!(assistants.len(), 1, "the call round is fed back once: {messages:?}");
+    assert_eq!(
+        assistants.len(),
+        1,
+        "the call round is fed back once: {messages:?}"
+    );
     let round = assistants[0]["tool_calls"]
         .as_array()
         .expect("the one assistant message carries the calls");
@@ -765,7 +781,11 @@ async fn two_calls_in_one_round_reach_the_model_as_one_round() {
         .filter(|message| message["role"] == "tool")
         .map(|message| message["tool_call_id"].as_str().unwrap_or_default())
         .collect();
-    assert_eq!(ids, vec!["c1", "c2"], "one result per call, in the calls' order");
+    assert_eq!(
+        ids,
+        vec!["c1", "c2"],
+        "one result per call, in the calls' order"
+    );
 
     // Both doors ran: the fragments reassembled into two complete argument documents.
     let tasks_url = format!("{store_url}/tasks/37");
@@ -773,7 +793,7 @@ async fn two_calls_in_one_round_reach_the_model_as_one_round() {
         ureq::get(&tasks_url)
             .call()
             .unwrap()
-            .into_json::<serde_json::Value>()
+            .into_json::<Value>()
             .unwrap()
     })
     .await
@@ -813,37 +833,14 @@ async fn a_provider_that_never_stops_asking_for_tools_fails_the_turn() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let engine = boot().await;
+    let (engine, seen) = boot().await;
 
-    let slot = Realm::iterate(
-        &engine.realm,
-        IterateOp::Start {
-            target: InstanceId {
-                booth_type: TURN_TYPE.into(),
-                key: InstanceKey::Named("s1".into()),
-            },
-            handler: "turn".into(),
-            args: turn_args(&store_url, &endpoint, "hi"),
-        },
-    )
-    .await
-    .unwrap();
-    // The failure rides the Start face's terminal envelope (ADR-0036
-    // §2: a handler that never opens a stream answers the invoke shape).
-    let v = match slot {
-        CallSlot::Hot { rx, .. } => match rx.await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => panic!("the failure must ride as a value: {e}"),
-            Err(_) => panic!("reply dropped"),
-        },
-        _ => panic!("iterate is hot-only"),
-    };
+    let failure = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap_err();
     assert!(
-        v.get("value")
-            .and_then(|s| s.as_str())
-            .map(|s| s.contains("did not converge"))
-            .unwrap_or(false),
-        "the round cap names itself: {v}"
+        failure.contains("did not converge"),
+        "the round cap names itself: {failure}"
     );
 
     // Nothing appended: a turn that never produced content is not an
@@ -860,13 +857,12 @@ async fn a_provider_that_never_stops_asking_for_tools_fails_the_turn() {
 /// verdict it served, so the caller never states one.
 #[tokio::test]
 async fn the_compression_branch_lands_the_served_summary() {
-    let endpoint =
-        sse_server_three_branches(
-            vec!["hel", "lo ", "wor", "ld"],
-            vec!["compressed ", "span"],
-            vec![r#"{"facts": []}"#],
-        )
-        .await;
+    let endpoint = sse_server_three_branches(
+        vec!["hel", "lo ", "wor", "ld"],
+        vec!["compressed ", "span"],
+        vec![r#"{"facts": []}"#],
+    )
+    .await;
     let store_url = mem_server_with_compression().await;
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
     // Three records with a wide gap before the last one: the verdict's split
@@ -879,8 +875,10 @@ async fn the_compression_branch_lands_the_served_summary() {
         surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
     }
 
-    let engine = boot().await;
-    let deltas = drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    let (engine, seen) = boot().await;
+    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap();
     assert_eq!(deltas.join(""), "hello world", "the answer still streams");
 
     let view = surface.fetch_session(7, 1).await.unwrap();
@@ -917,17 +915,22 @@ async fn the_cut_the_pass_chooses_lands_beside_the_summary() {
         surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
     }
 
-    let engine = boot().await;
-    drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    let (engine, seen) = boot().await;
+    run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap();
 
-    let raw: serde_json::Value = ureq::get(&format!(
+    let raw: Value = ureq::get(&format!(
         "{store_url}/channels/7/members/1/session?format=plaintext"
     ))
     .call()
     .unwrap()
     .into_json()
     .unwrap();
-    assert_eq!(raw["summary"], "the span in three lines", "the JSON product is unwrapped");
+    assert_eq!(
+        raw["summary"], "the span in three lines",
+        "the JSON product is unwrapped"
+    );
     assert_eq!(
         raw["suggested_ts"], 1_000,
         "the index the model gave, resolved to the record it numbered"
@@ -947,9 +950,7 @@ async fn the_review_branch_writes_the_facts_it_found() {
     let endpoint = sse_server_three_branches(
         vec!["hel", "lo ", "wor", "ld"],
         vec![r#"{"summary": "a span", "cut": 0}"#],
-        vec![
-            r#"{"facts": [["acme","repository",{},"OWNS",{},"issues-api","repository",{}]]}"#,
-        ],
+        vec![r#"{"facts": [["acme","repository",{},"OWNS",{},"issues-api","repository",{}]]}"#],
     )
     .await;
     let store_url = mem_server_with_compression().await;
@@ -962,12 +963,14 @@ async fn the_review_branch_writes_the_facts_it_found() {
         surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
     }
 
-    let engine = boot().await;
-    drain_turn(&engine, &store_url, &endpoint, "hi").await;
+    let (engine, seen) = boot().await;
+    run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+        .await
+        .unwrap();
 
     // The fact landed in the graph the review posted it to (scope 37, the turn's
     // `memory_scope`): the proof is a node the conversation never named.
-    let graph: serde_json::Value = ureq::get(&format!("{store_url}/graph/37"))
+    let graph: Value = ureq::get(&format!("{store_url}/graph/37"))
         .call()
         .unwrap()
         .into_json()
@@ -980,5 +983,143 @@ async fn the_review_branch_writes_the_facts_it_found() {
             .iter()
             .any(|node| node["name"].as_str() == Some("acme")),
         "the review's fact reached the graph: {graph}"
+    );
+}
+
+/// THE VENUE ROUTE, which is the one a page actually uses: `view:turn.submit` with an
+/// envelope reaches the booth by subscription, the turn draws without anyone pulling, the
+/// frames are addressed to the device the envelope named, and the end is said as its own
+/// event.
+#[tokio::test]
+async fn the_venue_route_draws_a_turn_nobody_pulls() {
+    let endpoint = sse_server(vec!["hel", "lo"]).await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot().await;
+    let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
+
+    Realm::emit(
+        &engine.realm,
+        None,
+        "view:turn.submit",
+        json!({
+            "name": "view:turn.submit",
+            "device": device,
+            "sender": { "device": device },
+            "data": view_args(&store_url, &endpoint, "hi"),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The end is the signal this leg has: the page's submit was an emit, so it cannot read
+    // an answer — `view:turn.done` is what stops its streaming state.
+    let mut done = None;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        done = seen.all("view:turn.done").into_iter().next();
+        if done.is_some() {
+            break;
+        }
+    }
+    let done = done.expect("the turn said it was done");
+
+    // Every emit carries the DEVICE that asked, and names the event its payload is for.
+    // No channel, and no `sender`: the venue excludes a sender from its own event's
+    // fan-out, so naming the asker there would send the answer to everyone but the asker.
+    //
+    // The collector subscribes to the prefix, so it also sees the page's own request
+    // (`view:turn.submit`) — that one is the input, not the booth's speech, and the venue
+    // drops it from the fan-out because it names a sender.
+    let emits: Vec<Value> = seen
+        .events()
+        .into_iter()
+        .filter(|event| event.get("name").and_then(Value::as_str) != Some("view:turn.submit"))
+        .collect();
+    assert!(emits.len() >= 3, "frames + done: {emits:?}");
+    for event in emits {
+        assert_eq!(
+            event.get("device").and_then(Value::as_str),
+            Some(device),
+            "an emit is delivered to the device that asked: {event}"
+        );
+        assert!(
+            event.get("sender").is_none(),
+            "a booth's own speech names no sender: {event}"
+        );
+        assert!(
+            event
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.starts_with("view:")),
+            "a payload the venue can route names its recipient event: {event}"
+        );
+    }
+    assert_eq!(
+        done.get("name").and_then(Value::as_str),
+        Some("view:turn.done")
+    );
+
+    // The frames: the first batch sets the stage (question, region, bubble) and patches the
+    // region; every batch is a list of Accrete operations the renderer can draw.
+    let batches: Vec<Vec<Value>> = seen
+        .all("view:turn")
+        .into_iter()
+        .filter_map(|e| e.get("data").and_then(Value::as_array).cloned())
+        .collect();
+    assert_eq!(batches.len(), 2, "one batch per chunk: {batches:?}");
+    let first = &batches[0];
+    assert_eq!(
+        first.len(),
+        4,
+        "the stage is set in one ordered batch: {first:?}"
+    );
+    assert_eq!(
+        first[0]["slot"], "chat",
+        "the user's line lands in the rack"
+    );
+    assert_eq!(
+        first[0]["data"]["children"][0]["bind"]["value"]["default"],
+        "hi"
+    );
+    assert_eq!(first[1]["action"], "set");
+    assert_eq!(
+        first[1]["slot"], "say",
+        "the region is the caller's own name"
+    );
+    assert_eq!(
+        first[2]["data"]["children"][0]["bind"]["value"]["source"],
+        "say"
+    );
+    assert_eq!(first[3]["action"], "patch");
+    assert_eq!(first[3]["value"], "hel");
+    assert_eq!(batches[1][0]["value"], "lo");
+
+    // And the exchange landed: the stream was live enough to be a turn.
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    let view = surface.fetch_session(7, 1).await.unwrap();
+    assert_eq!(
+        view.increment
+            .last()
+            .map(|(_, row)| row.content.clone())
+            .unwrap_or_default(),
+        "hello"
+    );
+}
+
+/// A drawing caller that names no slots is REFUSED by name: gravity owns no layout, so it
+/// cannot invent them, and a booth that guessed would draw into a slot the page does not
+/// have.
+#[tokio::test]
+async fn a_drawing_caller_must_name_its_slots() {
+    let endpoint = sse_server(vec!["hel"]).await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot().await;
+
+    let mut args = turn_args(&store_url, &endpoint, "hi");
+    args["protocol"] = json!("fluxen");
+    let failure = run_turn(&engine, &seen, args).await.unwrap_err();
+    assert!(
+        failure.contains("needs `slots`"),
+        "the refusal names the missing declaration: {failure}"
     );
 }

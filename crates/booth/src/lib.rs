@@ -8,20 +8,20 @@
 //!   endpoint parsed into an iterate producer; one envelope round per
 //!   pull, `done: true` closes. Key custody: the key is read from the
 //!   env var NAMED in the args (the value never in the module or args).
-//! - `gravity-turn` — the turn booth: a `turn` PRODUCER that fetches the
-//!   session projection from mem-server (HTTP — the booth's own code
-//!   decides its access method, ADR-0031), opens the provider stream
-//!   through the ctx iterate arms (ADR-0034's pull loop — the provider
-//!   is a sibling citizen, not gravity-internal plumbing), yields
-//!   `{"delta": ...}` per envelope item while the stream is live, then
-//!   appends the one-ts-two-subs exchange and returns. The instance key
-//!   IS the session (partition = session_id per aura PLAN Phase 6).
+//! - `gravity-turn` — the turn booth: ONE handler (`turn`) the venue reaches by
+//!   subscription (`view:turn.submit`). It fetches the session projection from
+//!   mem-server (HTTP — the booth's own code decides its access method, ADR-0031),
+//!   opens the provider stream through the ctx iterate arms (ADR-0034 — the
+//!   provider is a sibling citizen, not gravity-internal plumbing), emits every
+//!   chunk on the venue wire as it arrives, then appends the one-ts-two-subs
+//!   exchange and returns. Nothing pulls it: a turn is one handler call, so its
+//!   state lives on one call stack. The instance key is the envelope's own
+//!   address, so one device runs one turn at a time.
 //!
-//! The guest process IS the stream state — the process holds the SSE
-//! connection and the accumulated reply across pull rounds, which is
-//! exactly the resident state the old in-process `Body::Rust` closure
-//! arm lacked. prism's `turn.delta` contract rides the envelopes
-//! unchanged.
+//! The guest process IS the turn's state — the SSE connection, the accumulated
+//! reply and the live tail branches all sit on the handler's stack, which is
+//! exactly the resident form the old in-process `Body::Rust` closure arm lacked,
+//! with no pull face that has to stitch the rounds back together.
 //!
 //! Custody: the LLM key is read from the env var named in the args;
 //! the store URL rides the args the same way (a deployment fact the
@@ -78,7 +78,14 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
     engine
         .register(
             aura_booth::BoothType::script(TURN_TYPE, "induction", turn_spec())
-                .encoded(aura_booth::Encoding::Cbor),
+                .encoded(aura_booth::Encoding::Cbor)
+                // The venue's own word for "run a turn", declared here rather than special-cased
+                // in the host: the entry is `turn` (the guest's handler), the key is the envelope's
+                // address, so one device has one turn instance.
+                // The instance key is the ASKING DEVICE (prism ADR-0018: the transport
+                // knows devices and users; a channel is an application's business). One
+                // device, one turn at a time.
+                .on_as("view:turn.submit", "device", "turn"),
         )
         .await?;
     Ok(())
