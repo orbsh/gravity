@@ -14,7 +14,7 @@ Phase 2 已把循环落地。留下两个问题，第二个自带产品层面的
 **1. 一个工具能被调用之前，必须先存在什么？** aura 按**类型**路由调用：
 `engine.call(target: InstanceId, handler, args)`，target = 类型名 + 实例键
 （`aura/crates/engine/src/lib.rs`）。远程节点只能通过一个已注册的类型触达，其 body 是
-`Body::RemoteProbe { node_alias, language, source, encoding }`
+`Body::Remote { node_alias, language, source, encoding }`
 （`aura/crates/realm/src/instance.rs` 的分发臂）。这个类型是 aura 为节点规定的绑定
 记录——"type-affinity records ARE the binding surface … the type definition IS the
 binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今天没有任何
@@ -56,7 +56,7 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
 
 **RULING — 执行发生在节点上、经由一个固定的 runner；skill 是数据。**
 
-1. **ToolRunner 就是执行形态。** 节点 mount 是一个 `RemoteProbe` 摊位类型，其 source
+1. **ToolRunner 就是执行形态。** 节点 mount 是一个 `Remote` 摊位类型，其 source
    是一份**固定的部署件**：一个 runner（解释器或 dispatcher），它把操作的代码与参数
    当作调用参数收下并执行。mount 的代码永不随 skill 或版本变化；一切动态的部分都是
    数据。
@@ -140,10 +140,10 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
 - **k10r：** 脚本的家，且 gravity 是它唯一的客户；节点永不与它说话——字节路径是
   gravity → 控制路径 → 节点。
 - **prism：** 多出一件工作——mount 注册面。按 (别名 × 操作语言) 注册一个
-  `RemoteProbe` 类型，source 是那份 runner 部署件。`RemoteProbe` 定义不持久化，所以
+  `Remote` 类型，source 是那份 runner 部署件。`Remote` 定义不持久化，所以
   这是每次启动的幂等注册；拨入帧 `Frame::Register { node_alias, carriers }` 已经提供
   了别名与载具集，可作触发源。
-- **aura：** 零改动。用的全是既有面（`engine.register`、`Body::RemoteProbe`）。
+- **aura：** 零改动。用的全是既有面（`engine.register`、`Body::Remote`）。
 - **effector：** 零改动。runner 是定义，skill 脚本是参数；帧词汇、编解码、代码引用
   全部照旧。
 - **部署：** 每台机器（含控制面）跑一个节点；每语言一份 runner 部署件（或一台
@@ -169,7 +169,7 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
 
 上面的裁决写在它存在之前，而当天它大半成了事实。已落地：prism 的 mount 注册面
 （`prism/src/mounts.rs` —— `MountDecl`/`PRISM_MOUNTS`/`register_all`，启动时幂等重放，
-因为 `RemoteProbe` 定义不持久化）、三份 runner 部署件
+因为 `Remote` 定义不持久化）、三份 runner 部署件
 （`effector/deploy/runners/runner_nu.nu`、`runner_py.py`、`runner_py_guest.py`），以及
 第 8 条裁决在 python 上的常驻形态——`runner_py_guest.py` 是一个 induction guest，跨调用
 的驻留成立，且从它出去的 ctx bridge 端到端验证过：交付的脚本经宿主场域调用兄弟 mount

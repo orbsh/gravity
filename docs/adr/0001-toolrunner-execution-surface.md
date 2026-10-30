@@ -17,7 +17,7 @@ were left open, and the second one has a deadline built into the product.
 `engine.call(target: InstanceId, handler, args)`, where the target is a type name
 plus an instance key (`aura/crates/engine/src/lib.rs`). A remote node is reachable
 only through a registered type whose body is
-`Body::RemoteProbe { node_alias, language, source, encoding }`
+`Body::Remote { node_alias, language, source, encoding }`
 (`aura/crates/realm/src/instance.rs`, the dispatch arm). That type is aura's
 sanctioned binding record for a node — "type-affinity records ARE the binding
 surface … the type definition IS the binding record; no new table needed"
@@ -67,7 +67,7 @@ What the wire already provides (verified against the code, not assumed):
 
 **RULING — execution happens on a node, through a fixed runner; skills are data.**
 
-1. **ToolRunner is the execution form.** A node mount is a `RemoteProbe` booth
+1. **ToolRunner is the execution form.** A node mount is a `Remote` booth
    type whose source is a *fixed deployment artifact*: a runner (interpreter or
    dispatcher) that receives the operation's code and arguments as call
    arguments and executes them. The mount's code never varies per skill or per
@@ -185,12 +185,12 @@ What the wire already provides (verified against the code, not assumed):
 - **k10r:** the script store, with gravity as its only client. The node never
   talks to it — the byte path is gravity → control path → node.
 - **prism:** one new piece of work — a mount-registration face. Per (alias ×
-  operation language) a `RemoteProbe` type whose source is the runner artifact.
-  `RemoteProbe` definitions are not persisted, so this is an idempotent
+  operation language) a `Remote` type whose source is the runner artifact.
+  `Remote` definitions are not persisted, so this is an idempotent
   registration per boot, and the dial-in `Frame::Register { node_alias,
   carriers }` already supplies the alias and the carrier set for the trigger.
 - **aura:** no change. Only existing surfaces are used (`engine.register`,
-  `Body::RemoteProbe`).
+  `Body::Remote`).
 - **effector:** no change. The runner is a definition; the skill script is an
   argument; the frame vocabulary, the codec, and the code reference all stand.
 - **Deployment:** every machine (control plane included) runs a node; one runner
@@ -225,7 +225,7 @@ What the wire already provides (verified against the code, not assumed):
 The ruling above was written before any of it existed, and the same day carried
 most of it. Landed: prism's mount-registration face (`prism/src/mounts.rs` —
 `MountDecl`/`PRISM_MOUNTS`/`register_all`, replayed at boot because
-`RemoteProbe` definitions do not persist), the three runner artifacts
+`Remote` definitions do not persist), the three runner artifacts
 (`effector/deploy/runners/runner_nu.nu`, `runner_py.py`, `runner_py_guest.py`),
 and ruling 8's resident form for python — `runner_py_guest.py` is an induction
 guest whose residency holds across calls, and the ctx bridge OUT of it is proven
