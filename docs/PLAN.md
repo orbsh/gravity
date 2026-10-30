@@ -74,7 +74,16 @@ critical path).
     booth declares no `storage` block (the mechanism exists — `register` persists a script
     booth's introspected schema and allocates its ns, and the realm builds the plan from
     that copy; what is unproven is the induction carrier's half, since no induction guest in
-    the tree has declared storage yet). ADR-0007 also fixes HOW the rows are managed: the face
+    the tree has declared storage yet) — LANDED 2026-10-30: the turn guest declares `.storage(...)`
+    with two collections, `settings` (key `[kind=1, id=1]`: store_url, memory_scope, memory_format,
+    default_model) and `models` (key `[kind=2, id]`: alias, endpoint, model, key_env, weight,
+    enabled), and `turn()` reads them through `ctx.store` before anything else. THE ARGS SHRANK to
+    what the page knows (conversation, text, output shape, mounts); a fresh deployment has no rows
+    and the turn fails with a NAMED error listing the keys (no env fallback). The trap found on the
+    way is recorded in ADR-0007: a type owns ONE ns, so collections inside it need a `kind` in the
+    key — without it `models` id 1 and `settings` id 1 were the same row and the read returned one
+    table's fields under the other's name. Gates: booth 14/14 (one new case, the missing-settings
+    refusal), workspace green, clippy 0. ADR-0007 also fixes HOW the rows are managed: the face
     is a VIEW (`view:gravity-model` → gravity emits a management layout → its buttons emit
     ordinary events), the stack's general interaction pattern, driveable by an AI too — not an
     admin verb and not a config file. The pool's selection rule is the one item left open.

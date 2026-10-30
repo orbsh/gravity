@@ -50,7 +50,142 @@ fn main() -> anyhow::Result<()> {
         // handler runs the turn to its end. There is no producer binding: a stream this
         // booth no longer owns is a stream nobody has to pull.
         .on("turn", |ctx: &mut Ctx, args: Value| run(ctx, &args))
+        // THE TURN'S OWN STORAGE (ADR-0007): the deployment facts are rows in the field, in
+        // this type's ns, so a venue that serves this application needs no model configuration
+        // of its own. The schema is the declaration; `Engine::register` persists it and the
+        // realm builds the plan the `ctx.store` arm below executes against.
+        .storage(storage_schema())
         .run()
+}
+
+/// The declared collections. `settings` holds one row (id 1) with the deployment's facts; `models`
+/// holds one row per model recipe, addressed by id (`settings.default_model` names the default).
+/// Cold fields are the variable-length ones (a Str cannot be a key, and TLV is where it lives);
+/// every number is hot, so a read is one fixed-width segment.
+fn storage_schema() -> Value {
+    let slots = json!({
+        "primary": 0, "dynamic": 1, "dict_id": 2, "dict_name": 3,
+        "declared_index_base": 4096, "declared_reduce_base": 8192, "junction_base": 12288,
+    });
+    // A TYPE OWNS ONE NS (aura ADR-0026): every collection of this type shares it, so the key
+    // carries the discriminator — without it two collections with the same `id` are one row.
+    let key = json!([
+        {"name": "kind", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
+        {"name": "id", "ty": "U64", "width": 8, "offset": 8, "tag": 0},
+    ]);
+    // The induction schema nests this under `storage` already, so the value IS the collections map
+    // (wrapping it again would parse as "this type declares nothing").
+    json!({
+        "collections": {
+            "settings": {
+                "schema": {
+                    "key_len": 16,
+                    "key_fields": key,
+                    "layout_version": 1,
+                    "hot_width": 16,
+                    "payload_header_len": 3,
+                    "hot_fields": [
+                        {"name": "memory_scope", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
+                        {"name": "default_model", "ty": "U64", "width": 8, "offset": 8, "tag": 0},
+                    ],
+                    "cold_fields": [
+                        {"name": "store_url", "ty": "Str", "width": 0, "offset": 0, "tag": 1},
+                        {"name": "memory_format", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
+                    ],
+                    "slots": slots.clone(),
+                },
+            },
+            "models": {
+                "schema": {
+                    "key_len": 16,
+                    "key_fields": key,
+                    "layout_version": 1,
+                    "hot_width": 16,
+                    "payload_header_len": 3,
+                    "hot_fields": [
+                        {"name": "weight", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
+                        {"name": "enabled", "ty": "U64", "width": 8, "offset": 8, "tag": 0},
+                    ],
+                    "cold_fields": [
+                        {"name": "alias", "ty": "Str", "width": 0, "offset": 0, "tag": 1},
+                        {"name": "endpoint", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
+                        {"name": "model", "ty": "Str", "width": 0, "offset": 0, "tag": 3},
+                        {"name": "key_env", "ty": "Str", "width": 0, "offset": 0, "tag": 4},
+                    ],
+                    "slots": slots.clone(),
+                },
+            },
+        },
+    })
+}
+
+/// The key discriminator each collection uses inside the type's ONE ns (see `storage_schema`).
+const KIND_SETTINGS: u64 = 1;
+const KIND_MODELS: u64 = 2;
+
+/// One row of `settings` (id 1) — the deployment facts a turn needs, which used to ride the call
+/// arguments from the gateway (ADR-0007).
+struct Settings {
+    store_url: String,
+    memory_scope: u64,
+    memory_format: String,
+    default_model: u64,
+}
+
+/// Read the settings row. A fresh deployment has none, and that is a NAMED error: the turn says
+/// which document and which keys are missing rather than falling back to an environment variable
+/// (a fallback is a second home by another name, ADR-0007 §5).
+fn read_settings(ctx: &mut Ctx) -> anyhow::Result<Settings> {
+    let row = ctx.store(json!({
+        "collection": "settings", "op": "get_document", "key": { "kind": KIND_SETTINGS, "id": 1 },
+    }))?;
+    if row.is_null() {
+        anyhow::bail!(
+            "turn: this deployment has no settings row — write `settings` id 1 with `store_url`, \
+             `memory_scope`, `memory_format` and `default_model` (a model row's id)"
+        );
+    }
+    let text = |key: &str| -> anyhow::Result<String> {
+        row.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("turn: `settings` id 1 is missing `{key}`"))
+    };
+    Ok(Settings {
+        store_url: text("store_url")?,
+        memory_scope: row
+            .get("memory_scope")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("turn: `settings` id 1 is missing `memory_scope`"))?,
+        memory_format: text("memory_format")?,
+        default_model: row
+            .get("default_model")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("turn: `settings` id 1 is missing `default_model`"))?,
+    })
+}
+
+/// The model recipe a turn uses: `endpoint` / `model` / `key_env` off the row `settings` named.
+struct Recipe {
+    endpoint: String,
+    model: String,
+    key_env: String,
+}
+
+fn read_recipe(ctx: &mut Ctx, id: u64) -> anyhow::Result<Recipe> {
+    let row = ctx.store(json!({
+        "collection": "models", "op": "get_document", "key": { "kind": KIND_MODELS, "id": id },
+    }))?;
+    if row.is_null() {
+        anyhow::bail!("turn: `settings` names model {id}, and there is no such row in `models`");
+    }
+    let text = |key: &str| -> anyhow::Result<String> {
+        row.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("turn: model {id} is missing `{key}`"))
+    };
+    Ok(Recipe { endpoint: text("endpoint")?, model: text("model")?, key_env: text("key_env")? })
 }
 
 /// Where a drawing turn puts its frames. One event for the whole turn: the frames carry
@@ -246,21 +381,28 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// not a static — the whole turn is one call stack, so nothing has to survive a call
 /// boundary (a resident guest no longer carries one turn's state into the next).
 struct Turn<'a> {
-    /// The caller's payload, for the provider's endpoint/model/key_env.
+    /// The caller's payload: what the PAGE knows (its conversation, the text, the mount table).
     args: &'a Value,
     /// Already trailing-slash-trimmed.
-    store_url: &'a str,
+    store_url: String,
     channel_id: u64,
     member_id: u64,
-    memory_scope: Option<u64>,
+    memory_scope: u64,
+    /// The head's representation — the deployment's choice, stored beside the other facts.
+    memory_format: String,
+    /// The model recipe the settings row named.
+    endpoint: String,
+    model: String,
+    key_env: String,
 }
 
 fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<String> {
-    let store_url = args
-        .get("store_url")
-        .and_then(Value::as_str)
-        .context("turn: missing `store_url`")?
-        .trim_end_matches('/');
+    // THE DEPLOYMENT FACTS ARE ROWS, NOT ARGUMENTS (ADR-0007): the store, the memory scope, the
+    // representation and the model recipe live in this type's own namespace, so a gateway never
+    // carries them and a caller cannot forget one.
+    let settings = read_settings(ctx)?;
+    let recipe = read_recipe(ctx, settings.default_model)?;
+    let store_url = settings.store_url.trim_end_matches('/').to_string();
     let channel_id = args
         .get("channel_id")
         .and_then(Value::as_u64)
@@ -276,17 +418,21 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
         .to_string();
     let turn = Turn {
         args,
-        store_url,
+        store_url: store_url.clone(),
         channel_id,
         member_id,
-        memory_scope: args.get("memory_scope").and_then(Value::as_u64),
+        memory_scope: settings.memory_scope,
+        memory_format: settings.memory_format,
+        endpoint: recipe.endpoint,
+        model: recipe.model,
+        key_env: recipe.key_env,
     };
     let out = out_of(args)?;
 
     // 1. The session projection (mem-server's SessionDto shape). The head's
     // representation is the deployment's choice, and `struct` is refused
     // here: it returns the fact DATA, which this executor does not assemble.
-    let format = MemoryFormat::from_config(args.get("memory_format").and_then(Value::as_str))
+    let format = MemoryFormat::from_config(Some(turn.memory_format.as_str()))
         .context("turn: the configured memory format is unusable")?;
     let url = format!(
         "{store_url}/channels/{channel_id}/members/{member_id}/session?format={}",
@@ -319,8 +465,9 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     // starts every conversation from zero, which is the state this whole stack
     // exists to end. Best effort — a store that cannot answer is the store's
     // problem, and the model can still ask with `list_tasks`.
-    if let Some(scope) = turn.memory_scope {
-        if let Some(open) = open_tasks(store_url, scope) {
+    {
+        let scope = turn.memory_scope;
+        if let Some(open) = open_tasks(&turn.store_url, scope) {
             messages.push(json!({ "role": "system", "content": open }));
         }
     }
@@ -392,7 +539,7 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     //    feed the results back, re-open — the "next inference round" (Phase 2). The results
     //    are the MODEL's, not the consumer's, so they never ride the drawing wire.
     let mut walked: Vec<gravity_booth::tools::Walked> = Vec::new();
-    let mut first = open_provider(ctx, args, &messages, "turn: provider stream failed to open")?;
+    let mut first = open_provider(ctx, &turn, &messages, "turn: provider stream failed to open")?;
     for _round in 0..8 {
         if first.get("done").and_then(Value::as_bool) == Some(true) {
             return Err(stream_failure(
@@ -423,8 +570,8 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
         messages.push(json!({ "role": "assistant", "tool_calls": calls }));
         for call in parsed {
             let facts = gravity_booth::tools::Facts {
-                store_url,
-                memory_scope: turn.memory_scope,
+                store_url: &turn.store_url,
+                memory_scope: Some(turn.memory_scope),
                 mounts: &mounts,
                 session: &session,
             };
@@ -450,11 +597,8 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
                 // its reply first, for the record to exist. Best effort — the
                 // proposal is an observation about the walk, never a premise of
                 // the step the model asked for.
-                if let (true, Some(scope)) = (
-                    gravity_booth::tools::should_file(before, after, &so_far),
-                    turn.memory_scope,
-                ) {
-                    file_composition(store_url, scope, &so_far);
+                if gravity_booth::tools::should_file(before, after, &so_far) {
+                    file_composition(&turn.store_url, turn.memory_scope, &so_far);
                 }
                 match outcome {
                     Ok(value) => value.to_string(),
@@ -472,7 +616,7 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
                 "content": content,
             }));
         }
-        first = open_provider(ctx, args, &messages, "turn: provider re-open failed")?;
+        first = open_provider(ctx, &turn, &messages, "turn: provider re-open failed")?;
     }
     // The loop must have ENDED on a content stream: the cap is the runaway
     // stop, and a provider still asking for tools after it is a failed turn —
@@ -579,7 +723,7 @@ fn stream_answer(
 /// ADR-0012), so it fails HERE with the caller's own wording rather than at a later pull.
 fn open_provider(
     ctx: &mut Ctx,
-    args: &Value,
+    turn: &Turn<'_>,
     messages: &[Value],
     what: &str,
 ) -> anyhow::Result<Value> {
@@ -589,9 +733,9 @@ fn open_provider(
             "",
             "stream",
             json!({
-                "endpoint": args.get("endpoint"),
-                "model": args.get("model"),
-                "key_env": args.get("key_env"),
+                "endpoint": turn.endpoint,
+                "model": turn.model,
+                "key_env": turn.key_env,
                 "messages": messages,
                 // The fixed list (ADR-0004): the same bytes every turn, and
                 // the reason a real model can call anything at all.
@@ -769,9 +913,9 @@ fn open_branch(
         name,
         "stream",
         json!({
-            "endpoint": turn.args.get("endpoint"),
-            "model": turn.args.get("model"),
-            "key_env": turn.args.get("key_env"),
+            "endpoint": turn.endpoint,
+            "model": turn.model,
+            "key_env": turn.key_env,
             "messages": messages,
         }),
     ) {
@@ -961,10 +1105,7 @@ fn read_review_facts(text: &str) -> Option<Vec<Value>> {
 /// `POST …/memories/{scope}` — the door `commit_memory` writes through. Same body
 /// shape (an array of 8-slot tuples), so a review needs no vocabulary of its own.
 fn land_review(turn: &Turn<'_>, facts: &[Value]) {
-    let Some(scope) = turn.memory_scope else {
-        eprintln!("[gravity-turn] review: this deployment carries no memory scope");
-        return;
-    };
+    let scope = turn.memory_scope;
     let url = format!("{}/memories/{scope}", turn.store_url);
     match ureq::post(&url)
         .set("Content-Type", "application/json")

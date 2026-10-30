@@ -178,7 +178,15 @@ async fn sse_server_three_branches(
 /// Boot the realm: both guests, the turn registered with the venue's subscription route
 /// (what `gravity_booth::register` does in a deployment), and a collector standing in for
 /// the renderer.
-async fn boot() -> (Engine, Seen) {
+async fn boot(store_url: &str, endpoint: &str) -> (Engine, Seen) {
+    let (engine, seen) = boot_bare().await;
+    seed(&engine, store_url, endpoint);
+    (engine, seen)
+}
+
+/// The realm with both guests and the collector, and NO deployment rows — the state a fresh
+/// deployment is in before anyone configures it.
+async fn boot_bare() -> (Engine, Seen) {
     // The provider guest reads the LLM key from the env var its args NAME
     // (`key_env`), and that var rides the PROCESS environment the guest
     // child inherits. The fixture owns the requirement — without it the
@@ -247,6 +255,44 @@ async fn boot() -> (Engine, Seen) {
     (engine, seen)
 }
 
+/// THE DEPLOYMENT FACTS ARE ROWS (ADR-0007): every fixture writes them into the turn type's own
+/// namespace before driving a turn — which is also the proof that the induction carrier's
+/// `storage` block reaches the realm as a plan (the guest declares it; `Engine::register`
+/// persists the schema and allocates the type's ns).
+fn seed(engine: &Engine, store_url: &str, endpoint: &str) {
+    let (store, plan) = {
+        let realm = engine.realm.try_lock().expect("realm");
+        (
+            realm.mq.clone(),
+            realm
+                .plan_of(TURN_TYPE)
+                .cloned()
+                .expect("the turn declares `settings` + `models`"),
+        )
+    };
+    let put = |collection: &str, key: Value, doc: Value| {
+        aura_realm::store_exec::execute(
+            &store,
+            &plan,
+            &aura_booth::StoreOp {
+                collection: collection.to_string(),
+                op: aura_booth::StoreOpKind::PutDocument { key, doc },
+            },
+        )
+        .expect("seed")
+    };
+    put(
+        "models",
+        json!({ "kind": 2, "id": 1 }),
+        json!({"alias": "default", "endpoint": endpoint, "model": "test-model", "key_env": "GRAVITY_TEST_KEY", "weight": 1, "enabled": 1}),
+    );
+    put(
+        "settings",
+        json!({ "kind": 1, "id": 1 }),
+        json!({"store_url": store_url, "memory_scope": 37, "memory_format": "plaintext", "default_model": 1}),
+    );
+}
+
 async fn mem_server() -> String {
     let dir = tempfile::TempDir::new().unwrap();
     let app = mem_server::open(dir.path().to_path_buf()).unwrap();
@@ -286,26 +332,21 @@ async fn mem_server_with_compression() -> String {
 
 /// The caller's payload. `event` is the data protocol's name for its chunks — gravity owns
 /// no event names, so a consumer that wants `{"delta": …}` says what to call it.
-fn turn_args(store_url: &str, endpoint: &str, msg: &str) -> Value {
+fn turn_args(msg: &str) -> Value {
     json!({
+        // What the page knows: the conversation it is in, the text, and the output shape it wants.
+        // The deployment facts (store, scope, model recipe) are the application's own rows now.
         "channel_id": 7,
         "member_id": 1,
         "user_message": msg,
-        "store_url": store_url,
-        "endpoint": endpoint,
-        "model": "test-model",
-        "key_env": "GRAVITY_TEST_KEY",
-        // The k10r namespace the memory tools reach (ADR-0004 §5): k10r's
-        // FACT_NS, the only scope a fact tuple can land in.
-        "memory_scope": 37,
         "event": "turn.delta",
     })
 }
 
 /// The same payload asking for FRAMES: the drawing caller names its slots (gravity does not
 /// own a layout, so it cannot know them).
-fn view_args(store_url: &str, endpoint: &str, msg: &str) -> Value {
-    let mut args = turn_args(store_url, endpoint, msg);
+fn view_args(msg: &str) -> Value {
+    let mut args = turn_args(msg);
     args["protocol"] = json!("fluxen");
     args["slots"] = json!({ "rack": "chat", "text": "say" });
     args
@@ -392,9 +433,9 @@ async fn run_turn(engine: &Engine, seen: &Seen, args: Value) -> Result<Vec<Strin
 async fn the_turn_streams_its_chunks_as_events() {
     let endpoint = sse_server(vec!["hel", "lo ", "wor", "ld"]).await;
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
-    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let deltas = run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap();
     assert_eq!(
@@ -408,9 +449,9 @@ async fn the_turn_streams_its_chunks_as_events() {
 async fn the_exchange_lands_after_the_stream_ends() {
     let endpoint = sse_server(vec!["hel", "lo"]).await;
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
-    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let deltas = run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap();
     assert_eq!(deltas.join(""), "hello");
@@ -446,9 +487,9 @@ async fn failed_provider_appends_nothing() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
-    let failure = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let failure = run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap_err();
     assert!(
@@ -501,9 +542,9 @@ async fn transient_endpoint_failures_are_retried() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
-    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let deltas = run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap();
     assert_eq!(deltas.join(""), "recovered", "the retry landed the stream");
@@ -535,9 +576,9 @@ async fn client_errors_fail_through_without_retry() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
-    let failure = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let failure = run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap_err();
     assert!(
@@ -604,9 +645,9 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
-    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let deltas = run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap();
     // The wire carries the ANSWER and nothing else (a tool result is the model's).
@@ -738,12 +779,12 @@ async fn two_calls_in_one_round_reach_the_model_as_one_round() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
     let deltas = run_turn(
         &engine,
         &seen,
-        turn_args(&store_url, &endpoint, "open alpha and beta"),
+        turn_args("open alpha and beta"),
     )
     .await
     .unwrap();
@@ -833,9 +874,9 @@ async fn a_provider_that_never_stops_asking_for_tools_fails_the_turn() {
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let endpoint = format!("http://{addr}");
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
-    let failure = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let failure = run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap_err();
     assert!(
@@ -875,8 +916,8 @@ async fn the_compression_branch_lands_the_served_summary() {
         surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
     }
 
-    let (engine, seen) = boot().await;
-    let deltas = run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+    let deltas = run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap();
     assert_eq!(deltas.join(""), "hello world", "the answer still streams");
@@ -915,8 +956,8 @@ async fn the_cut_the_pass_chooses_lands_beside_the_summary() {
         surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
     }
 
-    let (engine, seen) = boot().await;
-    run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+    run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap();
 
@@ -963,8 +1004,8 @@ async fn the_review_branch_writes_the_facts_it_found() {
         surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
     }
 
-    let (engine, seen) = boot().await;
-    run_turn(&engine, &seen, turn_args(&store_url, &endpoint, "hi"))
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+    run_turn(&engine, &seen, turn_args("hi"))
         .await
         .unwrap();
 
@@ -994,7 +1035,7 @@ async fn the_review_branch_writes_the_facts_it_found() {
 async fn the_venue_route_draws_a_turn_nobody_pulls() {
     let endpoint = sse_server(vec!["hel", "lo"]).await;
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
     let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
 
     Realm::emit(
@@ -1005,7 +1046,7 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
             "name": "view:turn.submit",
             "device": device,
             "sender": { "device": device },
-            "data": view_args(&store_url, &endpoint, "hi"),
+            "data": view_args("hi"),
         }),
     )
     .await
@@ -1113,13 +1154,27 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
 async fn a_drawing_caller_must_name_its_slots() {
     let endpoint = sse_server(vec!["hel"]).await;
     let store_url = mem_server().await;
-    let (engine, seen) = boot().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
 
-    let mut args = turn_args(&store_url, &endpoint, "hi");
+    let mut args = turn_args("hi");
     args["protocol"] = json!("fluxen");
     let failure = run_turn(&engine, &seen, args).await.unwrap_err();
     assert!(
         failure.contains("needs `slots`"),
         "the refusal names the missing declaration: {failure}"
+    );
+}
+
+/// A fresh deployment has no rows, and that is a NAMED error (ADR-0007 §5): the turn says which
+/// document and which keys are missing, instead of falling back to an environment variable.
+#[tokio::test]
+async fn a_turn_without_a_settings_row_names_what_is_missing() {
+    let (engine, seen) = boot_bare().await;
+    let failure = run_turn(&engine, &seen, turn_args("hi")).await.unwrap_err();
+    assert!(failure.contains("no settings row"), "{failure}");
+    assert!(failure.contains("store_url"), "the refusal names the keys: {failure}");
+    assert!(
+        failure.contains("default_model"),
+        "and the model the settings must point at: {failure}"
     );
 }

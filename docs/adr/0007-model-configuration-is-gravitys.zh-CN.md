@@ -43,7 +43,8 @@
 
 - **Prism 的 `turns.rs` 随其余 turn 代码一起消失**（`TurnConfig`、槽位计数器、`run_turn`），layout 的 `turn.submit` 变成平面上一个普通事件。prism 保留的是场馆基础设施：它自己的节点清单（`mounts`）与平面本身。
 - **turn 的 args 缩到页面知道的范围**——会话、文本、输出形状。部署事实不再逐调用旅行，于是调用方也不可能漏传一件事实、让同一个输入得到不同的行为。
-- **gravity 的摊位在 `.auth(...)` 旁边声明 `.storage(...)`，注册工作就这些**：`Engine::register` 内省 guest、持久化 schema（并在途中分配该类型的 ns），realm 从这份持久化副本构建 plan——所以 plan 也能活过重启。**未证**的是 induction 载体那一半：这棵树里还没有 induction guest 声明过存储（该路径由 steel 载体的 fixture 走过），所以第一次实现是去证明它，而不是假设它。
+- **gravity 的摊位在 `.auth(...)` 旁边声明 `.storage(...)`，注册工作就这些——2026-10-30 已证**：induction 载体的 schema 块第一次就变成了 realm 里的 plan（`.storage()` 收的是 **collections 映射**，因为组装好的 schema 已经把它嵌在 `storage` 之下；再包一层就是"这个类型什么也没声明"）。`Engine::register` 内省 guest、持久化 schema（并在途中分配该类型的 ns），realm 从这份持久化副本构建 plan，因此它活过重启。
+- **一个类型只有一个 ns，所以类型内的 collection 必须带键判别位**（实测，aura ADR-0026 的形状）：`store_exec` 对每个 collection 都用 `plan.ns` 建集合、只编码声明的键字段，于是两个用相同 `id` 的 collection 写的是**同一行**——后写的静默覆盖先写的，读回来是另一个表的名字下的这套字段。gravity 的表因此把键定成 `[kind, id]`（`settings` = 1，`models` = 2）。将来加第三张表必须取新的 kind；在任何摊位里想加第二个 collection，都应该先假设这个坑还在。
 - **池化变成一次表编辑，而不是一次部署。** 权重与亲和性是数据；选择规则是代码，且归 gravity。
 - **CLI 走数据模式，两种模式由调用方选择。** `protocol: fluxen` 画图（帧，槽位由调用方声明）；delta 消费者自己声明 chunk 以哪个事件说话，而场馆下行会剥掉 `view:` 标记（prism ADR-0017），所以 CLI 看到的就是它本来就在说的裸名字。两种模式不是两套实现：一次 turn，两种呈现（ADR-0009）。
 - **turn 寻址设备，永远不是 channel。** 传输面只知道设备与用户（prism ADR-0018）；channel 是应用自己的业务，而这个应用没有——没有群聊，两个用户之间甚至不直接对话。turn 回答提出请求的那台设备；摊位自己发出的载荷不带 `sender`，因为场馆会把发送者从它自己事件的扇出里排除。
