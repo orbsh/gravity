@@ -79,7 +79,7 @@ fn view_of(args: &Value) -> Option<View> {
 fn frame_text_region(text: &str) -> Value {
     json!({
         "action": "set",
-        "event": text,
+        "slot": text,
         "data": {"type": "text", "bind": {"value": {"kind": "default", "default": ""}}},
     })
 }
@@ -89,7 +89,7 @@ fn frame_text_region(text: &str) -> Value {
 fn frame_answer_bubble(rack: &str, text: &str) -> Value {
     json!({
         "action": "append",
-        "event": rack,
+        "slot": rack,
         "data": {
             "type": "case",
             "attrs": {"class": ["nogrow", "as-stretch", "box", "border", "round", "shadow"]},
@@ -105,7 +105,7 @@ fn frame_answer_bubble(rack: &str, text: &str) -> Value {
 fn frame_ask_bubble(rack: &str, ask: &str) -> Value {
     json!({
         "action": "append",
-        "event": rack,
+        "slot": rack,
         "data": {
             "type": "case",
             "attrs": {
@@ -124,7 +124,7 @@ fn frame_ask_bubble(rack: &str, ask: &str) -> Value {
 fn frame_chunk(text: &str, chunk: &str) -> Value {
     json!({
         "action": "patch",
-        "event": text,
+        "slot": text,
         "path": "/bind/value/default",
         "op": "append",
         "value": chunk,
