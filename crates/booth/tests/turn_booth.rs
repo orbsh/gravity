@@ -1508,6 +1508,30 @@ async fn a_fresh_deployment_is_configured_through_its_own_door() {
         events.contains(&"ui:gravity-model.error".to_string()),
         "and a refusal is too: {events:?}"
     );
+    // The fact above is for programs. A person only ever sees the renderer's tree, and a non-list
+    // payload lands in a slot nobody binds — so the same refusal also rides into the notice area as
+    // a row.
+    let said = seen
+        .events()
+        .iter()
+        .rev()
+        .find(|envelope| envelope["name"] == "ui:gravity-model.notice")
+        .and_then(|envelope| envelope["data"].as_array().cloned())
+        .expect("a refusal says a line on screen too");
+    assert_eq!(said.len(), 1, "one line per refusal: {said:?}");
+    assert_eq!(said[0]["action"], "append", "{said:?}");
+    assert_eq!(said[0]["slot"], "notice", "{said:?}");
+    assert!(
+        said[0]["data"]["id"].as_str().is_some(),
+        "a row without an id is a row the renderer refuses: {said:?}"
+    );
+    let line = said[0]["data"]["children"][0]["bind"]["value"]["default"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        line.contains("memory_scope"),
+        "the line names what was wrong: {line}"
+    );
 }
 
 
@@ -1533,6 +1557,26 @@ fn screen_frames(seen: &Seen) -> Vec<Value> {
         })
         .next_back()
         .unwrap_or_default()
+}
+
+/// The rack bound to a source, wherever a tree hides it — the notice area is a sibling of the forms,
+/// and a screen is a tree, so the test asks for the container by what it reads rather than by path.
+fn rack_reading(node: &Value, source: &str) -> Option<Value> {
+    let reads = node
+        .get("bind")
+        .and_then(|b| b.get("value"))
+        .and_then(|v| v.get("source"))
+        .and_then(Value::as_str)
+        == Some(source);
+    if node.get("type").and_then(Value::as_str) == Some("rack") && reads {
+        return Some(node.clone());
+    }
+    for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
+        if let Some(found) = rack_reading(child, source) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Every `form` node under a tree, depth first: the screen nests its forms in a case, so the test
@@ -1588,6 +1632,14 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
         .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
         .collect();
     assert_eq!(forms.len(), 2, "one form per table: {forms:?}");
+    let notice = rack_reading(&frames[0]["data"], "notice")
+        .expect("the screen floats a notice area: a refusal has to reach a person, not only a log");
+    assert_eq!(notice["attrs"]["view"]["layout"], "exclusive", "{notice}");
+    assert_eq!(notice["attrs"]["view"]["play"], "rotate", "{notice}");
+    assert_eq!(
+        notice["attrs"]["view"]["scroll"], "none",
+        "an area with one line in it does not scroll: {notice}"
+    );
     let (models, settings) = (&forms[0], &forms[1]);
     assert_eq!(field_default(models, "collection"), "models");
     assert_eq!(field_default(settings, "collection"), "settings");

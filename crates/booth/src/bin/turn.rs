@@ -216,6 +216,10 @@ const SAVED_EVENT: &str = "ui:gravity-model.saved";
 /// A save this booth refused, said the same way (the failure is a value, ADR-0012).
 const SAVE_REFUSED_EVENT: &str = "ui:gravity-model.error";
 
+/// The ops that put a line in the notice area. Its own name — the venue's `ui:notice` speaks a map
+/// and lands in that slot as a whole value, which is a different shape from a row append.
+const NOTICE_EVENT: &str = "ui:gravity-model.notice";
+
 /// Where the frames go when the caller asked for the view protocol. THE CALLER DECLARES
 /// THEM (gravity does not own a layout, so it cannot know a slot's name): `slots.rack` is
 /// the list the turn appends to, `slots.text` the region the answer streams into.
@@ -790,31 +794,23 @@ fn mounts_of(args: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// Where a deployment's configuration is ASKED FOR: the caller names the slot (gravity owns no
-/// layout — the same rule the turn's frames live under), and this booth answers with the screen
-/// ADR-0007 §4 promised — a form per table, whose buttons emit the save event above.
-const MODEL_EVENT: &str = "ui:gravity-model";
-
-/// What the screen ANSWERS with. Never [`MODEL_EVENT`]: that is the request, this booth is
-/// subscribed to it, and answering under the same name makes the booth hear its own answer —
-/// measured, not feared: `ui:gravity-model` emitted 616 times for one click before the shape was
-/// split. The renderer does not care about the name (it draws whatever arrives); a program that
-/// wants the frames listens under this one.
+/// What the screen ANSWERS with. Never the request (`ui:gravity-model`, registered in `lib.rs`):
+/// this booth is subscribed to that one, and answering under the same name makes it hear its own
+/// answer — measured, not feared: `ui:gravity-model` emitted 616 times for one click before the
+/// shape was split. The renderer does not care about the name (it draws whatever arrives); a
+/// program that wants the frames listens under this one.
 const SCREEN_EVENT: &str = "ui:gravity-model.screen";
-
-/// THE EVENT A RENDERER'S CONNECTION IS: prism says `ui:connect` and forwards whatever an
-/// application answers (ADR-0017 §8 — the layout is data on the wire, and the booth that owns the
-/// logic is the one that draws it).
-const CONNECT_EVENT: &str = "ui:connect";
 
 /// What this booth ANSWERS with. Not `ui:connect`: that is the fact about a connection, and
 /// answering it under its own name is a loop — the booth is subscribed to it.
 const LAYOUT_EVENT: &str = "ui:layout";
 
-/// The shell: one `create` frame — a heading, the one control that opens management, and the rack
-/// the screen's forms land in. fluxen renders a bare button as nothing (a button IS a form's
-/// submit), so the control is a form with no fields: clicking it submits `{}` to `gravity-model`,
-/// which is exactly what the venue turns into `ui:gravity-model` with this device as the sender.
+/// The shell: one `create` frame — a heading, the one control that opens management, the empty space
+/// a screen's forms fill, and the notice area that floats above both. A renderer's connection is the
+/// event this answers (prism says `ui:connect` and forwards whatever an application answers, ADR-0017
+/// §8 — the layout is data on the wire). fluxen renders a bare button as nothing (a button IS a
+/// form's submit), so the control is a form with no fields: clicking it submits `{}` to
+/// `gravity-model`, which the venue turns into `ui:gravity-model` with this device as the sender.
 fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
     // THE ANSWER IS THE ACTION LIST ITSELF, never a `{frames: [...]}` wrapper: prism forwards an
@@ -860,10 +856,60 @@ fn frame_root(forms: Vec<Value>) -> Value {
                         "attrs": {"class": ["main", "box", "border", "round", "scrolly", "gap"], "scroll": true},
                         "children": forms,
                     },
+                    frame_notice(),
                 ],
             }],
         },
     })
+}
+
+/// THE SLOT WHERE THE DEPLOYMENT SPEAKS TO THE PERSON: one line at a time, floating above the
+/// screen, gone when nobody is looking. The frame carries no lifetime — how long a line stays, how
+/// it enters, whether it turns over, and what holds it still are the RENDERER's business (rack's
+/// `view`, ADR 0022). The venue only says the line.
+const NOTICE_SLOT: &str = "notice";
+
+fn frame_notice() -> Value {
+    json!({
+        "type": "float",
+        "attrs": {"class": ["toast"]},
+        "children": [{
+            "type": "rack",
+            "attrs": {"view": {
+                "layout": "exclusive",
+                "enter": "fade",
+                "scroll": "none",
+                "play": "rotate",
+                "every": 6000,
+                "pause": "click",
+            }},
+            "bind": {"value": {"kind": "source", "source": NOTICE_SLOT}},
+        }],
+    })
+}
+
+/// One line into the notice area. A row id is required by the vocabulary (the renderer rejects a
+/// duplicate), and it has to be unique across the guests that speak — a fresh process per turn — so
+/// the id is the clock, not a counter.
+fn say_notice(rows: &mut Vec<Value>, message: &str) -> anyhow::Result<()> {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    rows.push(json!({
+        "action": "append",
+        "slot": NOTICE_SLOT,
+        "data": {
+            "id": format!("notice-{at}"),
+            "type": "case",
+            "attrs": {"class": ["box", "border", "round", "shadow", "gap"]},
+            "children": [{
+                "type": "text",
+                "bind": {"value": {"kind": "default", "default": message}},
+            }],
+        },
+    }));
+    Ok(())
 }
 
 /// The screen: two forms, one per table, prefilled with what the rows hold today (an unconfigured
@@ -1020,6 +1066,13 @@ fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
                 device.as_deref(),
                 json!({ "detail": detail }),
             );
+            // THE PERSON SEES IT TOO. The fact above is for programs; a page that only got that sees
+            // nothing at all (prism injects a non-list payload into a slot nobody binds). So the same
+            // refusal rides into the notice slot as a row — the door says the line, the renderer
+            // decides how long it stays on screen.
+            let mut rows = Vec::new();
+            let _ = say_notice(&mut rows, &detail)
+                .and_then(|()| emit(ctx, NOTICE_EVENT, device.as_deref(), json!(rows)));
             Err(error)
         }
     }
