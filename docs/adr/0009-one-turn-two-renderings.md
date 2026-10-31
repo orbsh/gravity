@@ -47,3 +47,18 @@ The turn's behaviour does not change with its audience: it fetches the projectio
 ## Related records
 
 ADR-0001 (the execution surface), ADR-0002 (the CLI is a client of the venue, with exit codes as a contract), ADR-0007 (the configuration a turn reads), ADR-0008 (a cancelled turn renders like any other end), ADR-0012 (failure is a value). prism ADR-0017 (the marker, added and stripped by the venue) and prism `docs/MODELING.md` (the model this instance follows: an application is a view, and a program is a client of the same wire).
+
+## Update — 2026-10-31: an event-routed submit reads no return value, so its end is said
+
+The data mode's terminal was "the handler's return value", and that holds only for a caller that
+INVOKES. The path a page and a CLI actually use is an event: `ui:turn.submit` reaches the booth by
+subscription, and a delivery discards what the body returns — so a data-mode consumer saw its
+`delta`s and then nothing at all, forever.
+
+Measured on the whole stack (prism's `turn_invoke_skill`, which now submits `ui:turn.submit` through
+the venue): one `turn.delta` carrying the answer, and no terminal until the turn booth was changed
+to say it. The rule is therefore keyed on the DELIVERY, not on the protocol: when the turn is
+reached by an event (the envelope carries a `name`), its end is EMITTED — `ui:turn.done` or
+`ui:turn.error` — and a direct caller (iterate/call, argument-value shaped, no envelope) still reads
+the terminal value exactly as this record states. Nothing else moves: the two modes are still the
+caller's choice, and the end is still not a second implementation.

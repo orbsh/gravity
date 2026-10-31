@@ -358,17 +358,20 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
         .get("protocol")
         .and_then(Value::as_str)
         .is_some_and(|protocol| protocol == "fluxen");
+    // AN EVENT-ROUTED SUBMIT HAS NO ANSWER IT CAN READ: a delivery discards a return value, so its
+    // end is SAID, not returned. A direct caller (iterate/call — no envelope `name`) still reads the
+    // terminal value, which is what ADR-0009 states for the data protocol. The drawing caller is
+    // always event-routed, and it needs the end regardless: its submit was an emit.
+    let said = drawing || envelope.get("name").is_some();
     match turn(ctx, args, device.as_deref()) {
         Ok(reply) => {
-            // The page has no other end-of-turn signal: its submit was an EMIT, so there
-            // is no answer it can read.
-            if drawing {
+            if said {
                 emit(ctx, DONE_EVENT, device.as_deref(), json!({}))?;
             }
             Ok(json!({ "done": true, "value": { "reply": reply } }))
         }
         Err(error) => {
-            if drawing {
+            if said {
                 let detail = format!("{error:#}");
                 let _ = emit(ctx, ERROR_EVENT, device.as_deref(), json!({ "detail": detail }));
             }

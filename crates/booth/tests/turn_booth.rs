@@ -2,7 +2,7 @@
 //! the provider as a sibling guest, one realm, and the venue's own wire as the output.
 //!
 //! The shape under test is the one prism serves: the venue emits `ui:turn.submit` with an
-//! envelope (`{name, channel_id, sender, args}`), the turn runs to its end inside one
+//! envelope (`{name, device, sender, data}`), the turn runs to its end inside one
 //! handler call, and every chunk it draws is its OWN emit — nothing pulls, so a pull face
 //! that stopped existing cannot break the turn. The LLM wire is stubbed by a local SSE
 //! server, the memory seam rides a real mem-server, and a compiled collector booth
@@ -1176,5 +1176,191 @@ async fn a_turn_without_a_settings_row_names_what_is_missing() {
     assert!(
         failure.contains("default_model"),
         "and the model the settings must point at: {failure}"
+    );
+}
+
+// ── The task loop: a task opened in one turn is the next turn's starting point ────────────────
+//
+// k10r ADR-0021 · ADR-0004's task group, from this side of the seam. What is real: k10r's
+// mem-server, both guests, the realm. What is stubbed: the model — an SSE server that opens a task
+// once and then REFUSES to answer any later round unless the prompt it was handed already carries
+// the work.
+//
+// The assertion is on the MODEL's view, not on a store read and not on a log line: a store that
+// holds a task nobody is told about is the failure this feature exists to end, and only the body
+// the model receives can tell "the task is stored" from "the task is KNOWN".
+
+const TASK: &str = "ship-the-face-change";
+const NEXT: &str = "read the diff before the split";
+
+/// Does any SYSTEM message carry this text? The owed-work block rides a system message beside the
+/// store's rendered memory, so that is where a client-side promise would have to show up.
+fn saw_system(parsed: &Value, needle: &str) -> bool {
+    parsed["messages"]
+        .as_array()
+        .map(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "system"
+                    && message["content"]
+                        .as_str()
+                        .map(|content| content.contains(needle))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// The stub's way of failing a turn that forgot the work: an HTTP 500, which the provider reports
+/// as the turn's error — so the reason lands in the failure text instead of in a log nobody reads.
+fn refusal(why: &str) -> axum::response::Response {
+    axum::response::Response::builder()
+        .status(500)
+        .body(axum::body::Body::from(why.to_string()))
+        .unwrap()
+}
+
+/// The model, as a stub: round 0 opens a task and stops, round 1 ends that turn, and every later
+/// round is a NEW turn that refuses to answer unless its prompt knows the work.
+async fn sse_server_tasks() -> (String, Arc<std::sync::Mutex<Vec<Value>>>) {
+    let seen: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let rounds = Arc::new(std::sync::Mutex::new(0usize));
+    let recorder = seen.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move |request: axum::extract::Request| {
+            let seen = recorder.clone();
+            let rounds = rounds.clone();
+            async move {
+                let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                let index = {
+                    let mut n = rounds.lock().unwrap();
+                    let index = *n;
+                    *n += 1;
+                    index
+                };
+                seen.lock().unwrap().push(parsed.clone());
+
+                let open = json!({"choices": [{"delta": {"tool_calls": [{
+                    "id": "c0",
+                    "type": "function",
+                    "function": {
+                        "name": "open_task",
+                        "arguments": json!({ "name": TASK, "next": NEXT }).to_string(),
+                    }
+                }]}}]});
+                let say = |text: &str| json!({"choices": [{"delta": {"content": text}}]});
+
+                let payload = match index {
+                    0 => open,
+                    // The round after the tool call: the door's answer came back, so this turn may
+                    // end.
+                    1 => say("opened it"),
+                    // Turn 2, first round: the task must already be in view.
+                    2 => {
+                        if !saw_system(&parsed, TASK) || !saw_system(&parsed, "open") {
+                            return refusal("turn 2's prompt never carried the open task");
+                        }
+                        if !saw_system(&parsed, NEXT) {
+                            return refusal("turn 2's prompt lost the next action");
+                        }
+                        say("still open")
+                    }
+                    // Turn 3, first round: the task moved to `doing` in between.
+                    3 => {
+                        if !saw_system(&parsed, "doing") {
+                            return refusal("turn 3's prompt dropped the work in progress");
+                        }
+                        say("in flight")
+                    }
+                    _ => say(""),
+                };
+
+                let sse = format!("data: {payload}\n\ndata: [DONE]\n\n");
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+/// Three turns in one session: the third one exists because the first prompt asked the store for
+/// `state=open` only, so moving a task to `doing` dropped the work actually in flight out of view —
+/// the one kind of work the agent then could not see.
+#[tokio::test]
+async fn a_task_opened_in_one_turn_is_the_next_turns_starting_point() {
+    let (endpoint, bodies) = sse_server_tasks().await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+
+    // Turn 1: the model opens a task through its own door.
+    let first = run_turn(
+        &engine,
+        &seen,
+        turn_args("remember this work: ship the face change"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.join(""), "opened it");
+
+    // The door really wrote it: a vertex in the fact graph plus its sheet.
+    let url = format!("{store_url}/tasks/37?state=open");
+    let open: Value = tokio::task::spawn_blocking(move || {
+        ureq::get(&url)
+            .call()
+            .expect("the task door answers")
+            .into_json::<Value>()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let tasks = open.as_array().expect("a list of tasks");
+    assert_eq!(tasks.len(), 1, "one task was opened: {open}");
+    assert_eq!(tasks[0]["name"], TASK);
+    assert_eq!(tasks[0]["next"], NEXT);
+    assert_eq!(tasks[0]["state"], "open");
+    let id = tasks[0]["node_id"].as_u64().expect("a node id");
+
+    // Turn 2: nothing was said about the task here, so the only way the stub can see it is k10r's
+    // list reaching the prompt.
+    let second = run_turn(&engine, &seen, turn_args("what am I working on?"))
+        .await
+        .unwrap();
+    assert_eq!(second.join(""), "still open");
+
+    // Turn 3: the task moves to `doing` between turns — what a model does when it starts the work —
+    // and the prompt must still carry it.
+    let move_url = format!("{store_url}/tasks/37/{id}/move");
+    tokio::task::spawn_blocking(move || {
+        ureq::post(&move_url)
+            .send_json(json!({ "state": "doing" }))
+            .expect("the move door answers");
+    })
+    .await
+    .unwrap();
+    let third = run_turn(&engine, &seen, turn_args("keep going"))
+        .await
+        .unwrap();
+    assert_eq!(third.join(""), "in flight");
+
+    // And the reason to read the bodies at all: four real inference requests, and the task was not
+    // in the prompt that created it.
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        4,
+        "two rounds for turn 1, one each for turns 2 and 3"
+    );
+    assert!(
+        !saw_system(&bodies[0], TASK),
+        "turn 1 opened the task, so it could not have been in its own prompt"
     );
 }
