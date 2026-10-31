@@ -51,6 +51,21 @@ pub struct VenueConfig {
     pub username: String,
     /// The env var NAME holding the password.
     pub password_env: String,
+    /// The venue's mount table (ADR-0001 §7): which mount type serves which operation language.
+    /// Optional — a client that runs no code omits it, and `invoke_skill` then refuses by name
+    /// ("no mount serves `python` here") instead of guessing.
+    #[serde(default)]
+    pub mounts: Option<Vec<MountEntry>>,
+}
+
+/// One entry of the venue's mount table, spelled as the turn carries it.
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct MountEntry {
+    /// The operation language the mount runs (`python`, `nushell`, …).
+    pub language: String,
+    /// The mount's type name in the venue.
+    #[serde(rename = "type")]
+    pub type_name: String,
 }
 
 impl GravityConfig {

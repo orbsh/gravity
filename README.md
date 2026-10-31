@@ -21,7 +21,7 @@ Stateless between turns: no resident loop, no session state in memory. Compressi
 ## Layout
 
 - `crates/core` — turn executor: memory surface seam (in-process / HTTP), LLM loop, tool-call dispatch, SSE streaming
-- `crates/cli` — the venue client: one command = one call over prism's WS turn verbs (`turn.submit` / `turn.delta`* / `turn.done` / `turn.cancel`), no REPL, no client-side session state (ADR-0002)
+- `crates/cli` — the venue client: one command = one call over the venue's own wire (`ui:turn.submit` out; `turn.delta`* / `turn.done` / `turn.error` back, marker stripped by the venue), no REPL, no client-side session state (ADR-0002)
 - `crates/booth` — Aura Booth binding: one turn event per execution (the turn runs here, in the venue)
 
 The turn function is ONE implementation (`crates/core`), executed by the booth. The CLI does not run it: it submits to the venue like any other client, so there is no second driver — a FaaS driver (same function, another host) stays deferred.
@@ -34,7 +34,7 @@ gravity [--json] [--session <id>] [--venue <ws-url>] [--cancel-after-ms <n>] <te
 
 One argument = one turn (`-` reads stdin as ONE turn); `--json` prints one
 object per turn for scripts, the default streams the deltas as they arrive.
-Ctrl-C — or `--cancel-after-ms` — sends `turn.cancel`, the venue's own verb,
+Ctrl-C — or `--cancel-after-ms` — sends `ui:turn.cancel` as an event,
 rather than dropping a turn behind a dead socket. Exit codes: 0 done, 2
 usage/config, 3 auth, 4 the turn failed, 5 venue unreachable.
 

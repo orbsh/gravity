@@ -82,7 +82,7 @@ async fn serve(
                     .await?;
                 }
             }
-            "turn.submit" => match mode {
+            "ui:turn.submit" => match mode {
                 Mode::TurnError => {
                     send(
                         &mut ws,
@@ -115,7 +115,7 @@ async fn serve(
                     .await?;
                 }
             },
-            "turn.cancel" => {
+            "ui:turn.cancel" => {
                 send(
                     &mut ws,
                     json!({ "ev": "turn.cancel.result", "args": { "ok": true } }),
@@ -154,7 +154,14 @@ fn run_cli(venue_url: &str, args: &[&str]) -> Output {
     std::fs::write(
         &config,
         serde_json::to_string(&json!({
-            "venue": { "url": venue_url, "username": "alice", "password_env": "GRAVITY_TEST_PW" }
+            "venue": {
+                "url": venue_url,
+                "username": "alice",
+                "password_env": "GRAVITY_TEST_PW",
+                // The venue's mount table, as its manifest declares it (ADR-0001 §7). It rides the
+                // call, so the fake venue can assert it arrived unchanged.
+                "mounts": [{ "language": "python", "type": "runner_py" }]
+            }
         }))
         .unwrap(),
     )
@@ -183,15 +190,52 @@ fn one_command_is_one_turn_per_argument() {
         assert_eq!(value["session"], "1");
     }
     let frames = seen.lock().unwrap().clone();
+    let submits: Vec<&Value> = frames
+        .iter()
+        .filter(|f| f["ev"] == "ui:turn.submit")
+        .collect();
+    assert_eq!(submits.len(), 2, "two submits");
+    // The payload a page would send: the conversation, who is speaking, the text, the event its
+    // chunks are spoken as on the PLANE, and the venue's mount table.
+    let args = &submits[0]["args"];
+    assert_eq!(args["channel_id"], 1, "the default channel: {args}");
+    assert_eq!(args["member_id"], 1, "{args}");
+    assert_eq!(args["user_message"], "hello", "{args}");
+    assert_eq!(args["event"], "ui:turn.delta", "{args}");
     assert_eq!(
-        frames.iter().filter(|f| f["ev"] == "turn.submit").count(),
-        2,
-        "two submits"
+        args["mounts"],
+        json!([{ "language": "python", "type": "runner_py" }]),
+        "the mount table rides the call: {args}"
     );
     assert_eq!(
         frames.iter().filter(|f| f["ev"] == "signup").count(),
         1,
         "one signup, after the login was refused"
+    );
+}
+
+/// `--session` is the conversation and `--member` is who speaks in it: both ride the call, and a
+/// session that is not a channel id is refused before anything is sent.
+#[test]
+fn the_conversation_and_the_speaker_ride_the_call() {
+    let (url, seen) = venue(Mode::Happy);
+    let out = run_cli(&url, &["--session", "9", "--member", "3", "hi"]);
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let frames = seen.lock().unwrap().clone();
+    let submit = frames
+        .iter()
+        .find(|f| f["ev"] == "ui:turn.submit")
+        .expect("one submit");
+    assert_eq!(submit["args"]["channel_id"], 9, "{submit}");
+    assert_eq!(submit["args"]["member_id"], 3, "{submit}");
+
+    // A session that is not a channel id never reaches the socket: usage failure, exit 2.
+    let (url, seen) = venue(Mode::Happy);
+    let out = run_cli(&url, &["--session", "not-a-number", "hi"]);
+    assert_eq!(out.status.code(), Some(2), "a bad id is a usage failure");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "nothing was sent to the venue"
     );
 }
 
@@ -223,7 +267,7 @@ fn cancel_sends_the_venue_verb_and_ends_the_turn() {
     assert_eq!(out.status.code(), Some(4));
     let frames = seen.lock().unwrap().clone();
     assert_eq!(
-        frames.iter().filter(|f| f["ev"] == "turn.cancel").count(),
+        frames.iter().filter(|f| f["ev"] == "ui:turn.cancel").count(),
         1,
         "the client cancelled through the protocol, not by dropping the socket"
     );
