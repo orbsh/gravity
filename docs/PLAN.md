@@ -195,3 +195,5 @@ Deferred gates:
 
 - FaaS driver: same execution function on serverless platforms — only after the Aura Booth path is stable; no new code, just another driver of the function.
 - Multi-model routing: model selection per turn/session — after the single-model path is proven; LLM identity stays Gravity-side (cache binding), Krystallizer never learns it.
+
+THE UI MARKER IS `ui:` 2026-10-31 (prism ADR-0017's Update is the record): the turn booth declares `ui:turn.submit` and emits `ui:turn.done` / `ui:turn.error`; the auth map names `ui:turn.submit`. The rule did not change, only the word — `view` named three different things in this stack. Any `view:<name>` in this repo's ADRs and in the entries above reads `ui:<name>`.

@@ -9,7 +9,7 @@
 //!   pull, `done: true` closes. Key custody: the key is read from the
 //!   env var NAMED in the args (the value never in the module or args).
 //! - `gravity-turn` — the turn booth: ONE handler (`turn`) the venue reaches by
-//!   subscription (`view:turn.submit`). It fetches the session projection from
+//!   subscription (`ui:turn.submit`). It fetches the session projection from
 //!   mem-server (HTTP — the booth's own code decides its access method, ADR-0031),
 //!   opens the provider stream through the ctx iterate arms (ADR-0034 — the
 //!   provider is a sibling citizen, not gravity-internal plumbing), emits every
@@ -85,7 +85,7 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 // The instance key is the ASKING DEVICE (prism ADR-0018: the transport
                 // knows devices and users; a channel is an application's business). One
                 // device, one turn at a time.
-                .on_as("view:turn.submit", "device", "turn"),
+                .on_as("ui:turn.submit", "device", "turn"),
         )
         .await?;
     Ok(())

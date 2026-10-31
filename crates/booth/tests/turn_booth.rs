@@ -1,12 +1,12 @@
 //! The booth binding contract (PLAN Phase 4): the turn execution as a Rust guest process,
 //! the provider as a sibling guest, one realm, and the venue's own wire as the output.
 //!
-//! The shape under test is the one prism serves: the venue emits `view:turn.submit` with an
+//! The shape under test is the one prism serves: the venue emits `ui:turn.submit` with an
 //! envelope (`{name, channel_id, sender, args}`), the turn runs to its end inside one
 //! handler call, and every chunk it draws is its OWN emit — nothing pulls, so a pull face
 //! that stopped existing cannot break the turn. The LLM wire is stubbed by a local SSE
 //! server, the memory seam rides a real mem-server, and a compiled collector booth
-//! subscribed to the `view:` prefix is the renderer's stand-in.
+//! subscribed to the `ui:` prefix is the renderer's stand-in.
 //!
 //! What is pinned:
 //!
@@ -49,7 +49,7 @@ fn turn_bin() -> String {
     env!("CARGO_BIN_EXE_gravity-turn").to_string()
 }
 
-/// What the collector booth saw: the `data` payload of every `view:` emit, in arrival
+/// What the collector booth saw: the `data` payload of every `ui:` emit, in arrival
 /// order. The renderer's stand-in — a compiled body, because a script would need the frame
 /// vocabulary to say what it observed.
 #[derive(Clone, Default)]
@@ -212,7 +212,7 @@ async fn boot_bare() -> (Engine, Seen) {
             BoothType::script(TURN_TYPE, "induction", turn_bin())
                 // The venue's own word for "run a turn", exactly as `register` declares it:
                 // the entry is `turn`, the address field is the envelope's `channel_id`.
-                .on_as("view:turn.submit", "device", "turn"),
+                .on_as("ui:turn.submit", "device", "turn"),
         )
         .await
         .unwrap();
@@ -234,10 +234,10 @@ async fn boot_bare() -> (Engine, Seen) {
             // TWO ROUTES: the prefix every UI-facing emit uses (the renderer's declaration,
             // prism's `install`) and the data event this fixture's callers name — a booth
             // sees exactly what it declared, and the data protocol is a DIFFERENT event, not
-            // a `view:` one.
+            // a `ui:` one.
             receives: vec![
                 ReceiveDecl {
-                    event: "view:*".into(),
+                    event: "ui:*".into(),
                     entry: None,
                     resolution: RouteResolution::Singleton,
                     wildcard: true,
@@ -1027,7 +1027,7 @@ async fn the_review_branch_writes_the_facts_it_found() {
     );
 }
 
-/// THE VENUE ROUTE, which is the one a page actually uses: `view:turn.submit` with an
+/// THE VENUE ROUTE, which is the one a page actually uses: `ui:turn.submit` with an
 /// envelope reaches the booth by subscription, the turn draws without anyone pulling, the
 /// frames are addressed to the device the envelope named, and the end is said as its own
 /// event.
@@ -1041,9 +1041,9 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
     Realm::emit(
         &engine.realm,
         None,
-        "view:turn.submit",
+        "ui:turn.submit",
         json!({
-            "name": "view:turn.submit",
+            "name": "ui:turn.submit",
             "device": device,
             "sender": { "device": device },
             "data": view_args("hi"),
@@ -1053,11 +1053,11 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
     .unwrap();
 
     // The end is the signal this leg has: the page's submit was an emit, so it cannot read
-    // an answer — `view:turn.done` is what stops its streaming state.
+    // an answer — `ui:turn.done` is what stops its streaming state.
     let mut done = None;
     for _ in 0..300 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        done = seen.all("view:turn.done").into_iter().next();
+        done = seen.all("ui:turn.done").into_iter().next();
         if done.is_some() {
             break;
         }
@@ -1069,12 +1069,12 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
     // fan-out, so naming the asker there would send the answer to everyone but the asker.
     //
     // The collector subscribes to the prefix, so it also sees the page's own request
-    // (`view:turn.submit`) — that one is the input, not the booth's speech, and the venue
+    // (`ui:turn.submit`) — that one is the input, not the booth's speech, and the venue
     // drops it from the fan-out because it names a sender.
     let emits: Vec<Value> = seen
         .events()
         .into_iter()
-        .filter(|event| event.get("name").and_then(Value::as_str) != Some("view:turn.submit"))
+        .filter(|event| event.get("name").and_then(Value::as_str) != Some("ui:turn.submit"))
         .collect();
     assert!(emits.len() >= 3, "frames + done: {emits:?}");
     for event in emits {
@@ -1091,19 +1091,19 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
             event
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|name| name.starts_with("view:")),
+                .is_some_and(|name| name.starts_with("ui:")),
             "a payload the venue can route names its recipient event: {event}"
         );
     }
     assert_eq!(
         done.get("name").and_then(Value::as_str),
-        Some("view:turn.done")
+        Some("ui:turn.done")
     );
 
     // The frames: the first batch sets the stage (question, region, bubble) and patches the
     // region; every batch is a list of Accrete operations the renderer can draw.
     let batches: Vec<Vec<Value>> = seen
-        .all("view:turn")
+        .all("ui:turn")
         .into_iter()
         .filter_map(|e| e.get("data").and_then(Value::as_array).cloned())
         .collect();

@@ -1,7 +1,7 @@
 //! The turn guest — an induction process: one turn per activation, start to end.
 //!
 //! `turn(args)` is a HANDLER, not a producer. The venue tells this booth what happened
-//! (`view:turn.submit`, the subscription registered beside it in `lib.rs`) and the booth
+//! (`ui:turn.submit`, the subscription registered beside it in `lib.rs`) and the booth
 //! says what it drew: every chunk is its own emit, and the handler's return value IS the
 //! turn's end. Nothing pulls this booth, so no state has to survive a call boundary — the
 //! whole turn is one call stack, and the statics a pull face needed are gone.
@@ -19,7 +19,7 @@
 //!    next turn). Gravity's clock IS the channel's time (krystallizer ADR-0008 §3).
 //!
 //! Failure is a value (ADR-0012): the handler's answer carries the error text, and a
-//! drawing caller is told on the same wire (`view:turn.error`) — but nothing is appended.
+//! drawing caller is told on the same wire (`ui:turn.error`) — but nothing is appended.
 //!
 //! Args (the envelope's `data`, or the flat call of a direct caller):
 //! `{"channel_id", "member_id", "user_message", "store_url", "endpoint", "model",
@@ -42,9 +42,9 @@ fn main() -> anyhow::Result<()> {
         // The per-handler auth declaration (prism's gate reads it): the turn needs a
         // bound user — the SAME declaration face the echo plane enforces, no second ACL
         // table. The key is the EVENT the venue's gate names (ADR-0045: a declaration
-        // binds an entry, so event and entry may differ — `view:turn.submit` here,
+        // binds an entry, so event and entry may differ — `ui:turn.submit` here,
         // `turn` there).
-        .auth(json!({ "view:turn.submit": true }))
+        .auth(json!({ "ui:turn.submit": true }))
         // ONE HANDLER. The venue's word for "run a turn" reaches this booth as a
         // subscription and the realm names the instance by the same address, so the
         // handler runs the turn to its end. There is no producer binding: a stream this
@@ -190,12 +190,12 @@ fn read_recipe(ctx: &mut Ctx, id: u64) -> anyhow::Result<Recipe> {
 
 /// Where a drawing turn puts its frames. One event for the whole turn: the frames carry
 /// their own slots, so the name is an address, not a destination.
-const VIEW_EVENT: &str = "view:turn";
+const UI_EVENT: &str = "ui:turn";
 /// A drawing turn's end, said as an event so the page can stop its streaming state
 /// without knowing a verb.
-const DONE_EVENT: &str = "view:turn.done";
+const DONE_EVENT: &str = "ui:turn.done";
 /// A drawing turn's failure, said the same way.
-const ERROR_EVENT: &str = "view:turn.error";
+const ERROR_EVENT: &str = "ui:turn.error";
 
 /// Where the frames go when the caller asked for the view protocol. THE CALLER DECLARES
 /// THEM (gravity does not own a layout, so it cannot know a slot's name): `slots.rack` is
@@ -331,7 +331,7 @@ fn frames_for(view: &View, first: Option<&str>, chunk: &str) -> Vec<Value> {
 
 /// The caller's payload, whichever way this booth was reached. A venue puts the caller's
 /// data under `data` and the speaker in `sender` (`{name, sender, data}` — prism ADR-0017's
-/// `view:` envelope); a direct caller (a test, a sibling booth) sends the args flat. The
+/// `ui:` envelope); a direct caller (a test, a sibling booth) sends the args flat. The
 /// hidden parameter is "who wrapped this", so unwrap once here instead of at every field.
 fn payload(envelope: &Value) -> &Value {
     envelope
@@ -688,7 +688,7 @@ fn stream_answer(
                 let ask = first
                     .then(|| turn.args.get("user_message").and_then(Value::as_str))
                     .flatten();
-                emit(ctx, VIEW_EVENT, device, json!(frames_for(view, ask, &delta)))?;
+                emit(ctx, UI_EVENT, device, json!(frames_for(view, ask, &delta)))?;
             }
             Out::Data(event) => emit(ctx, event, device, json!({ "delta": delta }))?,
         }
