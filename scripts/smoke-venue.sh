@@ -205,18 +205,93 @@ curl -sf -X POST "http://127.0.0.1:$MEM_PORT/skills/37" \
 grep -q '"created":true' "$ROOT/skill.json" || fail "the skill was not created: $(cat "$ROOT/skill.json")"
 echo "ok: a skill is declared for the resolver to find"
 
+# Only the TWO SPAWN SPECS are environment here: where the guest binaries live. The deployment
+# facts (store URL, model, endpoint, key env, memory scope) are ROWS in the turn type's namespace
+# now (gravity ADR-0007), written below through the application's own door — a gateway that served
+# this app learned no model vocabulary.
 PRISM_ADDR="127.0.0.1:$PRISM_PORT" PRISM_IDENTITY=open PRISM_DATA="$ROOT/prism-data" \
 GRAVITY_PROVIDER_BIN="$GRAVITY_REPO/target/debug/gravity-provider" \
 GRAVITY_TURN_BIN="$GRAVITY_REPO/target/debug/gravity-turn" \
-GRAVITY_STORE_URL="http://127.0.0.1:$MEM_PORT" \
-GRAVITY_ENDPOINT="http://127.0.0.1:$SSE_PORT/v1" \
-GRAVITY_MODEL="smoke-model" \
-GRAVITY_KEY_ENV="SMOKE_KEY" \
-GRAVITY_MEMORY_SCOPE=37 \
 SMOKE_KEY="smoke-key" \
     "$PRISM_REPO/target/debug/prism" >"$ROOT/prism.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_for "$PRISM_PORT" "prism gateway" || exit 1
+
+# THE DEPLOYMENT IS CONFIGURED THROUGH ITS OWN DOOR, not through prism: `ui:gravity-model.save` is
+# the application's event (gravity ADR-0007 §4), gated by the auth declaration prism reads. A fresh
+# venue has no settings row, and a turn on one refuses BY NAME — so this step is what makes the
+# CLI's turn possible at all, and a bad row here fails loudly instead of leaving a plausible error.
+cat > "$ROOT/configure.py" <<PY
+import asyncio
+import json
+import sys
+
+import websockets
+
+PORT, MEM, SSE, PASSWORD = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+ROWS = [
+    {
+        "collection": "models",
+        "id": 1,
+        "doc": {
+            "alias": "default",
+            "endpoint": f"{SSE}/v1",
+            "model": "smoke-model",
+            "key_env": "SMOKE_KEY",
+            "weight": 1,
+            "enabled": 1,
+        },
+    },
+    {
+        "collection": "settings",
+        "id": 1,
+        "doc": {
+            "store_url": MEM,
+            "memory_scope": 37,
+            "memory_format": "plaintext",
+            "default_model": 1,
+        },
+    },
+]
+
+
+async def frame(ws):
+    return json.loads(await asyncio.wait_for(ws.recv(), 15))
+
+
+async def main():
+    async with websockets.connect(f"ws://127.0.0.1:{PORT}/ws?protocol=json") as ws:
+        first = await frame(ws)
+        if first.get("ev") != "connected":
+            raise SystemExit(f"FAIL: the venue did not greet: {first}")
+        await ws.send(json.dumps({"ev": "login", "args": {"username": "smoke", "password": PASSWORD}}))
+        answer = await frame(ws)
+        if answer.get("ev") != "login.result":
+            await ws.send(
+                json.dumps({"ev": "signup", "args": {"username": "smoke", "password": PASSWORD}})
+            )
+            answer = await frame(ws)
+            if answer.get("ev") != "signup.result":
+                raise SystemExit(f"FAIL: neither login nor signup was accepted: {answer}")
+        for row in ROWS:
+            await ws.send(json.dumps({"ev": "ui:gravity-model.save", "args": row}))
+        seen = []
+        while len(seen) < len(ROWS):
+            answer = await frame(ws)
+            name = answer.get("ev")
+            if name == "gravity-model.error":
+                raise SystemExit(f"FAIL: the deployment refused a row: {answer}")
+            if name == "gravity-model.saved":
+                seen.append(answer["args"])
+        print("ok: the deployment is configured through its own door:", seen)
+
+
+asyncio.run(main())
+PY
+
+python3 "$ROOT/configure.py" "$PRISM_PORT" "http://127.0.0.1:$MEM_PORT" "http://127.0.0.1:$SSE_PORT" "smoke-pw" \
+    >"$ROOT/configure.out" 2>&1 || fail "configuring the deployment failed: $(cat "$ROOT/configure.out")"
+cat "$ROOT/configure.out"
 
 cat > "$ROOT/gravity.json" <<JSON
 { "venue": { "url": "ws://127.0.0.1:$PRISM_PORT", "username": "smoke", "password_env": "SMOKE_PW" } }

@@ -53,3 +53,26 @@ Custody is unchanged and it constrains the shape: the KEY VALUE never leaves the
 ## Related records
 
 ADR-0001 (the execution surface — the mount and the script as an argument), ADR-0002 (the client form), ADR-0004 (the fixed tool list), ADR-0009 (one turn, two renderings), gravity PLAN Phase 4.1's `NO PULL FACE` note (the turn is an event handler that draws, which is why a turn's facts can no longer ride a request a puller assembles). prism `docs/MODELING.md` (the model: an application IS a view, administration included — this record is its first worked instance). prism ADR-0017/0018 (the wire; devices, not channels). aura ADR-0026 (a type's storage plan comes from its persisted declaration) and aura ADR-0031/0034 (a booth's own code owns its access; the ctx is the cross-booth surface). k10r's `docs/SEAM.md` for what a turn reads from the memory store once it has the URL.
+
+## Update — 2026-10-31: the door exists, the screen does not
+
+§4 said the management face is a view, and the half that PERFORMS an administration act landed
+first: `ui:gravity-model.save`, declared with the turn (`on_as` in `gravity_booth::register`, handler
+`save` in the guest) and gated by the same auth declaration prism reads (`{"ui:gravity-model.save":
+true}`). Its payload is one row — `{collection: "settings"|"models", id, doc}` — and it writes it
+into this type's ns, refusing by name: a collection a deployment cannot configure, or a document
+missing a key the turn reads, comes back as `ui:gravity-model.error` with the keys listed. The
+answer is an EVENT (`ui:gravity-model.saved`), because a handler reached by an event has nothing to
+return to (ADR-0009's Update).
+
+Why the act came first: §4's model face is a screen, and a fresh deployment had no way to be
+configured at all — `scripts/smoke-venue.sh` handed prism the retired `GRAVITY_*` variables and a
+turn on a fresh venue refused with "no settings row". With the door, the smoke configures the
+deployment through the application's own event (a WS client, no admin verb) and then drives the real
+CLI; it passes end to end. What is still OWED is the screen: `ui:gravity-model` answering with a
+layout whose buttons emit exactly these events. The door is not a substitute for it — a layout is
+what makes the vocabulary discoverable — but it is the same vocabulary, so the screen has nothing
+left to decide.
+
+Also corrected here: §4 says `view:gravity-model`; since prism ADR-0017's Update the marker is `ui:`,
+so it reads `ui:gravity-model`.

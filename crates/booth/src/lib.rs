@@ -85,7 +85,12 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 // The instance key is the ASKING DEVICE (prism ADR-0018: the transport
                 // knows devices and users; a channel is an application's business). One
                 // device, one turn at a time.
-                .on_as("ui:turn.submit", "device", "turn"),
+                .on_as("ui:turn.submit", "device", "turn")
+                // WHERE A DEPLOYMENT IS CONFIGURED: the facts are rows in this type's ns, so the
+                // door that writes them is an event too (auth: `ui:gravity-model.save`). A venue
+                // never learns the word — this is the application's own vocabulary, as much as
+                // `ui:turn.submit` is.
+                .on_as("ui:gravity-model.save", "device", "save"),
         )
         .await?;
     Ok(())

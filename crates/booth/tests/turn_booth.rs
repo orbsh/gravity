@@ -212,7 +212,9 @@ async fn boot_bare() -> (Engine, Seen) {
             BoothType::script(TURN_TYPE, "induction", turn_bin())
                 // The venue's own word for "run a turn", exactly as `register` declares it:
                 // the entry is `turn`, the address field is the envelope's `channel_id`.
-                .on_as("ui:turn.submit", "device", "turn"),
+                .on_as("ui:turn.submit", "device", "turn")
+                // The configuration door, exactly as `register` declares it.
+                .on_as("ui:gravity-model.save", "device", "save"),
         )
         .await
         .unwrap();
@@ -388,6 +390,40 @@ async fn start_turn(engine: &Engine, args: Value) -> Result<(), String> {
     match v.get("value").and_then(Value::as_str) {
         Some(error) => Err(error.to_string()),
         None => Ok(()),
+    }
+}
+
+/// Drive one of the booth's other handlers directly (the test shape: flat args, no envelope) and
+/// return its failure text if it refused — the same seam `start_turn` uses, without the terminal
+/// shape a turn answers.
+async fn drive(engine: &Engine, handler: &str, args: Value) -> Result<(), String> {
+    let slot = Realm::iterate(
+        &engine.realm,
+        IterateOp::Start {
+            target: InstanceId {
+                booth_type: TURN_TYPE.into(),
+                key: InstanceKey::Named("s-door".into()),
+            },
+            handler: handler.into(),
+            args,
+        },
+    )
+    .await
+    .unwrap();
+    let rx = match slot {
+        CallSlot::Hot { rx, .. } => rx,
+        _ => panic!("iterate is hot-only"),
+    };
+    // Failure is a VALUE (ADR-0012): a refused handler answers a terminal shape whose `value` is
+    // the error text, so reading the reply alone would call a refusal a success.
+    match tokio::time::timeout(Duration::from_secs(30), rx).await {
+        Ok(Ok(Ok(value))) => match value.get("value").and_then(Value::as_str) {
+            Some(error) => Err(error.to_string()),
+            None => Ok(()),
+        },
+        Ok(Ok(Err(e))) => Err(e.to_string()),
+        Ok(Err(_)) => panic!("reply dropped"),
+        Err(_) => panic!("`{handler}` stalled for 30s"),
     }
 }
 
@@ -1362,5 +1398,110 @@ async fn a_task_opened_in_one_turn_is_the_next_turns_starting_point() {
     assert!(
         !saw_system(&bodies[0], TASK),
         "turn 1 opened the task, so it could not have been in its own prompt"
+    );
+}
+
+
+// ── The configuration door: a fresh deployment can be set up from OUTSIDE the process ─────────
+//
+// gravity ADR-0007 put the deployment facts in the type's own namespace as ROWS, which left a new
+// question the code answered only for in-process tests: how does a real deployment write them? The
+// answer this booth chose is the same one its turn chose — an EVENT, behind the auth declaration
+// prism's gate reads — so this test drives it exactly as a venue would, and then proves a turn
+// runs on rows nobody seeded in-process.
+
+#[tokio::test]
+async fn a_fresh_deployment_is_configured_through_its_own_door() {
+    let endpoint = sse_server(vec!["hel", "lo"]).await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot_bare().await;
+
+    // Before anyone configures it: the turn refuses BY NAME, and the name says what to write.
+    let failure = start_turn(&engine, turn_args("hi")).await.unwrap_err();
+    assert!(
+        failure.contains("no settings row"),
+        "a fresh deployment says which row is missing: {failure}"
+    );
+
+    // The door writes the model recipe first, because `settings` names it by id.
+    drive(
+        &engine,
+        "save",
+        json!({
+            "collection": "models",
+            "id": 1,
+            "doc": {
+                "alias": "default",
+                "endpoint": endpoint,
+                "model": "test-model",
+                "key_env": "GRAVITY_TEST_KEY",
+                "weight": 1,
+                "enabled": 1,
+            },
+        }),
+    )
+    .await
+    .expect("the model row is written");
+
+    drive(
+        &engine,
+        "save",
+        json!({
+            "collection": "settings",
+            "id": 1,
+            "doc": {
+                "store_url": store_url,
+                "memory_scope": 37,
+                "memory_format": "plaintext",
+                "default_model": 1,
+            },
+        }),
+    )
+    .await
+    .expect("the settings row is written");
+
+    // A BOOTH THAT REFUSES SAYS WHY, and refuses by name: a collection a deployment cannot
+    // configure is not a store API, and a partial document is caught here rather than by a turn
+    // that dies mid-flight.
+    let wrong = drive(
+        &engine,
+        "save",
+        json!({ "collection": "tasks", "id": 1, "doc": {} }),
+    )
+    .await
+    .unwrap_err();
+    assert!(wrong.contains("not a collection a deployment configures"), "{wrong}");
+
+    let partial = drive(
+        &engine,
+        "save",
+        json!({ "collection": "settings", "id": 2, "doc": { "store_url": "http://x" } }),
+    )
+    .await
+    .unwrap_err();
+    for key in ["memory_scope", "memory_format", "default_model"] {
+        assert!(partial.contains(key), "the refusal names `{key}`: {partial}");
+    }
+
+    // And now the deployment works, on rows that only ever came through the door.
+    let deltas = run_turn(&engine, &seen, turn_args("hi"))
+        .await
+        .expect("a configured deployment runs a turn");
+    assert_eq!(deltas.join(""), "hello");
+
+    // Both ends were SAID, not returned: the door has no answer a venue could read.
+    settle(&seen).await;
+    let events: Vec<String> = seen
+        .events()
+        .iter()
+        .filter_map(|frame| frame.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    assert!(
+        events.contains(&"ui:gravity-model.saved".to_string()),
+        "the save is answered as an event: {events:?}"
+    );
+    assert!(
+        events.contains(&"ui:gravity-model.error".to_string()),
+        "and a refusal is too: {events:?}"
     );
 }

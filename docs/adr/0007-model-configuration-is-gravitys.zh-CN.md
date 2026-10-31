@@ -53,3 +53,21 @@
 ## 相关记录
 
 ADR-0001（执行面——mount 与作为参数的脚本）、ADR-0002（客户端形态）、ADR-0004（固定工具表）、ADR-0009（一次 turn，两种渲染）、gravity PLAN Phase 4.1 的 `NO PULL FACE` 记录（turn 是画图的 event handler，这正是 turn 的事实不能再随某个 puller 组装的请求旅行的原因）。prism `docs/MODELING.md`（模型：应用本身就是视图，管理面包括在内——本记录是它的第一个落地实例）。prism ADR-0017/0018（线协议；设备，不是频道）。aura ADR-0026（类型的存储 plan 来自它已持久化的声明）与 aura ADR-0031/0034（摊位的代码自己决定访问方式；ctx 是跨摊位面）。一次 turn 拿到 URL 之后从记忆库读什么，见 k10r 的 `docs/SEAM.md`。
+
+## Update — 2026-10-31：门有了，屏幕还没有
+
+§4 说管理面是一个 view，而先落地的是「执行一个管理动作」的那一半：`ui:gravity-model.save`，与
+turn 一起声明（`gravity_booth::register` 里的 `on_as`，guest 里的处理器 `save`），并由 prism 读取
+的同一份 auth 声明把守（`{"ui:gravity-model.save": true}`）。它的载荷是一行——
+`{collection: "settings"|"models", id, doc}`——写进本类型的 ns，并按名拒绝：部署不能配置的集合、
+或缺少 turn 要读的键的文档，都回 `ui:gravity-model.error` 并列出缺的键。回答是一个 EVENT
+（`ui:gravity-model.saved`），因为经事件到达的处理器没有可返回的对象（ADR-0009 的 Update）。
+
+为什么先做动作：§4 的模型面是一块屏幕，而一个全新部署此前根本没有被配置的途径——
+`scripts/smoke-venue.sh` 给 prism 传的是已退役的 `GRAVITY_*` 变量，新场馆上的一次 turn 会以
+"no settings row" 拒绝。有了这道门，smoke 用应用自己的事件完成配置（一个 WS 客户端，没有 admin
+动词），然后驱动真的 CLI，端到端通过。仍然欠的是屏幕：`ui:gravity-model` 回答一份布局，其按钮发出的
+正是这些事件。门不是它的替代品——布局才让词汇可以被发现——但两者是同一套词汇，屏幕没有别的要决定。
+
+同时更正：§4 写的是 `view:gravity-model`；自 prism ADR-0017 的 Update 起标记是 `ui:`，故读作
+`ui:gravity-model`。

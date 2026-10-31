@@ -44,12 +44,17 @@ fn main() -> anyhow::Result<()> {
         // table. The key is the EVENT the venue's gate names (ADR-0045: a declaration
         // binds an entry, so event and entry may differ — `ui:turn.submit` here,
         // `turn` there).
-        .auth(json!({ "ui:turn.submit": true }))
+        .auth(json!({ "ui:turn.submit": true, "ui:gravity-model.save": true }))
         // ONE HANDLER. The venue's word for "run a turn" reaches this booth as a
         // subscription and the realm names the instance by the same address, so the
         // handler runs the turn to its end. There is no producer binding: a stream this
         // booth no longer owns is a stream nobody has to pull.
         .on("turn", |ctx: &mut Ctx, args: Value| run(ctx, &args))
+        // THE OTHER HANDLER: where a deployment is configured. The facts are rows in this type's
+        // ns (below), so something outside the process has to be able to write them — and this
+        // booth refuses an admin verb, so that door is an event like the turn's, behind the same
+        // auth declaration.
+        .on("save", |ctx: &mut Ctx, args: Value| save(ctx, &args))
         // THE TURN'S OWN STORAGE (ADR-0007): the deployment facts are rows in the field, in
         // this type's ns, so a venue that serves this application needs no model configuration
         // of its own. The schema is the declaration; `Engine::register` persists it and the
@@ -196,6 +201,10 @@ const UI_EVENT: &str = "ui:turn";
 const DONE_EVENT: &str = "ui:turn.done";
 /// A drawing turn's failure, said the same way.
 const ERROR_EVENT: &str = "ui:turn.error";
+/// Where a deployment's configuration is ANSWERED: the save is an event, so its result is said.
+const SAVED_EVENT: &str = "ui:gravity-model.saved";
+/// A save this booth refused, said the same way (the failure is a value, ADR-0012).
+const SAVE_REFUSED_EVENT: &str = "ui:gravity-model.error";
 
 /// Where the frames go when the caller asked for the view protocol. THE CALLER DECLARES
 /// THEM (gravity does not own a layout, so it cannot know a slot's name): `slots.rack` is
@@ -769,6 +778,88 @@ fn mounts_of(args: &Value) -> Vec<(String, String)> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// THE DOOR A DEPLOYMENT IS CONFIGURED THROUGH (ADR-0007 §4, in the shape that record asks for):
+/// the facts are rows in this type's own namespace, so something OUTSIDE the process must be able
+/// to write them. That door is an EVENT like the turn's — prism's gate reads the auth declaration
+/// above, so only a bound user reaches it — and its answer is SAID, because a handler reached by an
+/// event has nothing to return to.
+///
+/// It is deliberately NARROW: two collections, the row addressed by `id`, and the document checked
+/// against the keys a turn reads. A missing key is refused BY NAME here instead of becoming a turn
+/// that dies mid-flight with a message about someone else's problem.
+fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
+    let device = device_of(envelope);
+    let args = payload(envelope);
+    match write_row(ctx, args) {
+        Ok(saved) => {
+            emit(ctx, SAVED_EVENT, device.as_deref(), saved)?;
+            Ok(json!({ "done": true }))
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            let _ = emit(
+                ctx,
+                SAVE_REFUSED_EVENT,
+                device.as_deref(),
+                json!({ "detail": detail }),
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Write one deployment row. `settings` is row 1 by construction (one deployment, one settings
+/// row); `models` takes whatever id the caller names, so a deployment can hold several recipes.
+fn write_row(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
+    let collection = args
+        .get("collection")
+        .and_then(Value::as_str)
+        .context("save: `collection` is `settings` or `models`")?;
+    let id = args
+        .get("id")
+        .and_then(Value::as_u64)
+        .context("save: `id` is the row's number (`settings` is 1)")?;
+    let doc = args
+        .get("doc")
+        .filter(|doc| doc.is_object())
+        .context("save: `doc` is the row's fields, as an object")?;
+    let kind = match collection {
+        "settings" => {
+            needs(doc, "settings", &["store_url", "memory_scope", "memory_format", "default_model"])?;
+            KIND_SETTINGS
+        }
+        "models" => {
+            // Exactly what a turn reads off a recipe: where to post, which model, which env var
+            // holds the key (the key itself never lands in a row — ADR-0007 §secrets).
+            needs(doc, "models", &["endpoint", "model", "key_env"])?;
+            KIND_MODELS
+        }
+        other => anyhow::bail!(
+            "save: `{other}` is not a collection a deployment configures (`settings`, `models`)"
+        ),
+    };
+    ctx.store(json!({
+        "collection": collection,
+        "op": "put_document",
+        "key": { "kind": kind, "id": id },
+        "doc": doc,
+    }))?;
+    Ok(json!({ "collection": collection, "id": id }))
+}
+
+/// The keys a row must carry, refused one by one so the caller learns all of them at once.
+fn needs(doc: &Value, what: &str, keys: &[&str]) -> anyhow::Result<()> {
+    let missing: Vec<&str> = keys
+        .iter()
+        .copied()
+        .filter(|key| doc.get(*key).is_none())
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!("save: `{what}` needs {}", missing.join(", "));
+    }
+    Ok(())
 }
 
 /// A provider envelope that closed before any content: its `value` is the error text.
