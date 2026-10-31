@@ -62,6 +62,9 @@ fn main() -> anyhow::Result<()> {
         // And the SCREEN that asks for it: ADR-0007 §4 said management is a view, so the same
         // booth that performs a save draws the forms that emit it.
         .on("screen", |ctx: &mut Ctx, args: Value| screen(ctx, &args))
+        // And the SHELL: a renderer that connects gets a layout, or the page is blank and the
+        // screen has nowhere to land. Public on purpose — the shell is chrome; `screen` is gated.
+        .on("shell", |ctx: &mut Ctx, args: Value| shell(ctx, &args))
         // THE TURN'S OWN STORAGE (ADR-0007): the deployment facts are rows in the field, in
         // this type's ns, so a venue that serves this application needs no model configuration
         // of its own. The schema is the declaration; `Engine::register` persists it and the
@@ -792,19 +795,97 @@ fn mounts_of(args: &Value) -> Vec<(String, String)> {
 /// ADR-0007 §4 promised — a form per table, whose buttons emit the save event above.
 const MODEL_EVENT: &str = "ui:gravity-model";
 
+/// The slot the screen draws into when the caller names none (a click cannot name one).
+const ADMIN_SLOT: &str = "admin";
+
+/// What the screen ANSWERS with. Never [`MODEL_EVENT`]: that is the request, this booth is
+/// subscribed to it, and answering under the same name makes the booth hear its own answer —
+/// measured, not feared: `ui:gravity-model` emitted 616 times for one click before the shape was
+/// split. The renderer does not care about the name (it draws whatever arrives); a program that
+/// wants the frames listens under this one.
+const SCREEN_EVENT: &str = "ui:gravity-model.screen";
+
+/// THE EVENT A RENDERER'S CONNECTION IS: prism says `ui:connect` and forwards whatever an
+/// application answers (ADR-0017 §8 — the layout is data on the wire, and the booth that owns the
+/// logic is the one that draws it).
+const CONNECT_EVENT: &str = "ui:connect";
+
+/// What this booth ANSWERS with. Not `ui:connect`: that is the fact about a connection, and
+/// answering it under its own name is a loop — the booth is subscribed to it.
+const LAYOUT_EVENT: &str = "ui:layout";
+
+/// The shell: one `create` frame — a heading, the one control that opens management, and the rack
+/// the screen's forms land in. fluxen renders a bare button as nothing (a button IS a form's
+/// submit), so the control is a form with no fields: clicking it submits `{}` to `gravity-model`,
+/// which is exactly what the venue turns into `ui:gravity-model` with this device as the sender.
+fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
+    let device = device_of(envelope);
+    // THE ANSWER IS THE ACTION LIST ITSELF, never a `{frames: [...]}` wrapper: prism forwards an
+    // array as the renderer's message and would INJECT anything else into a slot named by the
+    // event — a page that gets a map draws nothing and reports nothing (ADR-0017 §8).
+    emit(ctx, LAYOUT_EVENT, device.as_deref(), json!([frame_shell()]))?;
+    Ok(json!({ "done": true }))
+}
+
+fn frame_shell() -> Value {
+    json!({
+        "action": "create",
+        "slot": "",
+        "data": {
+            "type": "case",
+            "attrs": {"class": ["maximize"], "horizontal": true},
+            "children": [{
+                "type": "case",
+                "attrs": {"class": ["main", "shrink", "box", "gap"]},
+                "children": [
+                    {
+                        "type": "case",
+                        "attrs": {"class": ["--head", "nogrow", "horizontal", "center"]},
+                        "children": [
+                            {"type": "text", "bind": {"value": {"kind": "default", "default": "this deployment"}}},
+                            {
+                                "type": "form",
+                                "attrs": {"class": ["nogrow"]},
+                                "bind": {"value": {"kind": "dest", "dest": "gravity-model"}},
+                                "children": [{
+                                    "type": "button",
+                                    "attrs": {"oneshot": true},
+                                    "bind": {"value": {"kind": "submit", "default": "manage"}},
+                                }],
+                            },
+                        ],
+                    },
+                    {
+                        "type": "case",
+                        "attrs": {"class": ["main", "box", "border", "round", "scrolly"], "scroll": true},
+                        "children": [{
+                            "type": "rack",
+                            "bind": {"value": {"kind": "source", "source": ADMIN_SLOT}},
+                            "item": [{"type": "case", "attrs": {"class": ["nogrow", "box", "border", "round", "shadow"]}}],
+                        }],
+                    },
+                ],
+            }],
+        },
+    })
+}
+
 /// The screen: two forms, one per table, prefilled with what the rows hold today (an unconfigured
 /// deployment gets an EMPTY form rather than an error — a screen that refuses to draw is one nobody
 /// can use to configure anything).
 fn screen(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
     let args = payload(envelope);
+    // WHERE IT DRAWS: the caller's slot when it named one, else the booth's own. A CLICK cannot
+    // name a slot — a control's uplink carries the control's fields, nothing else — so the default
+    // is what makes the screen reachable by the very buttons ADR-0007 §4 promised.
     let rack = args
         .get("slots")
         .and_then(|slots| slots.get("rack"))
         .and_then(Value::as_str)
-        .context("gravity-model: `slots.rack` is where the screen is drawn (gravity owns no layout)")?;
+        .unwrap_or(ADMIN_SLOT);
     let frames = frames_model(ctx, rack)?;
-    emit(ctx, MODEL_EVENT, device.as_deref(), json!({ "frames": frames }))?;
+    emit(ctx, SCREEN_EVENT, device.as_deref(), json!(frames))?;
     Ok(json!({ "done": true }))
 }
 

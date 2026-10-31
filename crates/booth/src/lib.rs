@@ -94,7 +94,10 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 // And the SCREEN (ADR-0007 §4: management is a view). It draws forms whose buttons
                 // emit the save event above, so the vocabulary is discoverable from the venue
                 // itself and an AI drives exactly what a person clicks.
-                .on_as("ui:gravity-model", "device", "screen"),
+                .on_as("ui:gravity-model", "device", "screen")
+                // The shell a renderer connects to: the layout is the application's answer, and
+                // this booth is the application in this stack.
+                .on_as("ui:connect", "device", "shell"),
         )
         .await?;
     Ok(())

@@ -215,7 +215,8 @@ async fn boot_bare() -> (Engine, Seen) {
                 .on_as("ui:turn.submit", "device", "turn")
                 // The configuration door, exactly as `register` declares it.
                 .on_as("ui:gravity-model.save", "device", "save")
-                .on_as("ui:gravity-model", "device", "screen"),
+                .on_as("ui:gravity-model", "device", "screen")
+                .on_as("ui:connect", "device", "shell"),
         )
         .await
         .unwrap();
@@ -1526,7 +1527,7 @@ fn screen_frames(seen: &Seen) -> Vec<Value> {
         .filter_map(|envelope| {
             envelope
                 .get("data")
-                .and_then(|data| data.get("frames"))
+                .filter(|data| data.is_array())
                 .and_then(Value::as_array)
                 .cloned()
         })
