@@ -76,3 +76,37 @@ left to decide.
 
 Also corrected here: §4 says `view:gravity-model`; since prism ADR-0017's Update the marker is `ui:`,
 so it reads `ui:gravity-model`.
+
+## Update — 2026-10-31 (second half): the screen draws
+
+§4's screen landed on the same day as the door, and it is the same vocabulary: `ui:gravity-model`
+reached by subscription (handler `screen`, `on_as("ui:gravity-model", "device", "screen")`, auth
+`true` like the rest) answers with ONE batch of frames — a form per table, `models` and `settings` —
+each submitting to the BARE name `gravity-model.save` (a page's uplink carries no marker; the venue
+adds `ui:` on the way in, §4's own rule). The caller names the slot (`slots.rack`), because gravity
+owns no layout: the same rule the turn's frames live under.
+
+Three details the vocabulary forced, worth recording because each looks like a choice and is not:
+
+- **A form says which row it writes with FIELDS, not with its destination.** `collection` and `id`
+  ride as `text` nodes bound as form fields (`{kind: "field", field: "collection", default:
+  "models"}`): fluxen's form collects every `field`-bound child and sends `{field: {data, payload}}`,
+  and a text node has no input to type into, so the pair travels with the submit and cannot be
+  retyped. A hidden field would be nicer; the model has none, and adding one to fluxen to serve one
+  screen is the wrong direction.
+- **The door accepts the form's shape as well as the row's.** `ui:gravity-model.save` takes
+  `{collection, id, doc}` from a script and `{field: {data, payload}}` from a click; the second is
+  unwrapped in one place, before validation. Numbers are coerced there too (an input's text is a
+  string, a `number` input a float, and the declared width is 8 bytes — `"37"` does not encode).
+- **An unconfigured deployment still draws.** The screen reads rows with a plain `get_document`, not
+  `read_settings` (which refuses by name because a TURN must not run on half a deployment); empty
+  rows give empty forms, which is the only state from which a deployment can be configured at all.
+
+Verified: `turn_booth::the_screen_draws_the_forms_that_write_the_rows` (empty forms → two frames
+submitting the save event → a form-shaped click writes both rows, numbers included → the screen
+re-draws with the saved values → a turn runs on them), and `scripts/smoke-venue.sh`, which asks for
+the screen over the REAL venue and asserts the two forms and their destination before configuring
+anything from outside. NOT verified, and named as owed: the RENDER itself — the node shapes match
+fluxen's `Accrete` model field by field (`form`/`text`/`input`/`button`, `BindVariant::{Dest, Field,
+Submit}`, `JsType::{text, number}`), but no host page has drawn these frames in a browser yet. §4
+also says the layout re-draws by itself; today it is the page that asks again after a save.

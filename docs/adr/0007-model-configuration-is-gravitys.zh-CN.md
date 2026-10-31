@@ -71,3 +71,30 @@ turn 一起声明（`gravity_booth::register` 里的 `on_as`，guest 里的处�
 
 同时更正：§4 写的是 `view:gravity-model`；自 prism ADR-0017 的 Update 起标记是 `ui:`，故读作
 `ui:gravity-model`。
+
+## Update — 2026-10-31（后半）：屏幕也画出来了
+
+§4 的屏幕与门在同一天落地，用的是同一套词汇：`ui:gravity-model` 经订阅到达（处理器 `screen`，
+`on_as("ui:gravity-model", "device", "screen")`，auth 与其门相同为 `true`），回一批帧——每张表一份
+表单（`models`、`settings`）——各自提交到**裸名** `gravity-model.save`（页面上行不带标记，标记由场馆在
+入口加，正是 §4 自己的规则）。槽位由调用方命名（`slots.rack`），因为 gravity 不拥有布局——与 turn 的帧
+同一条规矩。
+
+词汇逼出来的三个细节值得记下，每一个看起来像选择，其实不是：
+
+- **表单用 FIELDS 说明自己写哪一行，而不是用目的地。** `collection` 与 `id` 以绑定为表单字段的
+  `text` 节点随提交一起走（`{kind: "field", field: "collection", default: "models"}`）：fluxen 的表单
+  收集每个 `field` 绑定的子节点并发送 `{field: {data, payload}}`，而 text 节点没有可输入的控件，所以这对
+  值会跟着提交走、也不会被重打。隐藏字段更好，但模型里没有——为一个屏幕去给 fluxen 加一种节点是反方向。
+- **门同时接受表单的形状与行的形状。** `ui:gravity-model.save` 接受脚本给的 `{collection, id, doc}`，
+  也接受一次点击给的 `{field: {data, payload}}`；后者在一处解包，早于校验。数字也在这里归一（输入框的文
+  本是字符串，`number` 输入是浮点，而声明的宽度是 8 字节——`"37"` 编码不了）。
+- **未配置的部署照样能画。** 屏幕用普通 `get_document` 读行，不用 `read_settings`（后者按名拒绝，因为
+  TURN 不能在半个部署上跑）；空行给空表单——而空表单正是"还能被配置"的唯一状态。
+
+已验证：`turn_booth::the_screen_draws_the_forms_that_write_the_rows`（空表单 → 两帧提交保存事件 → 一次
+表单形状的点击写入两行、含数字 → 屏幕重画出示刚存的值 → turn 在其上跑通），以及
+`scripts/smoke-venue.sh`——它在**真场馆**上请求屏幕，先断言两张表单与它们的目的地，再从进程外配置部署。
+未验证、并据此记欠的：**渲染本身**——节点形状与 fluxen 的 `Accrete` 模型逐字段对齐（`form`/`text`/
+`input`/`button`、`BindVariant::{Dest, Field, Submit}`、`JsType::{text, number}`），但还没有任何宿主
+页面在浏览器里画过这些帧。§4 还说布局会自己重画；今天是保存之后由页面再问一次。

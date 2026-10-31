@@ -273,6 +273,20 @@ async def main():
             answer = await frame(ws)
             if answer.get("ev") != "signup.result":
                 raise SystemExit(f"FAIL: neither login nor signup was accepted: {answer}")
+        # THE SCREEN, over the real venue: an unconfigured deployment must still draw (empty forms
+        # are what make it configurable), and the frames must come back under the stripped name.
+        await ws.send(json.dumps({"ev": "ui:gravity-model", "args": {"slots": {"rack": "admin"}}}))
+        answer = await frame(ws)
+        if answer.get("ev") != "gravity-model":
+            raise SystemExit(f"FAIL: the screen did not answer: {answer}")
+        frames = answer["args"]["frames"]
+        if [f["data"]["type"] for f in frames] != ["form", "form"]:
+            raise SystemExit(f"FAIL: the screen drew {frames}")
+        for drawn in frames:
+            if drawn["data"]["bind"]["value"].get("dest") != "gravity-model.save":
+                raise SystemExit(f"FAIL: a form submits the wrong event: {drawn}")
+        print("ok: the screen draws two forms that submit gravity-model.save")
+
         for row in ROWS:
             await ws.send(json.dumps({"ev": "ui:gravity-model.save", "args": row}))
         seen = []

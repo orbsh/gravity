@@ -44,7 +44,11 @@ fn main() -> anyhow::Result<()> {
         // table. The key is the EVENT the venue's gate names (ADR-0045: a declaration
         // binds an entry, so event and entry may differ — `ui:turn.submit` here,
         // `turn` there).
-        .auth(json!({ "ui:turn.submit": true, "ui:gravity-model.save": true }))
+        .auth(json!({
+            "ui:turn.submit": true,
+            "ui:gravity-model.save": true,
+            "ui:gravity-model": true,
+        }))
         // ONE HANDLER. The venue's word for "run a turn" reaches this booth as a
         // subscription and the realm names the instance by the same address, so the
         // handler runs the turn to its end. There is no producer binding: a stream this
@@ -55,6 +59,9 @@ fn main() -> anyhow::Result<()> {
         // booth refuses an admin verb, so that door is an event like the turn's, behind the same
         // auth declaration.
         .on("save", |ctx: &mut Ctx, args: Value| save(ctx, &args))
+        // And the SCREEN that asks for it: ADR-0007 §4 said management is a view, so the same
+        // booth that performs a save draws the forms that emit it.
+        .on("screen", |ctx: &mut Ctx, args: Value| screen(ctx, &args))
         // THE TURN'S OWN STORAGE (ADR-0007): the deployment facts are rows in the field, in
         // this type's ns, so a venue that serves this application needs no model configuration
         // of its own. The schema is the declaration; `Engine::register` persists it and the
@@ -780,6 +787,148 @@ fn mounts_of(args: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Where a deployment's configuration is ASKED FOR: the caller names the slot (gravity owns no
+/// layout — the same rule the turn's frames live under), and this booth answers with the screen
+/// ADR-0007 §4 promised — a form per table, whose buttons emit the save event above.
+const MODEL_EVENT: &str = "ui:gravity-model";
+
+/// The screen: two forms, one per table, prefilled with what the rows hold today (an unconfigured
+/// deployment gets an EMPTY form rather than an error — a screen that refuses to draw is one nobody
+/// can use to configure anything).
+fn screen(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
+    let device = device_of(envelope);
+    let args = payload(envelope);
+    let rack = args
+        .get("slots")
+        .and_then(|slots| slots.get("rack"))
+        .and_then(Value::as_str)
+        .context("gravity-model: `slots.rack` is where the screen is drawn (gravity owns no layout)")?;
+    let frames = frames_model(ctx, rack)?;
+    emit(ctx, MODEL_EVENT, device.as_deref(), json!({ "frames": frames }))?;
+    Ok(json!({ "done": true }))
+}
+
+/// The rows as the screen needs them: whatever is there, `null` when nothing is. Deliberately NOT
+/// `read_settings`/`read_recipe` — those refuse by name (a turn must not run on half a deployment),
+/// while a screen that cannot read a missing row must still draw the empty form that writes it.
+fn rows_for_screen(ctx: &mut Ctx) -> (Value, Value) {
+    let settings = ctx
+        .store(json!({
+            "collection": "settings", "op": "get_document", "key": { "kind": KIND_SETTINGS, "id": 1 },
+        }))
+        .unwrap_or(Value::Null);
+    let model_id = settings
+        .get("default_model")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let model = ctx
+        .store(json!({
+            "collection": "models", "op": "get_document", "key": { "kind": KIND_MODELS, "id": model_id },
+        }))
+        .unwrap_or(Value::Null);
+    (settings, model)
+}
+
+/// The frames one screen draws: ONE batch, because a form must exist before anything patches it.
+fn frames_model(ctx: &mut Ctx, rack: &str) -> anyhow::Result<Vec<Value>> {
+    let (settings, model) = rows_for_screen(ctx);
+    let model_id = settings
+        .get("default_model")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    Ok(vec![
+        frame_form(
+            rack,
+            "models",
+            &model_id.to_string(),
+            "the model this deployment answers with",
+            &[
+                ("alias", "default", Kind::Text, &model),
+                ("endpoint", "https://…/v1", Kind::Text, &model),
+                ("model", "model id", Kind::Text, &model),
+                ("key_env", "the env var holding the key", Kind::Text, &model),
+                ("weight", "1", Kind::Number, &model),
+                ("enabled", "1", Kind::Number, &model),
+            ],
+        ),
+        frame_form(
+            rack,
+            "settings",
+            "1",
+            "how this deployment remembers",
+            &[
+                ("store_url", "http://127.0.0.1:7760", Kind::Text, &settings),
+                ("memory_scope", "37", Kind::Number, &settings),
+                ("memory_format", "plaintext", Kind::Text, &settings),
+                ("default_model", "1", Kind::Number, &settings),
+            ],
+        ),
+    ])
+}
+
+/// How a field is typed on the screen: a text input sends a string, a number input a float, and the
+/// row's declared width decides which of them encodes (see `coerce_numbers`).
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Text,
+    Number,
+}
+
+
+/// One form. `collection` and `id` are TEXT NODES bound as form fields — static labels that travel
+/// with the submit, because a form has no other way to say which row it writes (and an id the
+/// operator could retype would be a way to write the wrong row).
+fn frame_form(
+    rack: &str,
+    collection: &str,
+    id: &str,
+    heading: &str,
+    fields: &[(&str, &str, Kind, &Value)],
+) -> Value {
+    let mut children = vec![
+        json!({"type": "text", "bind": {"value": {"kind": "default", "default": heading}}}),
+        json!({"type": "text", "bind": {"value": {"kind": "field", "field": "collection", "default": collection}}}),
+        json!({"type": "text", "bind": {"value": {"kind": "field", "field": "id", "default": id}}}),
+    ];
+    for (name, hint, kind, row) in fields {
+        // PREFILL: what the row holds, else the hint the operator reads as an example. A number
+        // field takes a JSON number (the renderer's `default_for` reads it as a float).
+        let current = row.get(*name).cloned().unwrap_or(Value::Null);
+        let default = match (kind, &current) {
+            (Kind::Text, Value::String(text)) => Value::String(text.clone()),
+            (Kind::Number, Value::Number(_)) => current.clone(),
+            (Kind::Number, _) => Value::from(hint.parse::<f64>().unwrap_or(0.0)),
+            _ => Value::String(hint.to_string()),
+        };
+        children.push(json!({
+            "type": "input",
+            "bind": {"value": {
+                "kind": "field",
+                "field": name,
+                "type": if *kind == Kind::Number { "number" } else { "text" },
+                "default": default,
+            }},
+        }));
+    }
+    children.push(json!({
+        "type": "button",
+        "attrs": {"oneshot": true},
+        "bind": {"value": {"kind": "submit", "default": "save"}},
+    }));
+    json!({
+        "action": "append",
+        "slot": rack,
+        // The form's own bind is the uplink: the BARE event name, because a page's uplink carries no
+        // marker (prism adds `ui:` on the way in — MODELING's rule).
+        "data": {
+            "type": "form",
+            "attrs": {"class": ["box", "border", "round", "shadow"]},
+            "bind": {"value": {"kind": "dest", "dest": "gravity-model.save"}},
+            "children": children,
+        },
+    })
+}
+
 /// THE DOOR A DEPLOYMENT IS CONFIGURED THROUGH (ADR-0007 §4, in the shape that record asks for):
 /// the facts are rows in this type's own namespace, so something OUTSIDE the process must be able
 /// to write them. That door is an EVENT like the turn's — prism's gate reads the auth declaration
@@ -812,34 +961,61 @@ fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 
 /// Write one deployment row. `settings` is row 1 by construction (one deployment, one settings
 /// row); `models` takes whatever id the caller names, so a deployment can hold several recipes.
+///
+/// TWO SHAPES, ONE RULE: a caller hands the row directly (`{collection, id, doc}` — a script, a
+/// test, an AI), or the SCREEN hands the form's own payload, which fluxen builds as
+/// `{field: {data, payload}}`. Unwrapping the second here keeps that difference out of the
+/// validation and out of every future caller.
 fn write_row(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
-    let collection = args
+    let mut row = args
+        .as_object()
+        .context("save: the payload is a row document or a form's fields")?
+        .clone();
+    let explicit = row.remove("doc");
+    if explicit.is_none() {
+        // The form's shape: every value is a `{data, payload}` message.
+        for value in row.values_mut() {
+            if let Some(data) = value.get("data").cloned() {
+                *value = data;
+            }
+        }
+    }
+    let collection = row
         .get("collection")
         .and_then(Value::as_str)
-        .context("save: `collection` is `settings` or `models`")?;
-    let id = args
+        .context("save: `collection` is `settings` or `models`")?
+        .to_string();
+    let id = row
         .get("id")
-        .and_then(Value::as_u64)
+        .and_then(|id| id.as_u64().or_else(|| id.as_str().and_then(|s| s.trim().parse().ok())))
         .context("save: `id` is the row's number (`settings` is 1)")?;
-    let doc = args
-        .get("doc")
-        .filter(|doc| doc.is_object())
-        .context("save: `doc` is the row's fields, as an object")?;
-    let kind = match collection {
-        "settings" => {
-            needs(doc, "settings", &["store_url", "memory_scope", "memory_format", "default_model"])?;
-            KIND_SETTINGS
-        }
-        "models" => {
-            // Exactly what a turn reads off a recipe: where to post, which model, which env var
-            // holds the key (the key itself never lands in a row — ADR-0007 §secrets).
-            needs(doc, "models", &["endpoint", "model", "key_env"])?;
-            KIND_MODELS
-        }
+    let kind = match collection.as_str() {
+        "settings" => KIND_SETTINGS,
+        "models" => KIND_MODELS,
         other => anyhow::bail!(
             "save: `{other}` is not a collection a deployment configures (`settings`, `models`)"
         ),
     };
+    // A direct caller's `doc` is used as given; a form's fields ARE the doc, minus the address.
+    let mut doc = match explicit {
+        Some(doc) => doc,
+        None => {
+            row.remove("collection");
+            row.remove("id");
+            Value::Object(row)
+        }
+    };
+    if !doc.is_object() {
+        anyhow::bail!("save: `doc` is the row's fields, as an object");
+    }
+    coerce_numbers(&collection, &mut doc);
+    let required: &[&str] = match collection.as_str() {
+        "settings" => &["store_url", "memory_scope", "memory_format", "default_model"],
+        // Exactly what a turn reads off a recipe: where to post, which model, which env var holds
+        // the key (the key itself never lands in a row — ADR-0007 §secrets).
+        _ => &["endpoint", "model", "key_env"],
+    };
+    needs(&doc, &collection, required)?;
     ctx.store(json!({
         "collection": collection,
         "op": "put_document",
@@ -847,6 +1023,30 @@ fn write_row(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
         "doc": doc,
     }))?;
     Ok(json!({ "collection": collection, "id": id }))
+}
+
+/// The DECLARED U64 fields, made numbers whatever a form sent: an input's text is a string, a
+/// `type: number` field is a float, and the row's declared width is 8 bytes — `"37"` does not
+/// encode where `37` does. Silence here would be the screen's writes failing on a type the operator
+/// never typed.
+fn coerce_numbers(collection: &str, doc: &mut Value) {
+    let numeric: &[&str] = match collection {
+        "settings" => &["memory_scope", "default_model"],
+        _ => &["weight", "enabled"],
+    };
+    for key in numeric {
+        let Some(value) = doc.get_mut(*key) else { continue };
+        let number = match &*value {
+            Value::Number(n) => n
+                .as_u64()
+                .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as u64)),
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        if let Some(number) = number {
+            *value = Value::from(number);
+        }
+    }
 }
 
 /// The keys a row must carry, refused one by one so the caller learns all of them at once.

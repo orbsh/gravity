@@ -90,7 +90,11 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 // door that writes them is an event too (auth: `ui:gravity-model.save`). A venue
                 // never learns the word — this is the application's own vocabulary, as much as
                 // `ui:turn.submit` is.
-                .on_as("ui:gravity-model.save", "device", "save"),
+                .on_as("ui:gravity-model.save", "device", "save")
+                // And the SCREEN (ADR-0007 §4: management is a view). It draws forms whose buttons
+                // emit the save event above, so the vocabulary is discoverable from the venue
+                // itself and an AI drives exactly what a person clicks.
+                .on_as("ui:gravity-model", "device", "screen"),
         )
         .await?;
     Ok(())

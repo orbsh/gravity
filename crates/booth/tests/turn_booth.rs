@@ -180,7 +180,7 @@ async fn sse_server_three_branches(
 /// the renderer.
 async fn boot(store_url: &str, endpoint: &str) -> (Engine, Seen) {
     let (engine, seen) = boot_bare().await;
-    seed(&engine, store_url, endpoint);
+    seed(&engine, store_url, endpoint).await;
     (engine, seen)
 }
 
@@ -214,7 +214,8 @@ async fn boot_bare() -> (Engine, Seen) {
                 // the entry is `turn`, the address field is the envelope's `channel_id`.
                 .on_as("ui:turn.submit", "device", "turn")
                 // The configuration door, exactly as `register` declares it.
-                .on_as("ui:gravity-model.save", "device", "save"),
+                .on_as("ui:gravity-model.save", "device", "save")
+                .on_as("ui:gravity-model", "device", "screen"),
         )
         .await
         .unwrap();
@@ -261,9 +262,11 @@ async fn boot_bare() -> (Engine, Seen) {
 /// namespace before driving a turn — which is also the proof that the induction carrier's
 /// `storage` block reaches the realm as a plan (the guest declares it; `Engine::register`
 /// persists the schema and allocates the type's ns).
-fn seed(engine: &Engine, store_url: &str, endpoint: &str) {
+async fn seed(engine: &Engine, store_url: &str, endpoint: &str) {
     let (store, plan) = {
-        let realm = engine.realm.try_lock().expect("realm");
+        // AWAIT the realm, never `try_lock` it: the engine's own boot tasks hold it for a moment,
+        // and a full suite run hit `TryLockError` in two tests that were green when run alone.
+        let realm = engine.realm.lock().await;
         (
             realm.mq.clone(),
             realm
@@ -1504,4 +1507,138 @@ async fn a_fresh_deployment_is_configured_through_its_own_door() {
         events.contains(&"ui:gravity-model.error".to_string()),
         "and a refusal is too: {events:?}"
     );
+}
+
+
+// ── The screen: the forms that emit the save event ────────────────────────────────────────────
+//
+// ADR-0007 §4 says management is a VIEW, and the door above is only the performing half. This is
+// the drawing half: `ui:gravity-model` answers with one batch of frames — a form per table, each
+// submitting to `gravity-model.save` with the BARE event name (a page's uplink carries no marker;
+// the venue adds `ui:` on the way in).
+
+/// The frames the screen answered with. The collector stores the whole envelope a booth emits
+/// (`{name, device?, data}`), so the frames ride under `data` and its shape is what tells a screen
+/// batch apart from a turn's deltas.
+fn screen_frames(seen: &Seen) -> Vec<Value> {
+    seen.events()
+        .iter()
+        .filter_map(|envelope| {
+            envelope
+                .get("data")
+                .and_then(|data| data.get("frames"))
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .next_back()
+        .unwrap_or_default()
+}
+
+/// A form field's prefilled value: the form's children carry `bind.value.default` for its fields.
+fn field_default(form: &Value, field: &str) -> Value {
+    form["children"]
+        .as_array()
+        .and_then(|children| {
+            children.iter().find(|child| {
+                child["bind"]["value"]["field"].as_str() == Some(field)
+            })
+        })
+        .map(|child| child["bind"]["value"]["default"].clone())
+        .unwrap_or(Value::Null)
+}
+
+#[tokio::test]
+async fn the_screen_draws_the_forms_that_write_the_rows() {
+    let endpoint = sse_server(vec!["hi"]).await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot_bare().await;
+
+    // AN UNCONFIGURED DEPLOYMENT STILL DRAWS: a screen that refuses to render is one nobody can use
+    // to configure anything, so empty rows produce empty forms.
+    drive(&engine, "screen", json!({ "slots": { "rack": "config" } }))
+        .await
+        .expect("a screen draws on a fresh deployment");
+    settle(&seen).await;
+    let frames = screen_frames(&seen);
+    assert_eq!(frames.len(), 2, "one form per table: {frames:?}");
+    for frame in &frames {
+        assert_eq!(frame["action"], "append", "{frame}");
+        assert_eq!(frame["slot"], "config", "{frame}");
+        let form = &frame["data"];
+        assert_eq!(form["type"], "form", "{frame}");
+        assert_eq!(
+            form["bind"]["value"]["dest"], "gravity-model.save",
+            "the form submits the bare name; the venue adds `ui:` on the way in: {frame}"
+        );
+    }
+    let models = &frames[0]["data"];
+    let settings = &frames[1]["data"];
+    assert_eq!(field_default(models, "collection"), "models");
+    assert_eq!(field_default(settings, "collection"), "settings");
+    assert_eq!(
+        field_default(settings, "id"),
+        "1",
+        "settings is row 1 by construction"
+    );
+    for field in ["endpoint", "model", "key_env"] {
+        assert_ne!(
+            field_default(models, field),
+            Value::Null,
+            "the model form offers `{field}`"
+        );
+    }
+
+    // A CLICK SENDS THE FORM SHAPE, not the row shape: fluxen builds `{field: {data, payload}}`,
+    // and the door unwraps it (numbers included — an input's text is a string, a number input a
+    // float, and the declared width is 8 bytes).
+    drive(
+        &engine,
+        "save",
+        json!({
+            "collection": { "data": "models" },
+            "id": { "data": "1" },
+            "alias": { "data": "default" },
+            "endpoint": { "data": endpoint },
+            "model": { "data": "test-model" },
+            "key_env": { "data": "GRAVITY_TEST_KEY" },
+            "weight": { "data": 1.0 },
+            "enabled": { "data": 1 },
+        }),
+    )
+    .await
+    .expect("a form's payload writes the model row");
+
+    drive(
+        &engine,
+        "save",
+        json!({
+            "collection": { "data": "settings" },
+            "id": { "data": "1" },
+            "store_url": { "data": store_url },
+            "memory_scope": { "data": 37.0 },
+            "memory_format": { "data": "plaintext" },
+            "default_model": { "data": "1" },
+        }),
+    )
+    .await
+    .expect("a form's numbers reach a U64 field");
+
+    // And the screen now shows what the rows hold: the same slots, the current values.
+    drive(&engine, "screen", json!({ "slots": { "rack": "config" } }))
+        .await
+        .expect("a configured deployment re-draws");
+    settle(&seen).await;
+    let frames = screen_frames(&seen);
+    let models = &frames[0]["data"];
+    let settings = &frames[1]["data"];
+    assert_eq!(field_default(models, "endpoint"), Value::String(endpoint.clone()));
+    assert_eq!(field_default(models, "model"), "test-model");
+    assert_eq!(field_default(settings, "store_url"), Value::String(store_url.clone()));
+    assert_eq!(field_default(settings, "memory_scope"), 37.0);
+
+    // The turn runs on what the screen wrote — one deployment, configured by clicking.
+    let deltas = run_turn(&engine, &seen, turn_args("hi"))
+        .await
+        .expect("a click-configured deployment runs a turn");
+    assert_eq!(deltas.join(""), "hi");
 }
