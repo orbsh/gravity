@@ -1535,6 +1535,19 @@ fn screen_frames(seen: &Seen) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// Every `form` node under a tree, depth first: the screen nests its forms in a case, so the test
+/// asks for the forms rather than for a positional path into the layout.
+fn forms_in(node: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    if node.get("type").and_then(Value::as_str) == Some("form") {
+        out.push(node.clone());
+    }
+    for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
+        out.extend(forms_in(child));
+    }
+    out
+}
+
 /// A form field's prefilled value: the form's children carry `bind.value.default` for its fields.
 fn field_default(form: &Value, field: &str) -> Value {
     form["children"]
@@ -1556,24 +1569,26 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
 
     // AN UNCONFIGURED DEPLOYMENT STILL DRAWS: a screen that refuses to render is one nobody can use
     // to configure anything, so empty rows produce empty forms.
-    drive(&engine, "screen", json!({ "slots": { "rack": "config" } }))
+    drive(&engine, "screen", json!({}))
         .await
         .expect("a screen draws on a fresh deployment");
     settle(&seen).await;
     let frames = screen_frames(&seen);
-    assert_eq!(frames.len(), 2, "one form per table: {frames:?}");
-    for frame in &frames {
-        assert_eq!(frame["action"], "append", "{frame}");
-        assert_eq!(frame["slot"], "config", "{frame}");
-        let form = &frame["data"];
-        assert_eq!(form["type"], "form", "{frame}");
-        assert_eq!(
-            form["bind"]["value"]["dest"], "gravity-model.save",
-            "the form submits the bare name; the venue adds `ui:` on the way in: {frame}"
-        );
-    }
-    let models = &frames[0]["data"];
-    let settings = &frames[1]["data"];
+    assert_eq!(
+        frames.len(),
+        1,
+        "the screen is ONE tree, not a row per table: a second set of rows would stack up on the \
+         next ask: {frames:?}"
+    );
+    assert_eq!(frames[0]["action"], "create", "{}", frames[0]);
+    // TWO forms, and not the header's: the control that ASKS for the screen is a form too, whose
+    // uplink is the request (`gravity-model`). The save forms are the ones with a row behind them.
+    let forms: Vec<Value> = forms_in(&frames[0]["data"])
+        .into_iter()
+        .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
+        .collect();
+    assert_eq!(forms.len(), 2, "one form per table: {forms:?}");
+    let (models, settings) = (&forms[0], &forms[1]);
     assert_eq!(field_default(models, "collection"), "models");
     assert_eq!(field_default(settings, "collection"), "settings");
     assert_eq!(
@@ -1624,14 +1639,21 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
     .await
     .expect("a form's numbers reach a U64 field");
 
-    // And the screen now shows what the rows hold: the same slots, the current values.
-    drive(&engine, "screen", json!({ "slots": { "rack": "config" } }))
+    // And the screen now shows what the rows hold: the same tree, the current values. Asking a
+    // second time REPLACES the root, so this is also the regression guard against a screen that
+    // stacked a second set of forms on every ask.
+    drive(&engine, "screen", json!({}))
         .await
         .expect("a configured deployment re-draws");
     settle(&seen).await;
     let frames = screen_frames(&seen);
-    let models = &frames[0]["data"];
-    let settings = &frames[1]["data"];
+    assert_eq!(frames.len(), 1, "one tree per answer: {frames:?}");
+    let redrawn: Vec<Value> = forms_in(&frames[0]["data"])
+        .into_iter()
+        .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
+        .collect();
+    assert_eq!(redrawn.len(), 2, "the second ask did not stack a second pair: {redrawn:?}");
+    let (models, settings) = (&redrawn[0], &redrawn[1]);
     assert_eq!(field_default(models, "endpoint"), Value::String(endpoint.clone()));
     assert_eq!(field_default(models, "model"), "test-model");
     assert_eq!(field_default(settings, "store_url"), Value::String(store_url.clone()));

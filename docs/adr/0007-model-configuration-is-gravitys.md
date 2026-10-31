@@ -110,3 +110,28 @@ anything from outside. NOT verified, and named as owed: the RENDER itself — th
 fluxen's `Accrete` model field by field (`form`/`text`/`input`/`button`, `BindVariant::{Dest, Field,
 Submit}`, `JsType::{text, number}`), but no host page has drawn these frames in a browser yet. §4
 also says the layout re-draws by itself; today it is the page that asks again after a save.
+
+## Update — 2026-10-31 (third): the screen is a TREE, not rows appended to one
+
+The Update above says the screen answers with "ONE batch of frames — a form per table, each
+submitting to the bare name", and the caller names the slot (`slots.rack`). Both halves are wrong,
+and a browser found it: pressing `manage` a second time put a SECOND pair of forms under the first.
+
+`append` is the only instruction that grows a list, the rows here carry no `id` (a configuration
+screen has two fixed forms, not a stream), so every answer stacked. Keying them with ids would have
+made the second append a duplicate the renderer REJECTS (ADR 0005's rule), which is not a fix
+either. What decided it is that a screen is not a list: it is the deployment's whole face.
+
+So the screen answers with `create` — the same root the shell draws on `ui:connect`, with the forms
+as children of its body case (`frame_root(forms)`). Asking twice replaces the root and leaves one
+screen; the rack, the `admin` slot and the `slots.rack` argument are gone, and so is the rule that
+the caller names where a screen draws. A click never could name one — that was the reason for the
+fallback in the first place — and the booth now owns what its own screen looks like.
+
+The forms themselves are unchanged (fields carry `collection`/`id`, the destination is the bare
+`gravity-model.save`), so the door, the coercion and the "unconfigured deployment still draws"
+rule all stand.
+
+Verified in a real browser (system chromium over CDP, not just the booth test): click `manage` →
+two prefilled forms (the settings form shows the store URL the deployment holds) → type a new alias
+→ press save → ask again → the same two forms, the new value, and no third pair.

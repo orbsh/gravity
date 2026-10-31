@@ -98,3 +98,24 @@ turn 一起声明（`gravity_booth::register` 里的 `on_as`，guest 里的处�
 未验证、并据此记欠的：**渲染本身**——节点形状与 fluxen 的 `Accrete` 模型逐字段对齐（`form`/`text`/
 `input`/`button`、`BindVariant::{Dest, Field, Submit}`、`JsType::{text, number}`），但还没有任何宿主
 页面在浏览器里画过这些帧。§4 还说布局会自己重画；今天是保存之后由页面再问一次。
+
+## Update — 2026-10-31（第三段）：屏是一棵树，不是往同一处反复追加的行
+
+上一条 Update 说屏"回答一批帧——一表一表单，各自提交到裸名"，并且调用方指定槽位
+（`slots.rack`）。这两半都错了，真实浏览器把它抓出来：第二次按 `manage`，第一对表单下面又多出一对。
+
+能往列表里增行的指令只有 `append`，而这里每行都没有 `id`（配置屏固定两张表，不是流），于是每次回答
+都在堆。给它们加 id 也不行——第二次 append 会撞上渲染器"重复行 id 拒收"的规矩（ADR 0005），那不是修法。
+
+决定它的是这件事：屏不是列表，是一个部署的整张脸。所以屏用 `create` 回答——和 shell 在
+`ui:connect` 上画的是同一棵根，表单挂在它 body case 的 children 上（`frame_root(forms)`）。
+问两次就替换一次根，屏始终只有一张；rack、`admin` 槽位、`slots.rack` 参数一起退场，"由调用方
+指定屏画在哪"这条规矩也跟着退场——点击本来就带不了槽位（那正是当初要兜底值的原因），而屏长什么样
+该由 booth 自己说了算。
+
+表单本身没变（字段携带 `collection`/`id`，目的地是裸名 `gravity-model.save`），所以门、类型强转、
+"未配置的部署照样画得出来"这三条全部照旧。
+
+在真浏览器里验过（系统 chromium 走 CDP，不只是 booth 测试）：按 `manage` → 两张预填好的表单
+（settings 那张显示的是部署里存的 store URL）→ 改别名 → 按 save → 再问一次 → 还是两张，值是新值，
+没有第三对。

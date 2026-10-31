@@ -795,9 +795,6 @@ fn mounts_of(args: &Value) -> Vec<(String, String)> {
 /// ADR-0007 §4 promised — a form per table, whose buttons emit the save event above.
 const MODEL_EVENT: &str = "ui:gravity-model";
 
-/// The slot the screen draws into when the caller names none (a click cannot name one).
-const ADMIN_SLOT: &str = "admin";
-
 /// What the screen ANSWERS with. Never [`MODEL_EVENT`]: that is the request, this booth is
 /// subscribed to it, and answering under the same name makes the booth hear its own answer —
 /// measured, not feared: `ui:gravity-model` emitted 616 times for one click before the shape was
@@ -823,11 +820,14 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // THE ANSWER IS THE ACTION LIST ITSELF, never a `{frames: [...]}` wrapper: prism forwards an
     // array as the renderer's message and would INJECT anything else into a slot named by the
     // event — a page that gets a map draws nothing and reports nothing (ADR-0017 §8).
-    emit(ctx, LAYOUT_EVENT, device.as_deref(), json!([frame_shell()]))?;
+    emit(ctx, LAYOUT_EVENT, device.as_deref(), json!([frame_root(Vec::new())]))?;
     Ok(json!({ "done": true }))
 }
 
-fn frame_shell() -> Value {
+/// The screen's tree: the title, the control that asks for the forms, and the forms themselves (or
+/// nothing at all when a renderer connects). One tree for both answers, because a screen and the
+/// layout a page connects to are the same screen with different contents.
+fn frame_root(forms: Vec<Value>) -> Value {
     json!({
         "action": "create",
         "slot": "",
@@ -857,12 +857,8 @@ fn frame_shell() -> Value {
                     },
                     {
                         "type": "case",
-                        "attrs": {"class": ["main", "box", "border", "round", "scrolly"], "scroll": true},
-                        "children": [{
-                            "type": "rack",
-                            "bind": {"value": {"kind": "source", "source": ADMIN_SLOT}},
-                            "item": [{"type": "case", "attrs": {"class": ["nogrow", "box", "border", "round", "shadow"]}}],
-                        }],
+                        "attrs": {"class": ["main", "box", "border", "round", "scrolly", "gap"], "scroll": true},
+                        "children": forms,
                     },
                 ],
             }],
@@ -875,17 +871,13 @@ fn frame_shell() -> Value {
 /// can use to configure anything).
 fn screen(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
-    let args = payload(envelope);
-    // WHERE IT DRAWS: the caller's slot when it named one, else the booth's own. A CLICK cannot
-    // name a slot — a control's uplink carries the control's fields, nothing else — so the default
-    // is what makes the screen reachable by the very buttons ADR-0007 §4 promised.
-    let rack = args
-        .get("slots")
-        .and_then(|slots| slots.get("rack"))
-        .and_then(Value::as_str)
-        .unwrap_or(ADMIN_SLOT);
-    let frames = frames_model(ctx, rack)?;
-    emit(ctx, SCREEN_EVENT, device.as_deref(), json!(frames))?;
+    // THE ANSWER IS THE LAYOUT ITSELF, rebuilt. A screen that appended its rows into a list would
+    // stack a second set of forms every time it was asked (the list is keyed by row id, and these
+    // rows have none) — so the screen REPLACES the root, exactly as the shell did, and asking twice
+    // leaves one screen. The caller names no slot: a click cannot carry one, and this booth owns
+    // what a screen looks like anyway.
+    let forms = frames_model(ctx)?;
+    emit(ctx, SCREEN_EVENT, device.as_deref(), json!([frame_root(forms)]))?;
     Ok(json!({ "done": true }))
 }
 
@@ -911,7 +903,7 @@ fn rows_for_screen(ctx: &mut Ctx) -> (Value, Value) {
 }
 
 /// The frames one screen draws: ONE batch, because a form must exist before anything patches it.
-fn frames_model(ctx: &mut Ctx, rack: &str) -> anyhow::Result<Vec<Value>> {
+fn frames_model(ctx: &mut Ctx) -> anyhow::Result<Vec<Value>> {
     let (settings, model) = rows_for_screen(ctx);
     let model_id = settings
         .get("default_model")
@@ -919,7 +911,6 @@ fn frames_model(ctx: &mut Ctx, rack: &str) -> anyhow::Result<Vec<Value>> {
         .unwrap_or(1);
     Ok(vec![
         frame_form(
-            rack,
             "models",
             &model_id.to_string(),
             "the model this deployment answers with",
@@ -933,7 +924,6 @@ fn frames_model(ctx: &mut Ctx, rack: &str) -> anyhow::Result<Vec<Value>> {
             ],
         ),
         frame_form(
-            rack,
             "settings",
             "1",
             "how this deployment remembers",
@@ -960,7 +950,6 @@ enum Kind {
 /// with the submit, because a form has no other way to say which row it writes (and an id the
 /// operator could retype would be a way to write the wrong row).
 fn frame_form(
-    rack: &str,
     collection: &str,
     id: &str,
     heading: &str,
@@ -997,16 +986,12 @@ fn frame_form(
         "bind": {"value": {"kind": "submit", "default": "save"}},
     }));
     json!({
-        "action": "append",
-        "slot": rack,
+        "type": "form",
         // The form's own bind is the uplink: the BARE event name, because a page's uplink carries no
         // marker (prism adds `ui:` on the way in — MODELING's rule).
-        "data": {
-            "type": "form",
-            "attrs": {"class": ["box", "border", "round", "shadow"]},
-            "bind": {"value": {"kind": "dest", "dest": "gravity-model.save"}},
-            "children": children,
-        },
+        "attrs": {"class": ["box", "border", "round", "shadow"]},
+        "bind": {"value": {"kind": "dest", "dest": "gravity-model.save"}},
+        "children": children,
     })
 }
 
