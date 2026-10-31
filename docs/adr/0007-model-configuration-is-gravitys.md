@@ -135,3 +135,18 @@ rule all stand.
 Verified in a real browser (system chromium over CDP, not just the booth test): click `manage` →
 two prefilled forms (the settings form shows the store URL the deployment holds) → type a new alias
 → press save → ask again → the same two forms, the new value, and no third pair.
+
+## Update 2026-10-31: a refusal is said twice
+
+The door refuses by naming what is missing, and it says so as an event (`ui:gravity-model.error`)
+because a program is one of the two readers. The other reader is a person looking at a screen, and
+a non-list payload injected into a slot nobody binds is invisible: "refused" and "nothing happened"
+looked the same on the page.
+
+The screen therefore carries a notice area — a float holding a rack bound to the fixed slot
+`notice`, above the forms, no room taken while empty. A refusal appends the same detail there as a
+row. The frame carries no lifecycle: how long a line stays, how it enters, whether it rotates and
+what holds it still are the renderer's `view` (fluxen ADR 0024), following the ruling that the
+deployment says the message and the UI decides how it is shown. The only new vocabulary on the
+wire is the event `ui:gravity-model.notice` and the slot name `notice`.
+
