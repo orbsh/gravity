@@ -866,7 +866,7 @@ fn frame_root(forms: Vec<Value>) -> Value {
 /// THE SLOT WHERE THE DEPLOYMENT SPEAKS TO THE PERSON: one line at a time, floating above the
 /// screen, gone when nobody is looking. The frame carries no lifetime — how long a line stays, how
 /// it enters, whether it turns over, and what holds it still are the RENDERER's business (rack's
-/// `view`, ADR 0022). The venue only says the line.
+/// `view`, fluxen ADR 0024). The venue only says the line.
 const NOTICE_SLOT: &str = "notice";
 
 fn frame_notice() -> Value {
