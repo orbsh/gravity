@@ -662,15 +662,29 @@ fn write_code(
     doors.post(&format!("{store_url}/code/{scope}"), &body)
 }
 
-/// Count one record of an invocation. Silent on failure: the store answers a
-/// receipt, and the receipt is not what the turn is for (ADR-0018).
-fn touch(doors: &mut impl Doors, store_url: &str, scope: u64, skill_id: u64, event: &str) {
+/// Count one record of an invocation, on the row that owns that count. Silent on
+/// failure: the store answers a receipt, and the receipt is not what the turn is
+/// for (ADR-0018).
+///
+/// `area` is the door's row kind — `skills` for the procedure the model invoked,
+/// `code` for the script that ran. BOTH are counted, because neither count
+/// derives the other: a `generate-pdf` script can be a step in several skills and
+/// reachable from more than one tool, so its count belongs to the script, while
+/// "this procedure was tried N times" belongs to the skill.
+fn touch(
+    doors: &mut impl Doors,
+    store_url: &str,
+    area: &str,
+    scope: u64,
+    id: u64,
+    event: &str,
+) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let _ = doors.post(
-        &format!("{store_url}/skills/{scope}/{skill_id}/touch"),
+        &format!("{store_url}/{area}/{scope}/{id}/touch"),
         &json!({ "event": event, "ts_ms": now }),
     );
 }
@@ -763,11 +777,13 @@ fn invoke(
     check_arguments(parameters, &arguments).map_err(|e| format!("invoke_skill: {e}"))?;
 
     // The ATTEMPT is counted before the node is asked to run anything (k10r
-    // ADR-0018): a call that never comes back must still be visible, which is
-    // why the count is a record about the call, not part of its result. Best
+    // ADR-0018), on BOTH rows: the skill (this procedure was tried) and the script
+    // (this code ran). A call that never comes back must still be visible, which
+    // is why the count is a record about the call, not part of its result. Best
     // effort by contract — a counter that cannot be written is not a reason to
     // fail the step the model asked for.
-    touch(doors, store_url, scope, skill_id, "attempt");
+    touch(doors, store_url, "skills", scope, skill_id, "attempt");
+    touch(doors, store_url, "code", scope, code_id, "attempt");
 
     let value = doors.mount(
         mount,
@@ -777,7 +793,8 @@ fn invoke(
     // The success is the SECOND record; a failed mount leaves `calls > ok`,
     // which is exactly the state a reader is looking for.
     if value.is_ok() {
-        touch(doors, store_url, scope, skill_id, "success");
+        touch(doors, store_url, "skills", scope, skill_id, "success");
+        touch(doors, store_url, "code", scope, code_id, "success");
     }
     let value = value?;
     // What this turn actually walked, in order — the turn reports the
@@ -1770,12 +1787,23 @@ mod tests {
             .iter()
             .filter(|(url, _)| url.ends_with("/touch"))
             .collect();
-        assert_eq!(touches.len(), 2, "one attempt, one success");
+        assert_eq!(
+            touches.len(),
+            4,
+            "two rows are counted, each with one attempt and one success"
+        );
         assert_eq!(touches[0].1["event"], "attempt", "the attempt goes first");
-        assert_eq!(touches[1].1["event"], "success");
+        assert_eq!(touches[1].1["event"], "attempt");
+        assert_eq!(touches[2].1["event"], "success", "the success comes after the run");
+        assert_eq!(touches[3].1["event"], "success");
         assert_eq!(
             touches[0].0, "http://mem.test/skills/37/9/touch",
-            "the count lands on the skill node the call named"
+            "the procedure the model named is counted on its own node"
+        );
+        assert_eq!(
+            touches[1].0, "http://mem.test/code/37/4/touch",
+            "and the SCRIPT is counted on its row: one script serves many skills, \
+             so its use belongs to the script and not to whichever skill named it"
         );
         assert!(
             touches[0].1["ts_ms"].as_u64().is_some_and(|ts| ts > 0),
@@ -1837,8 +1865,9 @@ mod tests {
             .collect();
         assert_eq!(
             events,
-            vec!["attempt"],
-            "tried and broke is the state a reader is looking for — no success follows"
+            vec!["attempt", "attempt"],
+            "tried and broke is the state a reader is looking for — a failed run \
+             records an attempt on each row and no success on either"
         );
         assert!(walked.is_empty(), "a step that failed is not part of a run");
     }
