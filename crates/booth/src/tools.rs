@@ -231,6 +231,14 @@ static SPECS: &[ToolSpec] = &[
                         "type": "string",
                         "enum": ["open", "doing", "blocked", "done"],
                         "description": "Defaults to `open`."
+                    },
+                    "finishes_on": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "The code ids (`code_id`, the number a skill step names) that \
+                                       FINISH this task. When one of them runs successfully the task is \
+                                       closed at the call site — you do not move it afterwards. State it \
+                                       when the work IS a step you are about to run."
                     }
                 },
                 "required": ["name"]
@@ -344,6 +352,11 @@ pub struct Facts<'a> {
     /// chooses it; gravity uses the conversation, so a script's state survives
     /// the turns of one conversation and nothing else).
     pub session: &'a str,
+    /// Which open tasks each code row finishes (`task --finishes_on--> code`),
+    /// built once from the turn's task listing. The call site reads it to close
+    /// work (ADR-0003 §3); an empty table means nothing is bound, which is the
+    /// ordinary case.
+    pub ends_on: &'a std::collections::BTreeMap<u64, Vec<u64>>,
 }
 
 impl Facts<'_> {
@@ -563,7 +576,9 @@ fn invoke(
         format!("invoke_skill: step {index} names no `code_id`")
     })?;
 
-    let code = doors.get(&format!("{store_url}/code/{code_id}"))?;
+    // A code row is scoped since k10r ADR-0024 (it is a vertex of that corpus's
+    // graph), so the door carries the same scope the skill did.
+    let code = doors.get(&format!("{store_url}/code/{scope}/{code_id}"))?;
     let language = code
         .get("language")
         .and_then(Value::as_str)
@@ -632,7 +647,61 @@ fn invoke(
             .unwrap_or_default()
             .to_string(),
     });
-    Ok(value)
+    // The call site closes what this code row finishes (ADR-0003 §3): the model
+    // dispatched the step, the binding did the rest. A FAILED run closes nothing
+    // — work is only done when the thing that does it succeeded.
+    Ok(close_bound(doors, facts, store_url, scope, code_id, value))
+}
+
+/// Close every open task bound to `code_id`, and say so in the value the model
+/// reads. Best effort in the same sense as a counter: the step already ran, and
+/// a store that cannot take the move must not turn a success into a failure —
+/// it must be VISIBLE instead, so the answer carries the error rather than
+/// swallowing it.
+fn close_bound(
+    doors: &mut impl Doors,
+    facts: &Facts<'_>,
+    store_url: &str,
+    scope: u64,
+    code_id: u64,
+    value: Value,
+) -> Value {
+    let Some(task_ids) = facts.ends_on.get(&code_id) else {
+        return value;
+    };
+    if task_ids.is_empty() {
+        return value;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let mut closed: Vec<u64> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for task_id in task_ids {
+        let moved = doors.post(
+            &format!("{store_url}/tasks/{scope}/{task_id}/move"),
+            &json!({ "state": "done", "ts_ms": now }),
+        );
+        match moved {
+            Ok(_) => closed.push(*task_id),
+            Err(error) => errors.push(format!("task {task_id}: {error}")),
+        }
+    }
+    // The step's own document is NEVER edited: it is wrapped, so a caller (or a
+    // model reading the transcript) finds the script's answer whole under
+    // `result`, and what the call closed beside it. Merging keys into the script's
+    // object would be this executor rewriting somebody else's answer.
+    let mut out = json!({ "result": value });
+    if let Value::Object(map) = &mut out {
+        if !closed.is_empty() {
+            map.insert("finished_tasks".into(), json!(closed));
+        }
+        if !errors.is_empty() {
+            map.insert("finish_errors".into(), json!(errors));
+        }
+    }
+    out
 }
 
 /// One code row this turn walked, in order. The description rides along because
@@ -831,11 +900,19 @@ mod tests {
         gets: Vec<String>,
         mounts: Vec<(String, String, Value)>,
         answers: Vec<(String, Value)>,
+        mount_error: Option<String>,
     }
 
     impl Recorder {
         fn answering(mut self, needle: &str, answer: Value) -> Self {
             self.answers.push((needle.to_string(), answer));
+            self
+        }
+
+        /// A node that refuses the run — the failure class a task binding must
+        /// not paper over.
+        fn refusing_the_run(mut self, reason: &str) -> Self {
+            self.mount_error = Some(reason.to_string());
             self
         }
     }
@@ -858,9 +935,16 @@ mod tests {
         fn mount(&mut self, type_name: &str, key: &str, args: Value) -> Result<Value, String> {
             self.mounts
                 .push((type_name.to_string(), key.to_string(), args));
-            Ok(json!({ "ran": true }))
+            match &self.mount_error {
+                Some(reason) => Err(reason.clone()),
+                None => Ok(json!({ "ran": true })),
+            }
         }
     }
+
+    /// The ordinary case: nothing bound, so nothing closes.
+    static NOTHING_BOUND: std::collections::BTreeMap<u64, Vec<u64>> =
+        std::collections::BTreeMap::new();
 
     fn facts<'a>(mounts: &'a [(String, String)], session: &'a str) -> Facts<'a> {
         Facts {
@@ -868,6 +952,21 @@ mod tests {
             memory_scope: Some(37),
             mounts,
             session,
+            ends_on: &NOTHING_BOUND,
+        }
+    }
+
+    fn facts_bound<'a>(
+        mounts: &'a [(String, String)],
+        session: &'a str,
+        ends_on: &'a std::collections::BTreeMap<u64, Vec<u64>>,
+    ) -> Facts<'a> {
+        Facts {
+            store_url: "http://mem.test/",
+            memory_scope: Some(37),
+            mounts,
+            session,
+            ends_on,
         }
     }
 
@@ -957,6 +1056,7 @@ mod tests {
             memory_scope: None,
             mounts: &mounts,
             session: "s-1",
+            ends_on: &Default::default(),
         };
         let Err(error) = call(
             &mut doors,
@@ -983,7 +1083,7 @@ mod tests {
                 }),
             )
             .answering(
-                "/code/5",
+                "/code/37/5",
                 json!({
                     "language": "python",
                     "description": "formats them",
@@ -1005,7 +1105,7 @@ mod tests {
             doors.gets,
             vec![
                 "http://mem.test/skills/37/9".to_string(),
-                "http://mem.test/code/5".to_string()
+                "http://mem.test/code/37/5".to_string()
             ],
             "the skill, then the code row the CHOSEN step names — never the first step by \
              accident"
@@ -1017,12 +1117,87 @@ mod tests {
         assert_eq!(args["args"]["repo"], "orbsh/okra");
     }
 
+    /// ADR-0003 §3: `task --finishes_on--> code`, and the CALL SITE closes it. The
+    /// model dispatched the step; nothing about the close is its judgement, and
+    /// nothing about it is a round trip the model could have skipped.
+    #[test]
+    fn a_bound_task_is_closed_by_the_call_that_finished_it() {
+        let mounts = python_mount();
+        let mut ends_on: std::collections::BTreeMap<u64, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        ends_on.insert(5, vec![12, 14]);
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":5}]"# }))
+            .answering("/code/37/5", json!({ "language": "python", "source": "print(1)" }));
+
+        let value = call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9, "step": 0 }),
+            &facts_bound(&mounts, "channel-7", &ends_on),
+            &mut Vec::new(),
+        )
+        .expect("the mount answered");
+
+        let moves: Vec<&(String, Value)> = doors
+            .posts
+            .iter()
+            .filter(|(url, _)| url.contains("/tasks/37/"))
+            .collect();
+        assert_eq!(moves.len(), 2, "one move per bound task: {:?}", doors.posts);
+        assert!(moves[0].0.ends_with("/tasks/37/12/move"), "{:?}", moves[0].0);
+        assert!(moves[1].0.ends_with("/tasks/37/14/move"), "{:?}", moves[1].0);
+        assert_eq!(moves[0].1["state"], json!("done"));
+        assert!(
+            moves[0].1["ts_ms"].as_u64().unwrap_or_default() > 0,
+            "the caller's clock rides the move"
+        );
+        assert_eq!(
+            value["finished_tasks"],
+            json!([12, 14]),
+            "the model is told what the call closed: {value}"
+        );
+        assert_eq!(
+            value["result"]["ran"],
+            json!(true),
+            "the step's own answer rides whole under `result`"
+        );
+    }
+
+    #[test]
+    fn a_failed_step_closes_nothing() {
+        let mounts = python_mount();
+        let mut ends_on: std::collections::BTreeMap<u64, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        ends_on.insert(5, vec![12]);
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":5}]"# }))
+            .answering("/code/37/5", json!({ "language": "python", "source": "print(1)" }))
+            .refusing_the_run("the node died");
+
+        let error = call(
+            &mut doors,
+            "invoke_skill",
+            &json!({ "skill_id": 9, "step": 0 }),
+            &facts_bound(&mounts, "channel-7", &ends_on),
+            &mut Vec::new(),
+        )
+        .expect_err("the mount refused");
+
+        assert_eq!(error, "the node died");
+        assert!(
+            !doors.posts.iter().any(|(url, _)| url.contains("/tasks/")),
+            "work is not done when the thing that does it failed: {:?}",
+            doors.posts
+        );
+    }
+
     #[test]
     fn invoke_skill_refuses_a_language_no_mount_serves() {
         let mounts = python_mount();
         let mut doors = Recorder::default()
             .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
-            .answering("/code/4", json!({ "language": "nu", "source": "1 + 1" }));
+            .answering("/code/37/4", json!({ "language": "nu", "source": "1 + 1" }));
 
         let Err(error) = call(
             &mut doors,
@@ -1066,7 +1241,7 @@ mod tests {
         let mut doors = Recorder::default()
             .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
             .answering(
-                "/code/4",
+                "/code/37/4",
                 json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
             );
         call(
@@ -1083,7 +1258,7 @@ mod tests {
         let mut doors = Recorder::default()
             .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
             .answering(
-                "/code/4",
+                "/code/37/4",
                 json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
             );
         let Err(error) = call(
@@ -1103,7 +1278,7 @@ mod tests {
         let mut doors = Recorder::default()
             .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
             .answering(
-                "/code/4",
+                "/code/37/4",
                 json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
             );
         let Err(error) = call(
@@ -1129,7 +1304,7 @@ mod tests {
             let mut doors = Recorder::default()
                 .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
                 .answering(
-                    "/code/4",
+                    "/code/37/4",
                     json!({ "language": "python", "parameters": parameters, "source": "print(1)" }),
                 );
             call(
@@ -1151,7 +1326,7 @@ mod tests {
         let mut doors = Recorder::default()
             .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
             .answering(
-                "/code/4",
+                "/code/37/4",
                 json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
             );
         let Err(error) = call(
@@ -1283,7 +1458,7 @@ mod tests {
                 json!({ "steps": r#"[{"code_id": 4, "note": "run"}]"# }),
             )
             .answering(
-                "/code/4",
+                "/code/37/4",
                 json!({ "language": "python", "description": "adds", "parameters": "{}", "source": "print(1)" }),
             );
         let mounts = python_mount();
@@ -1343,7 +1518,7 @@ mod tests {
                 json!({ "steps": r#"[{"code_id": 4, "note": "run"}]"# }),
             )
             .answering(
-                "/code/4",
+                "/code/37/4",
                 json!({ "language": "python", "description": "adds", "parameters": "{}", "source": "print(1)" }),
             );
         let mut doors = Broken(inner);

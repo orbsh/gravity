@@ -38,9 +38,57 @@ pub fn render_owed(tasks: &[Value]) -> Option<String> {
         if !next.is_empty() {
             block.push_str(&format!(" - {next}"));
         }
+        // A bound task closes ITSELF when its code row runs (ADR-0003 §3). Saying
+        // so here is what keeps the model from moving work the executor is about
+        // to close, and from waiting on a `move_task` nobody needs to make.
+        let bound: Vec<String> = task
+            .get("finishes_on")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|code| code.as_u64())
+            .map(|code| code.to_string())
+            .collect();
+        if !bound.is_empty() {
+            block.push_str(&format!(" [closes when code {} runs]", bound.join(", ")));
+        }
     }
-    block.push_str("\nMove them with `move_task`, add work with `open_task`, close with `state: done`.");
+    block.push_str(
+        "\nMove them with `move_task`, add work with `open_task`, close with `state: done`. \
+         A task marked `[closes when code N runs]` closes by itself when that step \
+         succeeds — do not move it afterwards.",
+    );
     Some(block)
+}
+
+/// Which tasks each CODE row finishes, built from the listing the turn already
+/// fetched (`finishes_on` edges, k10r ADR-0021). One map, read once per turn:
+/// the call site looks up a code id here instead of asking the store anything —
+/// ADR-0003 §4's "every in-turn check is a memory read", literally.
+///
+/// A task already `done` is left out: closing it again would only bump its
+/// clock, and the map exists to close work, not to restate it.
+pub fn bindings(tasks: &[Value]) -> std::collections::BTreeMap<u64, Vec<u64>> {
+    let mut out: std::collections::BTreeMap<u64, Vec<u64>> = std::collections::BTreeMap::new();
+    for task in tasks {
+        if task.get("state").and_then(Value::as_str) == Some("done") {
+            continue;
+        }
+        let Some(id) = task.get("node_id").and_then(Value::as_u64) else {
+            continue;
+        };
+        let bound = task
+            .get("finishes_on")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        for code in bound {
+            if let Some(code) = code.as_u64() {
+                out.entry(code).or_default().push(id);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -51,6 +99,26 @@ mod tests {
 
     fn task(id: u64, state: &str, name: &str, next: &str) -> serde_json::Value {
         json!({ "node_id": id, "state": state, "name": name, "next": next })
+    }
+
+    #[test]
+    fn a_done_task_needs_no_closing() {
+        // The map is what the call site closes with; a task already `done` must
+        // not ride it, or every later run of that code bumps its clock.
+        let bound = json!({ "node_id": 12, "state": "doing", "name": "a",
+                            "finishes_on": [7] });
+        let closed = json!({ "node_id": 13, "state": "done", "name": "b",
+                             "finishes_on": [7] });
+        let map = super::bindings(&[bound, closed]);
+        assert_eq!(map.get(&7), Some(&vec![12]), "only the open one: {map:?}");
+    }
+
+    #[test]
+    fn one_code_row_may_finish_several_tasks() {
+        let first = json!({ "node_id": 12, "state": "open", "name": "a", "finishes_on": [7] });
+        let second = json!({ "node_id": 14, "state": "blocked", "name": "b", "finishes_on": [7] });
+        let map = super::bindings(&[first, second]);
+        assert_eq!(map.get(&7), Some(&vec![12, 14]));
     }
 
     #[test]
@@ -66,6 +134,22 @@ mod tests {
         assert!(block.contains("- 9 - doing - ship-the-face-change - read the diff"));
         assert!(block.contains("- 3 - open - write-the-diff"));
         assert!(!block.contains("old-thing"), "done is not owed");
+    }
+
+    #[test]
+    fn a_bound_task_says_which_step_closes_it() {
+        // The model must see that this one needs no `move_task`: the call site
+        // closes it. Unbound tasks stay unmarked.
+        let bound = json!({ "node_id": 12, "state": "doing", "name": "a", "next": "",
+                            "finishes_on": [7, 9] });
+        let free = task(13, "open", "b", "");
+        let block = render_owed(&[bound, free]).expect("owed");
+        assert!(
+            block.contains("- 12 - doing - a [closes when code 7, 9 runs]"),
+            "{block}"
+        );
+        assert!(block.contains("- 13 - open - b\n"), "unmarked: {block}");
+        assert!(block.contains("closes by itself"), "{block}");
     }
 
     #[test]

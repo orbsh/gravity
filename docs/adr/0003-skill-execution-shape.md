@@ -151,3 +151,29 @@ ADR-0015 §B and `okm/docs/PLAN.md` (relations: `link`/`unlink`, no implicit
 cleanup), aura ADR-0043 (the ctx surface a glue script calls through), and the
 memory records on emergent skill boundaries (usage statistics, not edge
 rewrites).
+
+## Update (2026-10-31) — §3's binding and §4's gate landed
+
+**§3's binding is `task --finishes_on--> code`, and it is an ordinary fact.** k10r
+ADR-0023 made a code row a VERTEX of the fact graph (it was a bare surrogate id with
+nothing to point at, which is why this clause had no way to be written), so the edge
+lands where every other edge lands. The door states it at open
+(`POST /tasks/{scope} {name, finishes_on: [code_id…]}`), a code id nobody delivered is
+refused by name, and re-stating it is idempotent without moving the task's state.
+
+**The completion write is GRAVITY'S, at the call site** — the open half of this ADR is
+now closed. Gravity reads the binding off the turn-start listing
+(`finishes_on` per task, resolved from the edges), builds one local table per turn, and
+after a step SUCCEEDS moves every task bound to that code row to `done`; a failed or
+refused step writes nothing. The tool result reports what it closed
+(`finished_tasks`), because the model must not be surprised by work disappearing from
+its list. The step's own document rides whole under `result` — the executor does not
+edit the script's answer.
+
+**§4's "with the projection it already fetches" was wrong on the ground, and the
+implementation keeps two reads.** The session projection is one door (channel state,
+`GET …/session`); the open-task listing is another (`GET /tasks/{scope}`) and carries
+the bindings. Merging them would make one door's shape bend to the other's. What the
+clause MEANT still holds: the listing is fetched ONCE per turn, before the loop, and
+every in-turn check reads that local table — zero per-call round trips, no LLM on the
+path.

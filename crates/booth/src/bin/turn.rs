@@ -491,12 +491,15 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     // starts every conversation from zero, which is the state this whole stack
     // exists to end. Best effort — a store that cannot answer is the store's
     // problem, and the model can still ask with `list_tasks`.
-    {
-        let scope = turn.memory_scope;
-        if let Some(open) = open_tasks(&turn.store_url, scope) {
-            messages.push(json!({ "role": "system", "content": open }));
-        }
+    //
+    // The same rows answer a second question the loop asks: which code rows
+    // finish which tasks (ADR-0003 §3). Fetched ONCE here, so the dispatch
+    // below reads a local table and never the store.
+    let owed = fetch_tasks(&turn.store_url, turn.memory_scope);
+    if let Some(block) = owed.as_deref().and_then(gravity_booth::tasks::render_owed) {
+        messages.push(json!({ "role": "system", "content": block }));
     }
+    let ends_on = gravity_booth::tasks::bindings(owed.as_deref().unwrap_or_default());
     // The tail branches see the same records, NUMBERED: an operation that must
     // point at one (the compression's cut) answers with an index, because the
     // store owns positions and a model cannot see them.
@@ -600,6 +603,7 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
                 memory_scope: Some(turn.memory_scope),
                 mounts: &mounts,
                 session: &session,
+                ends_on: &ends_on,
             };
             // The ctx borrow lives only for this call: the provider re-open
             // below needs it back.
@@ -1610,12 +1614,12 @@ fn file_composition(store_url: &str, scope: u64, walked: &[gravity_booth::tools:
 /// The tasks a turn must know about, as one system block. `None` when none are
 /// owed or the store cannot answer: an empty preamble is noise, and a store error
 /// is not this executor's to report.
-fn open_tasks(store_url: &str, scope: u64) -> Option<String> {
+fn fetch_tasks(store_url: &str, scope: u64) -> Option<Vec<Value>> {
     let resp = ureq::get(&format!("{store_url}/tasks/{scope}"))
         .call()
         .ok()?;
     let tasks: Value = serde_json::from_reader(resp.into_reader()).ok()?;
-    gravity_booth::tasks::render_owed(tasks.as_array()?)
+    tasks.as_array().cloned()
 }
 
 #[cfg(test)]
