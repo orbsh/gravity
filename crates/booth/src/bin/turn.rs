@@ -35,7 +35,7 @@
 
 use anyhow::Context;
 use gravity_booth::tools::Doors;
-use gravity_core::surface::MemoryFormat;
+use gravity_core::surface::{Kind, MemoryFormat, Role};
 use induction_guest::{Ctx, Guest};
 use serde_json::{json, Value};
 
@@ -516,9 +516,13 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
         .into_iter()
         .enumerate()
     {
-        // The entry is FLAT: `role` is the resolved NAME (null for a code
-        // k10r does not police → the user's turn, the pre-existing fallback).
-        let role = entry.get("role").and_then(Value::as_str).unwrap_or("user");
+        // The entry is FLAT and `role` is the resolved NAME — k10r's mapping, the
+        // one place a code becomes a label. `null` means a stored code that
+        // mapping does not know (a writer's bug: k10r does not police codes and
+        // will not guess). The row happened, so dropping it would hide history;
+        // naming it `user` would put words in the user's mouth. `system` says
+        // exactly what is true: a record whose speaker cannot be named.
+        let role = entry.get("role").and_then(Value::as_str).unwrap_or("system");
         let content = entry
             .get("content")
             .and_then(Value::as_str)
@@ -992,12 +996,12 @@ fn frames_model(ctx: &mut Ctx) -> anyhow::Result<Vec<Value>> {
             &model_id.to_string(),
             "the model this deployment answers with",
             &[
-                ("alias", "default", Kind::Text, &model),
-                ("endpoint", "https://…/v1", Kind::Text, &model),
-                ("model", "model id", Kind::Text, &model),
-                ("key_env", "the env var holding the key", Kind::Text, &model),
-                ("weight", "1", Kind::Number, &model),
-                ("enabled", "1", Kind::Number, &model),
+                ("alias", "default", FieldKind::Text, &model),
+                ("endpoint", "https://…/v1", FieldKind::Text, &model),
+                ("model", "model id", FieldKind::Text, &model),
+                ("key_env", "the env var holding the key", FieldKind::Text, &model),
+                ("weight", "1", FieldKind::Number, &model),
+                ("enabled", "1", FieldKind::Number, &model),
             ],
         ),
         frame_form(
@@ -1005,10 +1009,10 @@ fn frames_model(ctx: &mut Ctx) -> anyhow::Result<Vec<Value>> {
             "1",
             "how this deployment remembers",
             &[
-                ("store_url", "http://127.0.0.1:7760", Kind::Text, &settings),
-                ("memory_scope", "37", Kind::Number, &settings),
-                ("memory_format", "plaintext", Kind::Text, &settings),
-                ("default_model", "1", Kind::Number, &settings),
+                ("store_url", "http://127.0.0.1:7760", FieldKind::Text, &settings),
+                ("memory_scope", "37", FieldKind::Number, &settings),
+                ("memory_format", "plaintext", FieldKind::Text, &settings),
+                ("default_model", "1", FieldKind::Number, &settings),
             ],
         ),
     ])
@@ -1017,7 +1021,7 @@ fn frames_model(ctx: &mut Ctx) -> anyhow::Result<Vec<Value>> {
 /// How a field is typed on the screen: a text input sends a string, a number input a float, and the
 /// row's declared width decides which of them encodes (see `coerce_numbers`).
 #[derive(Clone, Copy, PartialEq)]
-enum Kind {
+enum FieldKind {
     Text,
     Number,
 }
@@ -1030,7 +1034,7 @@ fn frame_form(
     collection: &str,
     id: &str,
     heading: &str,
-    fields: &[(&str, &str, Kind, &Value)],
+    fields: &[(&str, &str, FieldKind, &Value)],
 ) -> Value {
     let mut children = vec![
         json!({"type": "text", "bind": {"value": {"kind": "default", "default": heading}}}),
@@ -1042,9 +1046,9 @@ fn frame_form(
         // field takes a JSON number (the renderer's `default_for` reads it as a float).
         let current = row.get(*name).cloned().unwrap_or(Value::Null);
         let default = match (kind, &current) {
-            (Kind::Text, Value::String(text)) => Value::String(text.clone()),
-            (Kind::Number, Value::Number(_)) => current.clone(),
-            (Kind::Number, _) => Value::from(hint.parse::<f64>().unwrap_or(0.0)),
+            (FieldKind::Text, Value::String(text)) => Value::String(text.clone()),
+            (FieldKind::Number, Value::Number(_)) => current.clone(),
+            (FieldKind::Number, _) => Value::from(hint.parse::<f64>().unwrap_or(0.0)),
             _ => Value::String(hint.to_string()),
         };
         children.push(json!({
@@ -1052,7 +1056,7 @@ fn frame_form(
             "bind": {"value": {
                 "kind": "field",
                 "field": name,
-                "type": if *kind == Kind::Number { "number" } else { "text" },
+                "type": if *kind == FieldKind::Number { "number" } else { "text" },
                 "default": default,
             }},
         }));
@@ -1599,14 +1603,6 @@ struct ToolEvent {
 /// input; the row is a record of the action, not a copy of its output.
 const TOOL_RESULT_LIMIT: usize = 2_000;
 
-/// Role and kind codes for one tool record (k10r's `role` / `kind` vocabulary,
-/// ADR-0008 §2). `SYSTEM` and not `TOOL`: the stored line is a RECORD that the
-/// action happened — a protocol `role:"tool"` message is only legal directly after
-/// the assistant's `tool_calls`, and replaying one three turns later is a request
-/// a provider rejects. `TOOL_CALL` (k10r's `kind`) is what marks it as this shape.
-const TOOL_RECORD_ROLE: u8 = 3;
-const TOOL_RECORD_KIND: u8 = 1;
-
 /// The line a tool record carries, as it will read in a later turn's prompt:
 /// self-describing on purpose — whoever reads the history is not parsing it.
 fn render_tool_event(event: &ToolEvent) -> String {
@@ -1633,17 +1629,22 @@ fn append_exchange(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .context("turn: clock before epoch")?;
-    let mut rows: Vec<(u16, u8, u8, String)> =
-        vec![(0, 0, 0, user_message.to_string())];
+    // A tool record is `System` and not `Tool`: the stored line is a RECORD that
+    // the action happened — a protocol `role:"tool"` message is only legal
+    // directly after the assistant's `tool_calls`, and replaying one three turns
+    // later is a request a provider rejects.
+    let mut rows: Vec<(u16, Role, Kind, String)> =
+        vec![(0, Role::User, Kind::Text, user_message.to_string())];
     for (index, event) in tool_events.iter().enumerate() {
         // `sub` is u16: the loop caps at 8 rounds, so this cannot be reached by a
         // running turn — the saturating cast is for the type, not for a case.
         let sub = 1 + u16::try_from(index).unwrap_or(u16::MAX - 2);
-        rows.push((sub, TOOL_RECORD_ROLE, TOOL_RECORD_KIND, render_tool_event(event)));
+        rows.push((sub, Role::System, Kind::ToolCall, render_tool_event(event)));
     }
     let answer_sub = 1 + u16::try_from(tool_events.len()).unwrap_or(u16::MAX - 2);
-    rows.push((answer_sub, 1, 0, reply.to_string()));
+    rows.push((answer_sub, Role::Assistant, Kind::Text, reply.to_string()));
     for (sub, role, kind, content) in rows {
+        let (role, kind) = (role.code(), kind.code());
         let url = format!("{}/channels/{}/messages", turn.store_url, turn.channel_id);
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")

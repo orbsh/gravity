@@ -26,7 +26,13 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and
   later is a request providers reject. Why only successes: a correction loop's
   failures are PROCESS — the model needed them to fix the call, a later turn does
   not, and a retried-identical call keeps only its last answer. A failed turn still
-  appends nothing, tool rows included. Gate: gravity 86/0, prism 64/0.
+  appends nothing, tool rows included. The writer states codes through
+  `gravity_core::surface::{Role, Kind}` (`#[repr(u8)]`, discriminants spelled as
+  k10r's own constants, `TryFrom<u8>` total) instead of literals — and the labels
+  stay k10r's: the enum carries codes, `role_name` carries names, so there is one
+  mapping, not two. Reading back, a code the store does not recognise now renders
+  as `system`, not `user` (the row happened; its speaker is unnamed; `user` would
+  put words in the user's mouth). Gate: gravity 88/0, prism 64/0.
   STILL OPEN in this phase: the cold-call half (`Nature` is declared on all ten
   specs and read NOWHERE; the entry-split path — persist + prune the transcript,
   end the task, re-enter on the result — does not exist).

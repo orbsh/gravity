@@ -76,10 +76,87 @@ impl MemoryFormat {
     }
 }
 
+/// Who a message row is from, as k10r declares it (`mem_core::channel::role`).
+///
+/// The STORE keeps a plain `u8` — a protocol code, not a vocabulary — and this
+/// enum is the writer's shape at the edge: no magic numbers in the turn, and a
+/// reordered variant cannot renumber the wire because every discriminant is
+/// spelled out. The numeric table itself stays k10r's (`role::USER` … are the
+/// discriminants below); this type adds the shape, not a second table.
+///
+/// Names are NOT here on purpose: `user`/`assistant`/… is k10r's `role_name`,
+/// the one place the code becomes a label, and every reader — the projection a
+/// UI consumes and the prompt a model consumes — takes it from there. A second
+/// label table in this crate would be a second source of truth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Role {
+    User = mem_core::channel::role::USER,
+    Assistant = mem_core::channel::role::ASSISTANT,
+    Tool = mem_core::channel::role::TOOL,
+    System = mem_core::channel::role::SYSTEM,
+}
+
+impl Role {
+    /// The byte this row is stored under.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Reading a stored code back. Total: an unknown code is the caller's bug and
+/// comes back as `Err`, never as a default — a fallback here would silently
+/// relabel a row nobody can name.
+impl TryFrom<u8> for Role {
+    type Error = u8;
+
+    fn try_from(code: u8) -> Result<Self, u8> {
+        Ok(match code {
+            mem_core::channel::role::USER => Role::User,
+            mem_core::channel::role::ASSISTANT => Role::Assistant,
+            mem_core::channel::role::TOOL => Role::Tool,
+            mem_core::channel::role::SYSTEM => Role::System,
+            other => return Err(other),
+        })
+    }
+}
+
+/// What a row IS, as k10r declares it (`mem_core::channel::kind`). Same
+/// reasoning as [`Role`]: a protocol code the store keeps as a byte, and a
+/// writer's shape at the edge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Kind {
+    Text = mem_core::channel::kind::TEXT,
+    ToolCall = mem_core::channel::kind::TOOL_CALL,
+    ToolResult = mem_core::channel::kind::TOOL_RESULT,
+}
+
+impl Kind {
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+impl TryFrom<u8> for Kind {
+    type Error = u8;
+
+    fn try_from(code: u8) -> Result<Self, u8> {
+        Ok(match code {
+            mem_core::channel::kind::TEXT => Kind::Text,
+            mem_core::channel::kind::TOOL_CALL => Kind::ToolCall,
+            mem_core::channel::kind::TOOL_RESULT => Kind::ToolResult,
+            other => return Err(other),
+        })
+    }
+}
+
 /// One increment entry as the projection carries it: the key the message
 /// lives under, the LLM role NAME (k10r's mapping), the kind byte and the
 /// content. `role` is `None` for a stored code k10r does not police — a
-/// writer's bug, which the turn loop surfaces by falling back to `user`.
+/// writer's bug, which the turn loop renders as `system` (the record happened,
+/// but its speaker cannot be named, and calling it `user` would put words in
+/// the user's mouth).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ViewRow {
     pub role: Option<String>,
@@ -429,5 +506,37 @@ impl MemorySurface for HttpSurface {
             ts_ms,
             sub,
         })
+    }
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::{Kind, Role};
+
+    /// The codes are k10r's, not this crate's invention: a mismatch here means the
+    /// store and the writer disagree about what byte 3 means.
+    #[test]
+    fn the_codes_are_the_stores() {
+        assert_eq!(Role::User.code(), mem_core::channel::role::USER);
+        assert_eq!(Role::Assistant.code(), mem_core::channel::role::ASSISTANT);
+        assert_eq!(Role::Tool.code(), mem_core::channel::role::TOOL);
+        assert_eq!(Role::System.code(), mem_core::channel::role::SYSTEM);
+        assert_eq!(Kind::Text.code(), mem_core::channel::kind::TEXT);
+        assert_eq!(Kind::ToolCall.code(), mem_core::channel::kind::TOOL_CALL);
+        assert_eq!(Kind::ToolResult.code(), mem_core::channel::kind::TOOL_RESULT);
+    }
+
+    /// Every stored code either decodes or is refused — never a silent default.
+    /// Counting the decodable codes catches an arm that was never written: the
+    /// domain is four values wide, and a code the enum forgot would come back as
+    /// an error for a row the store legitimately holds.
+    #[test]
+    fn the_domains_are_exactly_as_wide_as_declared() {
+        let roles: Vec<u8> = (0..=255u8).filter(|c| Role::try_from(*c).is_ok()).collect();
+        assert_eq!(roles, vec![0, 1, 2, 3], "four roles, contiguous from 0");
+        let kinds: Vec<u8> = (0..=255u8).filter(|c| Kind::try_from(*c).is_ok()).collect();
+        assert_eq!(kinds, vec![0, 1, 2], "three kinds, contiguous from 0");
+        assert_eq!(Role::try_from(4u8), Err(4));
+        assert_eq!(Kind::try_from(9u8), Err(9));
     }
 }
