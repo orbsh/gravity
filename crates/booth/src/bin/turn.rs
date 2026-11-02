@@ -606,6 +606,20 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
         // the key to the caller): a step script's own state survives the turns
         // of one conversation and nothing else.
         let session = format!("channel-{channel_id}-member-{member_id}");
+        // The COLD path (PLAN Phase 2.5), before the round is dispatched: a
+        // `human`-nature call touches the outside world and may not answer for
+        // minutes, so the transcript stops carrying payloads it has already used.
+        // Finished rounds collapse into net-effect lines; the round about to run
+        // stays raw, because the results of THAT round are what the next
+        // inference needs. `fast` rounds never trigger it — zero flushes unless
+        // the declaration says the call is cold.
+        if parsed
+            .iter()
+            .any(|call| gravity_booth::tools::nature_of(&call.function.name)
+                == Some(gravity_booth::tools::Nature::Human))
+        {
+            compact_finished_rounds(&mut messages);
+        }
         // The call round itself, once: the wire shape of "the assistant asked
         // for these N tools", which the results below answer one by one.
         messages.push(json!({ "role": "assistant", "tool_calls": calls }));
@@ -1354,8 +1368,9 @@ fn open_branch(
     };
     let mut messages: Vec<Value> = prefix.to_vec();
     messages.push(json!({ "role": "user", "content": prompt }));
-    // The operation's OWN provider instance (see the note above): the guest keeps
-    // one stream per process, so this is what keeps two branches from sharing one.
+    // Each request needs its own connection — a request is stateless, and the
+    // saving comes from the endpoint's prefix cache, not from a shared stream — so
+    // every operation gets its own provider instance, keyed by its name.
     let first = match ctx.iterate_start(
         "llm_provider",
         name,
@@ -1449,13 +1464,17 @@ fn step_tail(ctx: &mut Ctx, turn: &Turn<'_>, tails: &mut Vec<Tail>) {
     tails.push(branch);
 }
 
-/// Drain the live branch before the turn closes. The carrier releases the turn's
-/// streams at its end and the guest's state goes with it, so a branch still live
-/// here is pulled to completion: the summary must land before the next user
-/// message (Phase 3), and the answer has already streamed, so the only wait is
-/// the product's own tail. The cap keeps a runaway branch from holding the turn
-/// open; what is left unlanded is k10r's open node, which its next read treats
-/// as "compressing".
+/// Drain the live branch before the turn closes. The reason is NOT that the
+/// carrier reclaims the stream when the entry returns (it does not — a stream is
+/// released by `iterate_dispose` or by eviction, ADR-0034 §3): it is that a pull
+/// stream does not move on its own. The pull loop IS this call stack, so the
+/// moment the turn returns, nobody is left to ask for the next envelope and the
+/// branch would sit idle until eviction. Draining is therefore the only way to
+/// land the summary from here — the summary must be in place before the next user
+/// message (Phase 3) and the answer has already streamed, so the wait is the
+/// product's own tail. The cap keeps a runaway branch from holding the turn open;
+/// what is left unlanded is k10r's open node, which its next read treats as
+/// "compressing".
 fn drain_tails(ctx: &mut Ctx, turn: &Turn<'_>, tails: &mut Vec<Tail>) {
     for _ in 0..64 {
         if tails.is_empty() {
@@ -1603,16 +1622,97 @@ struct ToolEvent {
 /// input; the row is a record of the action, not a copy of its output.
 const TOOL_RESULT_LIMIT: usize = 2_000;
 
-/// The line a tool record carries, as it will read in a later turn's prompt:
-/// self-describing on purpose — whoever reads the history is not parsing it.
-fn render_tool_event(event: &ToolEvent) -> String {
-    let mut result = event.result.clone();
+/// The line one call reads as, truncated: used for the record a turn leaves in
+/// the history AND for the transcript compaction a cold call performs. One
+/// renderer, because both are the same claim — this call happened, this came
+/// back — and two renderers would drift into two vocabularies.
+fn render_call_line(tool: &str, args: &str, result: &str) -> String {
+    let mut result = result.to_string();
     if result.len() > TOOL_RESULT_LIMIT {
-        let cut = result.char_indices().nth(TOOL_RESULT_LIMIT).map(|(i, _)| i).unwrap_or(result.len());
+        let cut = result
+            .char_indices()
+            .nth(TOOL_RESULT_LIMIT)
+            .map(|(i, _)| i)
+            .unwrap_or(result.len());
         result.truncate(cut);
         result.push_str("… (truncated)");
     }
-    format!("[tool] {} {} -> {}", event.tool, event.args, result)
+    format!("[tool] {tool} {args} -> {result}")
+}
+
+/// The line a tool record carries, as it will read in a later turn's prompt:
+/// self-describing on purpose — whoever reads the history is not parsing it.
+fn render_tool_event(event: &ToolEvent) -> String {
+    render_call_line(&event.tool, &event.args, &event.result)
+}
+
+/// Compact every FINISHED round of the working transcript into the same
+/// net-effect lines the history would carry (PLAN Phase 2.5's cold path: "the
+/// transcript takes the minimal replay set").
+///
+/// A round is one `assistant` message carrying `tool_calls` plus the `tool`
+/// messages that answer those ids — the wire shape a provider requires. It
+/// cannot be compacted on one side only: an unanswered `tool_calls` message is a
+/// malformed request. So the whole group is replaced by one `system` line per
+/// call, which is both legal and smaller.
+///
+/// Called only when the round ABOUT to be dispatched asks for a `human`-nature
+/// tool: such a call may not come back for minutes (or at all), and the model
+/// has already read the earlier payloads to decide it — what a cold call needs
+/// is the shape of what happened, not the bytes. `fast` calls never trigger it:
+/// their results are what the next inference is reasoning over, and flushing
+/// them would cost the turn its own context for nothing.
+fn compact_finished_rounds(messages: &mut Vec<Value>) {
+    let mut out: Vec<Value> = Vec::with_capacity(messages.len());
+    let mut index = 0;
+    while index < messages.len() {
+        let calls = messages[index].get("tool_calls").and_then(Value::as_array);
+        let Some(calls) = calls.cloned() else {
+            out.push(messages[index].clone());
+            index += 1;
+            continue;
+        };
+        let ids: Vec<&str> = calls
+            .iter()
+            .filter_map(|call| call.get("id").and_then(Value::as_str))
+            .collect();
+        let mut end = index + 1;
+        let mut answers: Vec<Value> = Vec::new();
+        while end < messages.len() {
+            match messages[end].get("tool_call_id").and_then(Value::as_str) {
+                Some(id) if ids.contains(&id) => {
+                    answers.push(messages[end].clone());
+                    end += 1;
+                }
+                _ => break,
+            }
+        }
+        // An INCOMPLETE group is left as it is: it is not valid to hand the
+        // provider either way, and rewriting it here would hide the bug.
+        if answers.len() != ids.len() {
+            out.push(messages[index].clone());
+            index += 1;
+            continue;
+        }
+        for (call, answer) in calls.iter().zip(answers.iter()) {
+            let name = call
+                .pointer("/function/name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let args = call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let content = answer.get("content").and_then(Value::as_str).unwrap_or("");
+            let line = format!(
+                "{} (earlier step, compacted: the raw result was read when it arrived)",
+                render_call_line(name, args, content)
+            );
+            out.push(json!({ "role": "system", "content": line }));
+        }
+        index = end;
+    }
+    *messages = out;
 }
 
 /// Append the exchange: one ts for the whole thing, `sub` ordering the events —

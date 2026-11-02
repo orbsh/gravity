@@ -373,6 +373,17 @@ pub fn specs() -> &'static [ToolSpec] {
     SPECS
 }
 
+/// The nature declared for a tool, by name. `None` for a name the list does not
+/// declare (a model can invent one; the caller-refusal path handles it).
+///
+/// This is the reader Phase 2.5's cold half was missing: `nature` was written on
+/// every entry and read nowhere, which made the declaration a comment. The
+/// writing side lists ten tools and no runtime registry — the list IS the
+/// registry, so the lookup is here and not in a table of its own.
+pub fn nature_of(name: &str) -> Option<Nature> {
+    SPECS.iter().find(|s| s.name == name).map(|s| s.nature)
+}
+
 /// The names this deployment serves — the ones an unknown call is answered
 /// with.
 pub fn names() -> Vec<&'static str> {

@@ -1753,3 +1753,171 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
         .expect("a click-configured deployment runs a turn");
     assert_eq!(deltas.join(""), "hi");
 }
+
+/// A round that asks for a `human`-nature tool is a COLD call: it may not come
+/// back for minutes, so the transcript stops carrying payloads it has already
+/// consumed. Everything FINISHED collapses into the net-effect line the history
+/// uses; the round about to run stays raw, because its results are what the next
+/// inference reasons over. This is PLAN Phase 2.5's cold half as the runtime can
+/// hold it today — `nature` had no reader at all before this.
+#[tokio::test]
+async fn a_cold_call_compacts_the_rounds_it_already_used() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let hits_for_route = hits.clone();
+    let bodies_for_route = bodies.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move |request: axum::extract::Request| {
+            let bodies = bodies_for_route.clone();
+            async move {
+                let n = hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&bytes).to_string());
+                let mut sse = String::new();
+                match n {
+                    0 => sse.push_str(
+                        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"resolve_skills","arguments":"{\"query\":\"pdf\"}"}}]}}]}"#,
+                    ),
+                    1 => sse.push_str(
+                        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c2","type":"function","function":{"name":"open_task","arguments":"{\"name\":\"cold-alpha\"}"}}]}}]}"#,
+                    ),
+                    _ => sse.push_str(r#"data: {"choices":[{"delta":{"content":"done"}}]}"#),
+                }
+                sse.push_str("\n\ndata: [DONE]\n\n");
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{addr}");
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+
+    let deltas = run_turn(&engine, &seen, turn_args("look it up, then log it"))
+        .await
+        .unwrap();
+    assert_eq!(deltas.join(""), "done");
+
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3, "three inference rounds");
+
+    // The round AFTER the fast call knows nothing of a cold call yet: the raw
+    // pairing is intact.
+    let second: Value = serde_json::from_str(&bodies[1]).unwrap();
+    let before = second["messages"].as_array().unwrap();
+    assert!(
+        before.iter().any(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("c1")),
+        "no compaction before a cold call is dispatched: {before:#?}"
+    );
+
+    // The round after the COLD call: the finished fast round is a line, not a
+    // payload pair.
+    let third: Value = serde_json::from_str(&bodies[2]).unwrap();
+    let after = third["messages"].as_array().unwrap();
+    assert!(
+        !after
+            .iter()
+            .any(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("c1")),
+        "the finished round's tool message is gone: {after:#?}"
+    );
+    assert!(
+        after.iter().any(|m| {
+            m.get("role").and_then(Value::as_str) == Some("system")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.starts_with("[tool] resolve_skills "))
+        }),
+        "the finished round is a net-effect line: {after:#?}"
+    );
+    // The round dispatched right now stays raw.
+    assert!(
+        after
+            .iter()
+            .any(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("c2")),
+        "the cold round's own result is not compacted: {after:#?}"
+    );
+
+    // And the history still holds one row per successful call, compaction or not.
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    let view = surface.fetch_session(7, 1).await.unwrap();
+    let rows: Vec<(Option<String>, String)> = view
+        .increment
+        .iter()
+        .map(|(_, m)| (m.role.clone(), m.content.clone()))
+        .collect();
+    assert_eq!(rows.len(), 4, "question + two calls + answer: {rows:#?}");
+    assert!(rows[1].1.starts_with("[tool] resolve_skills "));
+    assert!(rows[2].1.starts_with("[tool] open_task "));
+}
+
+/// A turn that only calls `fast` tools is never compacted: their results are what
+/// the next inference reasons over, and PLAN Phase 2.5 says "zero flushes" unless
+/// the declaration says the call is cold.
+#[tokio::test]
+async fn a_fast_only_turn_keeps_its_raw_results() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let hits_for_route = hits.clone();
+    let bodies_for_route = bodies.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move |request: axum::extract::Request| {
+            let bodies = bodies_for_route.clone();
+            async move {
+                let n = hits_for_route.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&bytes).to_string());
+                let mut sse = String::new();
+                if n < 2 {
+                    let id = if n == 0 { "c1" } else { "c2" };
+                    sse.push_str(&format!(
+                        r#"data: {{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"{id}","type":"function","function":{{"name":"resolve_skills","arguments":"{{\"query\":\"x\"}}"}}}}]}}}}]}}"#
+                    ));
+                } else {
+                    sse.push_str(r#"data: {"choices":[{"delta":{"content":"done"}}]}"#);
+                }
+                sse.push_str("\n\ndata: [DONE]\n\n");
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let endpoint = format!("http://{addr}");
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+
+    let deltas = run_turn(&engine, &seen, turn_args("look it up twice")).await.unwrap();
+    assert_eq!(deltas.join(""), "done");
+
+    let bodies = bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 3, "three inference rounds");
+    let third: Value = serde_json::from_str(&bodies[2]).unwrap();
+    let after = third["messages"].as_array().unwrap();
+    assert!(
+        after
+            .iter()
+            .any(|m| m.get("tool_call_id").and_then(Value::as_str) == Some("c1")),
+        "a fast-only turn is never flushed: {after:#?}"
+    );
+}
