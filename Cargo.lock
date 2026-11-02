@@ -3508,7 +3508,7 @@ dependencies = [
 [[package]]
 name = "okm-core"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#9bc1ac663cfbc457dfcae3bfafd0c939593e689a"
+source = "git+https://github.com/orbsh/okm?branch=main#613eaf1d98ceca4584da6278a3e75d01f4230bc2"
 dependencies = [
  "arrow",
  "fjall",
@@ -3531,7 +3531,7 @@ dependencies = [
 [[package]]
 name = "okm-derive"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#9bc1ac663cfbc457dfcae3bfafd0c939593e689a"
+source = "git+https://github.com/orbsh/okm?branch=main#613eaf1d98ceca4584da6278a3e75d01f4230bc2"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -3542,7 +3542,7 @@ dependencies = [
 [[package]]
 name = "okm-dynamic"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#9bc1ac663cfbc457dfcae3bfafd0c939593e689a"
+source = "git+https://github.com/orbsh/okm?branch=main#613eaf1d98ceca4584da6278a3e75d01f4230bc2"
 dependencies = [
  "okm-core",
 ]
@@ -3550,7 +3550,7 @@ dependencies = [
 [[package]]
 name = "okm-entry"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#9bc1ac663cfbc457dfcae3bfafd0c939593e689a"
+source = "git+https://github.com/orbsh/okm?branch=main#613eaf1d98ceca4584da6278a3e75d01f4230bc2"
 dependencies = [
  "okm-core",
  "okm-dynamic",
@@ -3560,7 +3560,7 @@ dependencies = [
 [[package]]
 name = "okm-steel"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#9bc1ac663cfbc457dfcae3bfafd0c939593e689a"
+source = "git+https://github.com/orbsh/okm?branch=main#613eaf1d98ceca4584da6278a3e75d01f4230bc2"
 dependencies = [
  "im-rc",
  "okm-core",
@@ -3573,7 +3573,7 @@ dependencies = [
 [[package]]
 name = "okm-vector"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#9bc1ac663cfbc457dfcae3bfafd0c939593e689a"
+source = "git+https://github.com/orbsh/okm?branch=main#613eaf1d98ceca4584da6278a3e75d01f4230bc2"
 dependencies = [
  "okm-core",
 ]
@@ -3581,7 +3581,7 @@ dependencies = [
 [[package]]
 name = "okm-wire"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#9bc1ac663cfbc457dfcae3bfafd0c939593e689a"
+source = "git+https://github.com/orbsh/okm?branch=main#613eaf1d98ceca4584da6278a3e75d01f4230bc2"
 
 [[package]]
 name = "once_cell"
@@ -5978,7 +5978,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
