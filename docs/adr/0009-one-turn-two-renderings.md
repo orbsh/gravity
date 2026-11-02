@@ -27,7 +27,7 @@ The turn's behaviour does not change with its audience: it fetches the projectio
 
 5. **Both clients are clients.** The web surface (a renderer leg) uses frames; the CLI uses raw deltas. Neither is privileged: the CLI is not a second executor and the page is not a second model driver — a turn is the same booth call, reached through the same venue. The venue strips the `view:` marker on the way down (prism ADR-0017), so a program sees the plain names it already speaks while the plane stays marked.
 
-6. **A cancelled or failed turn renders the same way.** Nothing about the output mode changes the append rule (ADR-0012: a failed turn appends nothing) or the cancellation boundary (ADR-0008).
+6. **A cancelled or failed turn renders the same way.** Nothing about the output mode changes the write rule or the cancellation boundary (ADR-0008): a cancelled or failed turn writes no closing record, so the rows it wrote stay OPEN and the projection skips them (krystallizer ADR-0024) — a reader sees nothing of it.
 
 ## Considered and rejected
 
@@ -46,7 +46,7 @@ The turn's behaviour does not change with its audience: it fetches the projectio
 
 ## Related records
 
-ADR-0001 (the execution surface), ADR-0002 (the CLI is a client of the venue, with exit codes as a contract), ADR-0007 (the configuration a turn reads), ADR-0008 (a cancelled turn renders like any other end), ADR-0012 (failure is a value). prism ADR-0017 (the marker, added and stripped by the venue) and prism `docs/MODELING.md` (the model this instance follows: an application is a view, and a program is a client of the same wire).
+ADR-0001 (the execution surface), ADR-0002 (the CLI is a client of the venue, with exit codes as a contract), ADR-0007 (the configuration a turn reads), ADR-0008 (a cancelled turn renders like any other end), ADR-0004 (a tool failure is a value the model reads). prism ADR-0017 (the marker, added and stripped by the venue) and prism `docs/MODELING.md` (the model this instance follows: an application is a view, and a program is a client of the same wire).
 
 ## Update — 2026-10-31: an event-routed submit reads no return value, so its end is said
 

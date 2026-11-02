@@ -246,12 +246,25 @@ jail is built from the node's own `CapabilitySurface` (`fs_scope` as write scope
 `deny_read`, `cwd`), `config.sandbox` is the switch the manifest line here
 assumed, and a declaration with no enforcement point fails the startup.
 
-Owed: gravity's own call site. No skill search and no
-`invoke(mount, key, entry, args{code, args})` exists yet — the turn still
-dispatches `ctx.invoke(tool_target, …)` to a booth type named `effector`, the
-pre-ruling shape (`crates/booth/src/bin/turn.rs`). It waits on two things: k10r
-serving the script bytes, and a ruling for the language default of dynamically
-written code.
+Gravity's own call site, which is the piece this surface is read from:
+
+- **The mount call exists.** `Doors::mount` is `ctx.invoke(type_name, key,
+  "execute", args)` (`crates/booth/src/bin/turn.rs`), the target is resolved from
+  the language → mount table the deployment declares, carried in the turn args
+  (`crates/booth/src/tools.rs`, `mount_for`), and the skill's script rides as
+  `{code, args}` exactly as §2 says. `mount_for` is a MATCH on the operation
+  language; a language no mount serves is a refusal naming what is served, never
+  a fallback.
+- **No `effector` type remains.** `crates/` names it nowhere.
+- **The language default was resolved by declining to have one.** `write_code`
+  makes `language` a required argument of the tool call: a default would be
+  gravity choosing someone else's mount, and the route is a deployment fact.
+
+One plumbing question this raised, still open: the mount table rides the turn
+ARGS, so every caller carries it (the CLI reads it from its venue config). prism
+already holds the same table as `PRISM_MOUNTS`, so a second declaration per client
+is a drift source; whether the venue should inject the table into the turn's args
+when it routes `ui:turn.submit` is not decided.
 
 ## Related records
 

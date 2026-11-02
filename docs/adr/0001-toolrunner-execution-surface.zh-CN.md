@@ -185,11 +185,20 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
 `CapabilitySurface` 构建（`fs_scope` 作写范围、`deny_read`、`cwd`），`config.sandbox` 就是
 这里清单行所假定的那个开关，而没有执法点的声明会让启动失败。
 
-仍欠：gravity 自己的调用点。今天既没有 skill search，也没有
-`invoke(mount, key, entry, args{code, args})`——turn 仍以裁决前的形态
-`ctx.invoke(tool_target, …)` 分派到名为 `effector` 的摊位类型
-（`crates/booth/src/bin/turn.rs`）。它等两件事：k10r 提供脚本字节，以及动态写出代码的
-语言默认值裁决。
+gravity 自己的调用点——这块执行面真正被读取的地方：
+
+- **mount 调用存在了。** `Doors::mount` 就是
+  `ctx.invoke(type_name, key, "execute", args)`（`crates/booth/src/bin/turn.rs`），目标由
+  部署声明的「操作语言 → mount」表解析、该表随 turn 参数传入（`crates/booth/src/tools.rs`
+  的 `mount_for`），skill 的脚本按 §2 以 `{code, args}` 随调用走。`mount_for` 是对操作语言
+  的 MATCH；没有 mount 服务的语言是一句点名"谁被服务"的拒绝，永不兜底。
+- **不再有 `effector` 类型。** `crates/` 里一处都不提。
+- **语言默认值靠"不给默认值"了结。** `write_code` 把 `language` 定为工具调用的必填参数：
+  给默认值等于 gravity 替别人挑 mount，而路由是部署事实。
+
+由此浮出的一个管路问题仍开着：这张表随 turn 参数走，于是每个调用方都得自己带（CLI 从它的
+venue 配置里读）。prism 已经持有同一张表（`PRISM_MOUNTS`），每多一个客户端多一份声明就是
+一个漂移源；该不该由 venue 在路由 `ui:turn.submit` 时把表注入 turn 参数，尚未裁决。
 
 ## 相关记录
 

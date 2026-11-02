@@ -24,8 +24,9 @@ exactly the drift an architecture record exists to prevent.
 Phase 2 landed the tool-call LOOP — the guest parses `tool_calls`, dispatches
 them, feeds the results back, and re-opens the provider — but nothing ever told
 the model which tools exist. There is no `tools` array in the provider request,
-and dispatch takes its target from the turn args (`tool_target`, default
-`effector`) with the model-supplied name used directly as the entry point. So
+and dispatch took its target from the turn args (`tool_target`, default
+`effector`) with the model-supplied name used directly as the entry point — the
+shape this record's list replaces. So
 the loop is live code on a surface that is never described: a real model cannot
 call a tool it was not told about, and the only traffic that exercises the loop
 is a test stub that emits `tool_calls` unprompted.
@@ -270,11 +271,3 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
   are: doors for a caller that already knows what it is looking for. The skill
   node's schema and namespace are CLOSED (k10r ADR-0015: kind `skill` in ns 36,
   the scope the facts live in).
-
-## Related records
-
-ADR-0001 (the execution surface: mounts, `carrier`, the script as an argument),
-ADR-0002 (the client form), ADR-0003 (skill execution: code composes, progress
-is data, code identity by id), `docs/PLAN.md` Phases 2.5 / 2.6 / 4.6 / 5, and
-k10r `docs/SEAM.md` §2/§3 (the tool face, the names, the doors) plus
-`docs/MODELING.md` (namespaces).

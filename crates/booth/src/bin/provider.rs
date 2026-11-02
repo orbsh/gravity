@@ -57,10 +57,12 @@ fn main() -> anyhow::Result<()> {
         .run()
 }
 
-/// The connection this guest process holds across pull rounds — the
-/// process IS the stream state. One stream per guest instance (the
-/// realm keys instances by session; a second turn cold-starts a new
-/// child), so a single slot suffices.
+/// The connection this guest process holds across pull rounds: a pull stream's
+/// half-read state has to live somewhere between two `iterate_next` calls, and
+/// the pulled instance is where it lives.
+///
+/// One slot, because one provider instance serves one request at a time — each
+/// concurrent request gets its own instance (see `open_branch` in `turn.rs`).
 static STREAM: Mutex<Option<Stream>> = Mutex::new(None);
 
 struct Stream {

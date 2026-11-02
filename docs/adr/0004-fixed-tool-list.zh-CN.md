@@ -28,7 +28,7 @@ ADR-0015 的 skill 节点与它的门），以及 `invoke_skill`（把一步走�
 Phase 2 落地的是工具调用**循环**——guest 解析 `tool_calls`、分发、把结果喂回、重开
 provider——但从来没有任何东西告诉模型有哪些工具。provider 请求里没有 `tools` 数组，而分发
 的 target 取自 turn 的 args（`tool_target`，默认 `effector`），模型给的名字被直接当作入口
-点。于是这条循环活在一个从未被描述过的面上：真实模型调用不出它没被告知的工具，唯一走过这条
+点——正是本记录的工具清单取代掉的形状。于是这条循环活在一个从未被描述过的面上：真实模型调用不出它没被告知的工具，唯一走过这条
 循环的流量，是测试里那个不经提示就吐 `tool_calls` 的 stub。
 
 但工具面本身并不是没设计过——k10r 的 `docs/SEAM.md` §2 逐个操作列了它，带着各自的门和状态。
@@ -185,10 +185,3 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
 - **开放项：** 图谱其它入口（`top`、`timeline`、`chain`、`anchored`——都已作为门落地）该不该
   变成工具，还是保持它们本来的样子：给已经知道要找什么的调用方用的门。skill 节点的 schema
   与 namespace 已**闭合**（k10r ADR-0015：ns 36 里 kind `skill`，与事实同一个 scope）。
-
-## 相关记录
-
-ADR-0001（执行面：mount、`carrier`、脚本作为参数）、ADR-0002（客户端形态）、ADR-0003
-（skill 执行：代码负责组合、进度是数据、code 按 id 标识）、`docs/PLAN.md` 的 Phase
-2.5 / 2.6 / 4.6 / 5、以及 k10r 的 `docs/SEAM.md` §2/§3（工具面、名字、门）与
-`docs/MODELING.md`（namespace）。

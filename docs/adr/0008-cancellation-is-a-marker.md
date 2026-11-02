@@ -25,7 +25,7 @@ Two obvious answers are wrong here.
 
 3. **A function call is atomic.** A tool call in flight completes and its result is discarded; nothing inside a mount, a script, or a request is interrupted. The boundary rule is what makes this honest — the marker is never read in the middle of something that has no safe point.
 
-4. **A cancelled turn appends NOTHING and says why.** The oldest rule holds: only a successful stream appends. The caller learns the turn ended on the same wire it was drawing on, with the cancellation as the reason — no new event vocabulary, no `cancelled: true` field for a consumer to forget.
+4. **A cancelled turn closes no turn and says why.** The oldest rule holds in effect: nothing of a cancelled turn reaches the next inference — its rows stay OPEN and the projection skips them (krystallizer ADR-0024). The caller learns the turn ended on the same wire it was drawing on, with the cancellation as the reason — no new event vocabulary, no `cancelled: true` field for a consumer to forget.
 
 5. **The marker is per turn and cleared with it.** A stale marker that survives its turn cancels the next one; a marker that a caller forgets to clear is a turn that never answers.
 
@@ -48,9 +48,9 @@ Both are legitimate; the choice is the implementation's, and this record keeps t
 
 - The cancel path becomes a readable fact: an operator can see that a turn was cancelled, and when, because the marker is data rather than a signal that vanished.
 - A policy knob enters the deployment (`cancel_check_every` or equivalent). Default: per chunk, which is what a streaming UI expects.
-- The turn has one more boundary obligation: every loop that streams or dispatches must pass through the check, and a loop added later that skips it is a bug of this record's kind. The unit to test is "a marker set mid-stream stops the turn and appends nothing".
+- The turn has one more boundary obligation: every loop that streams or dispatches must pass through the check, and a loop added later that skips it is a bug of this record's kind. The unit to test is "a marker set mid-stream stops the turn and it closes no turn" — asserting on what the projection returns, never on the log's row count, because the turn's rows are written as it ran and survive as OPEN.
 - Cancellation is not retry: nothing re-runs. The user's next message is the retry.
 
 ## Related records
 
-ADR-0007 (the turn's configuration and its own storage — the same field store would carry the marker), gravity PLAN Phase 4.1 `NO PULL FACE` (the pull face whose disposal used to BE the cancellation), ADR-0012 (failure is a value; a cancelled turn is a value the caller reads), prism ADR-0017 (the wire a cancel action travels as an ordinary `view:` event).
+ADR-0007 (the turn's configuration and its own storage — the same field store would carry the marker), gravity PLAN Phase 4.1 `NO PULL FACE` (the pull face whose disposal used to BE the cancellation), ADR-0004 (a failure is a value the model reads; a cancelled turn is a value the caller reads), prism ADR-0017 (the wire a cancel action travels as an ordinary `view:` event).

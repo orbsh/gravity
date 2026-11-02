@@ -25,17 +25,60 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and
   legal directly after the assistant's `tool_calls`, so replaying one three turns
   later is a request providers reject. Why only successes: a correction loop's
   failures are PROCESS — the model needed them to fix the call, a later turn does
-  not, and a retried-identical call keeps only its last answer. A failed turn still
-  appends nothing, tool rows included. The writer states codes through
+  not, and a retried-identical call keeps only its last answer. A failed turn
+  writes no closing record: its rows stay OPEN and the projection skips them
+  (k10r ADR-0024), so a failure costs visibility, not correctness. The net-effect
+  row shape above is unchanged — what the turn axis moves is WHEN it is written,
+  from the end of the turn to every round.
+  The writer states codes through
   `gravity_core::surface::{Role, Kind}` (`#[repr(u8)]`, discriminants spelled as
   k10r's own constants, `TryFrom<u8>` total) instead of literals — and the labels
   stay k10r's: the enum carries codes, `role_name` carries names, so there is one
   mapping, not two. Reading back, a code the store does not recognise now renders
   as `system`, not `user` (the row happened; its speaker is unnamed; `user` would
   put words in the user's mouth). Gate: gravity 88/0, prism 64/0.
-  STILL OPEN in this phase: the cold-call half (`Nature` is declared on all ten
-  specs and read NOWHERE; the entry-split path — persist + prune the transcript,
-  end the task, re-enter on the result — does not exist).
+  **SECOND HALF LANDED 2026-10-31 — the transcript side of the cold path.**
+  `nature` now has its first reader (`tools::nature_of`, the spec list is the
+  registry): a round that asks for a `human`-nature tool triggers a compaction of
+  the FINISHED rounds before it is dispatched — each one collapses from
+  `assistant.tool_calls` + its `tool` answers into one `system` line per call, the
+  same `[tool] … -> …` renderer the history uses. That is PLAN's "the transcript
+  takes the minimal replay set": a cold call may not answer for minutes, and the
+  model has already read those payloads to decide it. The round ABOUT to run stays
+  raw (its results are what the next inference reasons over), and a `fast`-only
+  turn is never compacted ("zero flushes"). Compaction replaces the whole pairing
+  because an unanswered `tool_calls` message is a malformed request. Gate:
+  gravity 90/0, clippy 0.
+  STILL OPEN in this phase: what a cold call does BESIDES compacting — write a row
+  for the call it dispatched, and re-enter on the result. Neither is blocked on
+  gravity's own code; both are blocked on the CALL SEAM, in two places:
+  - **The carrier has one invoke shape.** induction's `Arm::Invoke` is
+    request/reply (`induction-host/src/ops.rs:121`): the host answers with a
+    `Reply`, and the guest is parked in `read_host_reply` until it arrives. No
+    frame says "register this and answer me an id".
+  - **The realm's value-shaped door refuses a cold slot.** gravity's invoke lands
+    in aura's `dispatch_call`, which can only answer `Done` or `Err` — a cold slot
+    comes back as an error: `Waited::Pending(id) => Err("cold target cannot return
+    a value to a parked caller (call {id}); emit instead")` (aura
+    `crates/realm/src/lib.rs:137`).
+  So a cold tool call cannot return ANYTHING today: the tier exists in aura
+  (`CallSlot::Cold`, `pending_calls` with its `session` field, `resolve_call`),
+  the guest never gets to declare it, and the one door that would carry the answer
+  is a request/reply.
+  NOT a route: `emit` is gravity's OUTPUT face (`ui:*` frames to the front end or
+  the CLI) and `iterate` is the LLM token stream plus the compression branch.
+  Neither carries a tool call and neither returns a result to the loop; aura's
+  "emit instead" addresses realm-internal work handed to a queue-shaped target,
+  not a caller that needs its result back to finish the round. The tier is NOT the
+  frame's business — it is a declaration on the target inside the realm
+  (`CallSpec`), and a guest neither states it nor needs to; what Phase 4.5 owes is
+  an ANSWER shape for a value-shaped caller (a pending handle as a value, or no
+  value-shaped question for work that finishes later). A dispatched cold call DOES write rows while its turn is undecided: every round
+  lands as it runs, the turn carries an id the STORE mints at its open, and an
+  open turn is working state the projection skips. The turn closes with ONE
+  `kind = FINAL` record naming the subs to keep and k10r collapses the rest
+  (k10r ADR-0024). What this phase still owes is the code: the turn axis in k10r's
+  key, and gravity writing per round and submitting the final record.
   RECORDED, NOT ADOPTED (2026-10-31, user's call): "recall happens when the
   question arrives" — the turn would send the question to k10r, k10r would search
   its own memory and append whatever looks useful as NOTES behind the question
@@ -45,7 +88,7 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and
   that cannot search again is a one-shot reader. When the mechanism lands, the
   notes are EPHEMERAL: the stored user row keeps the question, never the notes
   (derived context is not memory, and a summarizer that reads them would record
-  them as things the user said). the in-turn tool loop keeps a working transcript in resident memory (calls, errors, retries — what the next LLM inference needs); session history receives only the net effect at turn end (intermediate failures are process, not memory). Every tool declares its execution nature at registration (fast/idempotent vs human-touch/external — declared per tool, static, rides `tool_invoke_count`'s registration info); declared-cold tools trigger the cold path at call time (transcript persist + prune before flush: history takes final state, transcript takes the minimal replay set), everything else stays hot with zero flushes. Gravity never branches on local vs remote — execution location lives in target resolution (user namespace + node alias + capability from the tool list), invoke targets come from the tool list, not from Gravity code.
+  them as things the user said). the in-turn tool loop keeps a working transcript in resident memory (calls, errors, retries — what the next LLM inference needs); session history receives the net effect, row by row AS THE TURN RUNS (intermediate failures are process, not memory; a turn is collapsed to its net effect by the store when it closes, so an unfinished turn is working state the projection skips). Every tool declares its execution nature at registration (fast/idempotent vs human-touch/external — declared per tool, static, rides `tool_invoke_count`'s registration info); declared-cold tools trigger the cold path at call time (transcript persist + prune before flush: history takes final state, transcript takes the minimal replay set), everything else stays hot with zero flushes. Gravity never branches on local vs remote — execution location lives in target resolution (user namespace + node alias + capability from the tool list), invoke targets come from the tool list, not from Gravity code.
 - [x] Phase 2.6 — Progress as data (ADR-0003): a multi-step task's progress is ROWS, not prose the model advances — one task row per step, bound (edge) to the call that completes it, so completion is written at the call site. Truth lives in k10r as structured application state (an enumeration question the approximate memory face cannot answer); gravity pulls the session's open todos WITH the turn-start projection it already fetches, so every pre-dispatch check inside a turn is a memory read — zero per-call round trips, no LLM on the gate's path. Branch/step logic is a GLUE SCRIPT (code composes; the flow-engine form is rejected), and glue can only ride a mount whose carrier is `induction` (Phase 4.6's manifest states which mounts those are). Execution history writes counters, never topology: re-parenting is a definition change, promoted by an audited act and never self-applied (Phase 5's weight write-back is the counter's home).
   **LANDED 2026-10-31 — both open halves (ADR-0003's Update).** The binding is
   `task --finishes_on--> code`, an ordinary fact: k10r ADR-0023 made a code row a VERTEX
@@ -67,6 +110,34 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and
   prism 64/0 (`turn_invoke_skill` now asserts the bound task is `done` after the turn
   without any `move_task`), clippy 0.
 - [ ] Phase 3 — Compression as a parallel side branch: when the Krystallizer's fetched view carries a compression marker (watermark reached), Gravity fires TWO concurrent requests from the same immutable prefix — main branch `[H] + [U_n]` answers the user (critical path, normal streaming), side branch `[H] + [compression instruction]` produces the summary. Prefix KV is shared (same-prompt fork — inference servers natively reuse concurrent prefix requests); the side branch pays only its delta. Summary lands before U_{n+1}: the session swaps to `[S] + [recent tail]` at the typing gap — zero user-perceived latency, no mixed-turn. Idle/no-turn triggers (cache TTL cooldown): the side branch is fired standalone (CLI idle tick / Prism timer / Aura `@cron` booth) — off every critical path, pure cost decision. Memory-tool extraction runs on the same branch pattern (past-oriented read branch, output to external state). **Seam half LANDED 2026-10-20:** `SessionProjection.compress` carries k10r's verdict through BOTH surfaces (the in-process one runs the same engine, so they agree), and the checkpoint door now takes the SUMMARY only — k10r derives the coverage point from the verdict it served. What is left is this phase's turn-loop half: firing the side branch and handing the text back. **Turn-loop half LANDED 2026-10-26 (k10r ADR-0017):** the branch fires from
+`start_tails`, which reads k10r's `tails` verdict off the projection and opens one
+`Tail` per requested operation (`compress`, and the review behind it) over the same
+numbered prefix the main branch reads; the provider pulls interleave with the
+answer's own stream, and every branch failure is swallowed — an unlanded
+compression leaves k10r's node open, which is its "compressing" marker. What is
+left of this phase is the STANDALONE trigger: no idle/no-turn tick exists
+(`grep idle` finds nothing in the tree), so a conversation that stops talking
+never reaches its compression point.
+  **AND the branch's OWNER (open, 2026-10-31).** The design says the summary lands
+  at the typing gap — i.e. a compression slower than the answer does not hold the
+  turn. Today it does: the pull loop IS the turn's call stack, so `drain_tails`
+  finishes the branch before the handler returns (up to 64 pulls). The stream is
+  not the obstacle — `iterate` streams live until `dispose` or eviction, and the
+  carrier does not reclaim them when an entry returns. The obstacle is that a pull
+  stream makes no progress without a puller. So the decision this phase owes is
+  WHO pulls after the turn: a resident driver inside the booth (its own loop or
+  clock, the `@cron` shape), the NEXT turn picking the branch up, or nobody —
+  leave k10r's open node as the marker and let the following read re-decide.
+  Two prerequisites, in order:
+  1. one process must be able to serve two requests at once, or a resident driver
+     is blocked by the very pull it is driving. Today it cannot: the host's
+     supervise loop routes inline (`induction-host/src/supervise.rs`) and the
+     guest reads "the next frame" as its reply — the `id` field exists on both
+     sides and neither uses it. That is induction ADR-0002 (Proposed), steps 1–3.
+  2. then the provider's shape follows: one call carrying the requests that go
+     together (the turn's own, plus each tail operation's), N SSE connections
+     opened at once, pulls addressed by `stream_id` — not one process per
+     operation key, which is only today's workaround for a single-slot guest.
 `tails` (the operation table — an unknown name is skipped with a log, since the
 store's list can grow before a deployed guest) and the records are NUMBERED, so
 the pass can name the cut it would have chosen; `read_products` takes the JSON
@@ -166,6 +237,14 @@ critical path).
     uplink/downlink never carry the prefix, prism adds it on the way in and strips it on the way
     out — handoff step 2's `dest: view:turn.submit` was a misreading and is NOT to be applied.
 - [ ] Phase 4.5 — Unified call model adoption: tool calls go through `ctx.invoke()` (Aura CallSlot) — target = user namespace + node alias + capability (e.g. `probe:home-pc:read_file`); two-tier waiting handled by the runtime behind one `await` per call-site (hot: park on oneshot; cold: entry-split — no park, transcript flush, task ends, re-entry on result). Retention-window residency: executor stays in memory between calls/turns of the same session, session persisted at turn end or expiry; crash within window rebuilds from event stream. Multi-machine orchestration (e.g. "send the file from home PC to office PC") = two invokes composed in the turn loop — no remote/local branching in Gravity code.
+  **The seam this phase must cut (stated from the code, 2026-10-31):** "behind one `await`" does not survive contact with the pipe — the cold tier is not something the runtime can hide there, because neither side can express "I did not wait".
+  - induction's guest frame `Arm::Invoke` is a request/reply pair (`induction-host/src/ops.rs:121`: `ops.invoke(&call).await` → `Reply`); the guest blocks in `read_host_reply`. That is CORRECT and stays: the frame carries a call, not a scheduling policy — whether a target is hot or cold is its own declaration in the realm, and a guest that stated it would be stating someone else's deployment fact. What the frame cannot do is answer anything but a value or an error, and that is the gap.
+  - gravity's invoke lands in aura's `dispatch_call`, whose answer type is a VALUE: a cold slot is refused — `Waited::Pending(id) => Err("cold target cannot return a value to a parked caller (call {id}); emit instead")` (aura `crates/realm/src/lib.rs:137`).
+  So the tier machinery is all there (aura `CallSlot::{Hot,Cold}`, `pending_calls` keyed by `CallId`, `PendingEntry.session` naming the transcript to wake, `resolve_call`, the deadline sweep) and nothing can reach it from a tool call. What this phase has to rule, in order:
+  1. what a VALUE-SHAPED caller receives when the target is cold: the realm answering a pending handle as a value (`{pending: call-N}`) so the guest can decide what to do with it, or gravity not asking a value-shaped question at all for work that finishes later (a job opened in k10r's task sheet, or fire-and-forget plus re-entry). This is an answer shape, not a frame field — induction's vocabulary does not change either way.
+  2. what the caller does with it: end the entry, and what it writes down (this is the open question in Phase 2.5 — a row for a call the turn has not resolved yet).
+  3. re-entry: the result arrives as a call INTO the booth's own entry (the guest is event-driven, so re-entry is an ordinary dispatch, not a resumed stack), carrying the minimal replay set the turn left behind.
+  Until 1 lands, a `human`-nature call can only be awaited as a value (today's behaviour) — which is why Phase 2.5's cold half stops at compaction.
 - [x] Phase 4.6 — The execution surface is the runner mount (ADR-0001): every machine (the control plane's included) runs an effector node; each (node alias × operation language) gets ONE `Remote` mount whose source is a fixed deployment artifact (a runner: interpreter or dispatcher, installed with the node and declared in its manifest); the LLM-selected operation's script is fetched from k10r by gravity and travels as a call ARGUMENT (`invoke(mount, key, entry, args{code, args})`), so a skill — or a skill version — never mints a type, a ns, a route, or a definition row. Work: prism's mount-registration face (node manifest → idempotent registration per boot — `Remote` definitions are not persisted; the dial-in `Frame::Register` already supplies alias + carriers), the runner artifact + node manifest, and gravity's run call plus the fixed tool list (skill search + run). aura and effector: NO change (existing surfaces; the runner is a definition per ADR-0027, the script is an argument, so there is no per-call code form and no errata). Forecloses: gravity running standalone with execution ability; any local privileged execution path. Node language surface: nu (systems) + python (business logic) are the required installs — steel is in-binary; no shell carrier and no bash fallback (OS operations route to nu mounts); one runner per language, entry `execute`. A COMPOSED operation (a glue script that encodes a branch and calls sibling steps — ADR-0003) can only ride a mount whose carrier is `induction`: the one-shot `exec` carrier has no channel (one JSON in, one out; no frames, no ctx bridge), so the manifest's `carrier` axis is what states which mounts can host glue.
   THE WALK LANDED 2026-10-26 (ADR-0004 §3): `invoke_skill` closes the loop — the model resolves, picks a candidate, and names a step; gravity reads the skill, fetches that step's code row, matches the row's `language` against the deployment's mount table (prism reads its own `PRISM_MOUNTS` — both axes were already declared — and passes `mounts` in the turn args), and calls the mount with the script as an ANSWER: `ctx.invoke(mount, session, "execute", {code, args})`. ONE step per call: ordering, retry and feeding one step's output into the next stay Phase 5's, and the sequence is the model's to drive. Residency key = the conversation (`channel-{c}-member-{m}`), so a step script's own state survives the turns of one conversation and nothing else. The two door kinds meet in `crates/booth/src/tools.rs`'s `Doors` trait (k10r over HTTP, a mount over the ctx); the turn implements it, the list stays testable without a realm. Proven on the real stack by `../prism/crates/prism/tests/turn_invoke_skill.rs`: real mem-server, real gateway, real effector node, real `runner_py`, and the model's own round-1 request body carrying `{"sum":7}` that a python child computed from the arguments gravity passed. The argument check landed the same day: `check_arguments` enforces the JSON Schema subset a code row DECLARES (`required`, `properties.*.type`, `additionalProperties: false`) before a node is asked to run anything, names the offending key, and hands the contract back so the model repairs its call in one round — a row that declares nothing constrains nothing (ADR-0004's consequence). NOT built: the multi-step body (ADR-0005 rules what it is: code, not a DSL). Gates: gravity 38/0, prism `turn_invoke_skill` 1/1, `turn_e2e` 5/5, k10r 163/0.
   WRITE_CODE LANDED 2026-10-31 (ADR-0004's ninth tool, k10r ADR-0023): the writing
@@ -187,7 +266,7 @@ critical path).
   derivable from the other. Best effort by contract: a counter that cannot be
   written never fails the step (k10r ADR-0018 / ADR-0023's second Update).
   Gate: gravity 35/0 lib, k10r 210/0.
-  LANDED 2026-10-14 (prism `d6d385f` + uncommitted work tree; effector `7e06a0f` + uncommitted work tree): the mount-registration face (`prism/src/mounts.rs` — `MountDecl`/`PRISM_MOUNTS`/`register_all`, replayed at boot because `Remote` definitions do not persist; a declaration now names BOTH axes — `carrier` for the node facility the call runs in, `language` for the operation language a skill is matched on — so the route to a mount is a match, not a name sniff) + the three runner artifacts (`effector/deploy/runners/runner_nu.nu`, `runner_py.py`, `runner_py_guest.py`) + the **ctx bridge OUT of a remote induction guest**, proven end to end: a delivered script calls a sibling mount through the host realm and gets its value back, on a session that has already served two calls (`prism/crates/prism/tests/runner_mount.rs`). Three located breaks were fixed to get there, one per layer: ① the guest's protocol frames rode `sys.stdout`, which the delivered-script wrapper redirects into the result capture buffer — the frame landed in the capture buffer and the call deadlocked to its deadline (the wire fds are now pinned at import); ② a resident session kept the bridge of its cold-start call, so later calls carried a call id nobody was waiting on (the bridge is per-call data: `ResidentSession::set_host`, re-armed by the dispatch seam on every call); ③ the dial-in reader loop resolved host calls inline and parked on a hot realm call whose Result frame only that loop can read — a self-deadlock whenever the ctx target lives on the same node (the resolution is now spawned; both dial-in homes, `prism/src/effectors.rs` and `aura crates/engine/src/effectors.rs`). Still open in this phase: gravity's `run` call for a script that belongs to no skill (dynamic code needs the language-default ruling; the READ-OUT of a script is no longer the blocker — `GET /code/{scope}/{id}` answers the current version and `write_code` delivers one). The node's containment half of the manifest has since been carried on the effector side (2026-10-14, effector ADR-0001): the jail is built from the node's own `CapabilitySurface` (`fs_scope` = write scope, `deny_read`, `cwd`), `config.sandbox` is the switch, and a claim with no enforcement point fails the startup — domain allowlists, seccomp and a `command_exec` grant stay unwired.
+  LANDED 2026-10-14 (prism `d6d385f` + uncommitted work tree; effector `7e06a0f` + uncommitted work tree): the mount-registration face (`prism/src/mounts.rs` — `MountDecl`/`PRISM_MOUNTS`/`register_all`, replayed at boot because `Remote` definitions do not persist; a declaration now names BOTH axes — `carrier` for the node facility the call runs in, `language` for the operation language a skill is matched on — so the route to a mount is a match, not a name sniff) + the three runner artifacts (`effector/deploy/runners/runner_nu.nu`, `runner_py.py`, `runner_py_guest.py`) + the **ctx bridge OUT of a remote induction guest**, proven end to end: a delivered script calls a sibling mount through the host realm and gets its value back, on a session that has already served two calls (`prism/crates/prism/tests/runner_mount.rs`). Three located breaks were fixed to get there, one per layer: ① the guest's protocol frames rode `sys.stdout`, which the delivered-script wrapper redirects into the result capture buffer — the frame landed in the capture buffer and the call deadlocked to its deadline (the wire fds are now pinned at import); ② a resident session kept the bridge of its cold-start call, so later calls carried a call id nobody was waiting on (the bridge is per-call data: `ResidentSession::set_host`, re-armed by the dispatch seam on every call); ③ the dial-in reader loop resolved host calls inline and parked on a hot realm call whose Result frame only that loop can read — a self-deadlock whenever the ctx target lives on the same node (the resolution is now spawned; both dial-in homes, `prism/src/effectors.rs` and `aura crates/engine/src/effectors.rs`). Still open in this phase: gravity's `run` call for a script that belongs to no skill. Both former blockers are gone — `GET /code/{scope}/{id}` answers the current version, `write_code` delivers one, and the language question is settled by requiring `language` of the writer (ADR-0001's Update: a default would be gravity choosing someone else's mount). So what is missing is the tool itself: a way to execute a code row that no skill names. The node's containment half of the manifest has since been carried on the effector side (2026-10-14, effector ADR-0001): the jail is built from the node's own `CapabilitySurface` (`fs_scope` = write scope, `deny_read`, `cwd`), `config.sandbox` is the switch, and a claim with no enforcement point fails the startup — domain allowlists, seccomp and a `command_exec` grant stay unwired.
 - [ ] Phase 5 — Skill pull-through: on each tool call, fetch skill spec from Krystallizer via the pull-through path (Probe → Gravity → Krystallizer, never direct); view processing + `tool_invoke_count` weight write-back at this data gate. The write-back is a COUNTER (data, additive and reversible); no execution path rewrites the graph's topology — a recurring composition is proposed for promotion, never self-parented (ADR-0003 §5).
   FIVE TOOLS, AND COUNTING AT THE CALL 2026-10-26 (k10r ADR-0018): `create_skill` is
   the fifth entry — the model's act, symmetric with `commit_memory`, posting to k10r's
