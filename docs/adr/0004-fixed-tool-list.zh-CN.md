@@ -10,6 +10,7 @@ ADR-0015 的 skill 节点与它的门），以及 `invoke_skill`（把一步走�
 
 同日再补三条**任务**工具（2026-10-27，k10r ADR-0021）：
 
+   | `read_code` | `{code_id, rev?}` | `GET /code/{memory_scope}/{code_id}` —— **当前版本**（`invoke_skill` 会跑的就是它）；带 `rev` 则 `GET /code/{memory_scope}/{code_id}/{rev}`——指定版本 | 2026-10-31 列入：这一对里的「读」半。带 `code_id` 的 `write_code` 改的是脚本的**含义**，而模型明天不再是同一个上下文——蒙着改，就是把一个能跑的步骤改成不能跑 |
    | `write_code` | `{language, source, description?, parameters?, code_id?}` | `POST /code/{memory_scope}` —— k10r 的 code 门（ADR-0023）：不给 `code_id` 就是**新脚本**（id 由仓分配），给了 `code_id` 就是给那个脚本追加**下一版**，回答 `{code_id, rev}` | 2026-10-31 列入：执行的一半。在它出现之前，skill 的步骤只是散文，部署跑不起来——`invoke_skill` 只能跑别人绕过工具面投递过的 `code_id` |
    | `open_task` | `{name, next?, state?}` | `POST /tasks/{memory_scope}` —— k10r 的任务门：任务是事实图里**普通**的顶点，任务单在 ns 44，所以依赖、标签都是 `commit_memory` 的事实，不需要工具 | 2026-10-27 列入 |
    | `move_task` | `{task_id, state?, next?}` | `POST /tasks/{memory_scope}/{task_id}/move` —— 缺席的字段**不动**；状态是闭集，打错在门口就拒，因为一个活在没人查的状态名下的任务就是没人找得到的任务 | 2026-10-27 列入 |
@@ -103,7 +104,7 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
    `human`（触到外部世界、花人的注意力或改状态）。这是 Phase 2.5 冷路径读的那个字段，也是
    `tool_invoke_count` 回写挂靠的字段（Phase 5）：`recall_memory` 与 `resolve_skills` 是
    **为什么 `write_code` 是独立工具，而不是 `create_skill` 上的一个字段。** 脚本有**生命周期**——写、读、改——而且有东西指着它：skill 的步骤用它的 id，任务的 `finishes_on` 边落在它的顶点上，计数也记在它上面。内联投递只能表达「创建」：每声明一次就铸一个新 id，指着旧 id 的绑定和计数全部落空；改一次脚本就是换一个地址，而不是「同一个脚本、换了内容」。执行在这个系统里也不是角落——一个以跑代码为工作的协调引擎，需要一条一等公民的投递路径，就像记忆有 `commit_memory`、流程有 `create_skill`。
-   改版不动地址：k10r 追加一个版本（ADR-0023），所以昨天跑过的那一版仍然可读，而所有引用照旧指着同一个脚本。写入不需要 mount：一门没人伺候的语言可以先存下来，等到**调用**时才拒——真正需要 runner 的是那一扇门。
+   改版不动地址：k10r 追加一个版本（ADR-0023），所以昨天跑过的那一版仍然可读，而所有引用照旧指着同一个脚本——`read_code` 就是看见那一版的方式，改之前或改坏了之后都用它。写入不需要 mount：一门没人伺候的语言可以先存下来，等到**调用**时才拒——真正需要 runner 的是那一扇门。
 
    `fast`；`commit_memory`、`invoke_skill`、`create_skill` 是 `human`。
 

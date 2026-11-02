@@ -204,13 +204,40 @@ static SPECS: &[ToolSpec] = &[
         nature: Nature::Human,
     },
     ToolSpec {
+        name: "read_code",
+        description: "Read a script back: its language, description, parameters and source, plus \
+                      which version answered. Without `rev` it is the CURRENT version — the one \
+                      `invoke_skill` would run. With `rev` it is that exact version, which is how \
+                      you see what an older run was given before you change it. Read before \
+                      revising: `write_code` with a `code_id` replaces the script's meaning, and a \
+                      blind edit is how a working step stops working.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "code_id": {
+                        "type": "integer",
+                        "description": "The script to read (the number a skill's step names)."
+                    },
+                    "rev": {
+                        "type": "integer",
+                        "description": "Which version. Omit for the current one."
+                    }
+                },
+                "required": ["code_id"]
+            })
+        },
+        nature: Nature::Fast,
+    },
+    ToolSpec {
         name: "write_code",
         description: "Deliver a script as a piece of code this deployment stores and can run, and \
                       get back the `code_id` a skill's step names. Give `code_id` to REVISE a script \
                       you delivered before: a correction appends a new version, so what ran \
-                      yesterday stays readable and the address does not move. This is the writing \
-                      half of execution — a procedure with real steps needs the scripts its steps \
-                      run, or `invoke_skill` has nothing to run.",
+                      yesterday stays readable and the address does not move (read it first with \
+                      `read_code` when it is not yours from this turn). This is the writing half of \
+                      execution — a procedure with real steps needs the scripts its steps run, or \
+                      `invoke_skill` has nothing to run.",
         parameters: || {
             json!({
                 "type": "object",
@@ -517,6 +544,7 @@ pub fn call(
             doors.get(&url)
         }
         "create_skill" => create_skill(doors, args, facts, store_url),
+        "read_code" => read_code(doors, args, facts, store_url),
         "write_code" => write_code(doors, args, facts, store_url),
         "invoke_skill" => invoke(doors, args, facts, store_url, walked),
         other => Err(format!(
@@ -562,6 +590,30 @@ fn create_skill(
         }
     }
     doors.post(&format!("{store_url}/skills/{scope}"), &body)
+}
+
+/// `read_code`: the script a step names, as it stands — the current version by
+/// default, one exact version when `rev` says so.
+///
+/// Both addresses are k10r's (ADR-0023): `/code/{scope}/{code_id}` answers the
+/// current version, `/code/{scope}/{code_id}/{rev}` one exact version. The turn
+/// reads this way before revising, and a person reads it way to see what an older
+/// run was actually given.
+fn read_code(
+    doors: &mut impl Doors,
+    args: &Value,
+    facts: &Facts<'_>,
+    store_url: &str,
+) -> Result<Value, String> {
+    let code_id = args
+        .get("code_id")
+        .and_then(Value::as_u64)
+        .ok_or("read_code: `code_id` is required (the number a skill's step names)")?;
+    let scope = facts.scope("read_code")?;
+    match args.get("rev").and_then(Value::as_u64) {
+        Some(rev) => doors.get(&format!("{store_url}/code/{scope}/{code_id}/{rev}")),
+        None => doors.get(&format!("{store_url}/code/{scope}/{code_id}")),
+    }
 }
 
 /// `write_code`: a script becomes a code row, and a correction becomes the next
@@ -1076,6 +1128,7 @@ mod tests {
                 "resolve_skills",
                 "invoke_skill",
                 "create_skill",
+                "read_code",
                 "write_code",
                 "open_task",
                 "move_task",
@@ -1502,6 +1555,61 @@ mod tests {
             "a part the model did not state stays ABSENT — the store merges, \
              so an empty one would erase what a previous declaration filled"
         );
+    }
+
+    #[test]
+    fn read_code_asks_the_current_version_unless_a_revision_is_named() {
+        // The ordinary read is the version `invoke_skill` would run, so the URL
+        // must not carry a revision. Naming one asks for that EXACT version —
+        // what an older run was given (k10r ADR-0023).
+        let mut doors = Recorder {
+            answers: vec![(
+                "/code/37/4".to_string(),
+                json!({ "rev": 2, "language": "python", "source": "print(2)" }),
+            )],
+            ..Recorder::default()
+        };
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+
+        let value = call(&mut doors, "read_code", &json!({ "code_id": 4 }), &facts, &mut Vec::new())
+            .expect("the read lands");
+        assert_eq!(value["source"], "print(2)");
+        assert_eq!(
+            doors.gets,
+            vec!["http://mem.test/code/37/4"],
+            "no revision in the path = the current version"
+        );
+
+        let mut doors = Recorder {
+            answers: vec![(
+                "/code/37/4/1".to_string(),
+                json!({ "rev": 1, "language": "python", "source": "print(1)" }),
+            )],
+            ..Recorder::default()
+        };
+        let value = call(
+            &mut doors,
+            "read_code",
+            &json!({ "code_id": 4, "rev": 1 }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect("the version reads");
+        assert_eq!(value["rev"], 1);
+        assert_eq!(value["source"], "print(1)");
+        assert_eq!(doors.gets, vec!["http://mem.test/code/37/4/1"]);
+    }
+
+    #[test]
+    fn read_code_refuses_a_call_without_a_script_to_read() {
+        let mut doors = Recorder::default();
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+        let err = call(&mut doors, "read_code", &json!({}), &facts, &mut Vec::new())
+            .expect_err("no id, nothing to read");
+        assert!(err.contains("code_id"), "{err}");
+        assert!(doors.gets.is_empty(), "nothing was fetched");
     }
 
     #[test]

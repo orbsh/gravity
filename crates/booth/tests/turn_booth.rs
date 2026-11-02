@@ -718,6 +718,7 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
                 "resolve_skills",
                 "invoke_skill",
                 "create_skill",
+                "read_code",
                 "write_code",
                 "open_task",
                 "move_task",
