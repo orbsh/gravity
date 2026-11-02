@@ -14,7 +14,10 @@
 //! 3. `ctx.iterate_start(llm_provider, "", "stream", provider_args)`, and in this same
 //!    call the tool rounds and then the answer: each envelope item's `delta` leaves as a
 //!    frame on the venue wire.
-//! 4. On the provider's `done`: append user + assistant with one shared `ts_ms`, subs 0/1
+//! 4. On the provider's `done`: append the exchange — the question at sub 0, one row per
+//!    SUCCESSFUL tool call at subs 1..n, the answer last. One shared `ts_ms`, and the
+//!    tool rows are the turn's NET EFFECT (a correction loop's failures stay in the
+//!    working messages, where the model needed them, and never reach the store)
 //!    — ONLY after a successful stream (a failed turn appends nothing; the user re-sends
 //!    next turn). Gravity's clock IS the channel's time (krystallizer ADR-0008 §3).
 //!
@@ -568,6 +571,11 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     //    feed the results back, re-open — the "next inference round" (Phase 2). The results
     //    are the MODEL's, not the consumer's, so they never ride the drawing wire.
     let mut walked: Vec<gravity_booth::tools::Walked> = Vec::new();
+    // The NET EFFECT of the tool rounds, for the history: only a call that came
+    // back OK is here, so a correction loop leaves its final success and nothing
+    // else. The loop's failures stay in the working messages above — the model
+    // needed them to fix its call, a later turn does not.
+    let mut tool_events: Vec<ToolEvent> = Vec::new();
     let mut first = open_provider(ctx, &turn, &messages, "turn: provider stream failed to open")?;
     for _round in 0..8 {
         if first.get("done").and_then(Value::as_bool) == Some(true) {
@@ -631,7 +639,26 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
                     file_composition(&turn.store_url, turn.memory_scope, &so_far);
                 }
                 match outcome {
-                    Ok(value) => value.to_string(),
+                    Ok(value) => {
+                        // One record per call that SUCCEEDED. The same call twice
+                        // (a model that re-asks rather than moving on) keeps only
+                        // the last answer: what the store owes the next turn is
+                        // the effect, not the retries.
+                        let event = ToolEvent {
+                            tool: call.function.name.clone(),
+                            args: call.function.arguments.to_string(),
+                            result: value.to_string(),
+                        };
+                        match tool_events.last_mut() {
+                            Some(last)
+                                if last.tool == event.tool && last.args == event.args =>
+                            {
+                                *last = event;
+                            }
+                            _ => tool_events.push(event),
+                        }
+                        value.to_string()
+                    }
                     Err(error) => json!({ "error": error }).to_string(),
                 }
             };
@@ -695,7 +722,7 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     if reply.is_empty() {
         anyhow::bail!("turn: provider stream yielded no tokens");
     }
-    append_exchange(&turn, &user_message, &reply)?;
+    append_exchange(&turn, &user_message, &reply, &tool_events)?;
     Ok(reply)
 }
 
@@ -1558,19 +1585,70 @@ fn land_summary(turn: &Turn<'_>, summary: &str, suggested: Option<(u64, u16)>) {
     }
 }
 
-/// Append the one-ts-two-subs exchange. Reached only after a successful stream: a failed
-/// turn appends NOTHING (the user re-sends next turn).
-fn append_exchange(turn: &Turn<'_>, user_message: &str, reply: &str) -> anyhow::Result<()> {
+/// One tool call's net effect, as the history records it: what was asked and what
+/// came back. Only the SUCCESS is here (a correction loop's failures are process,
+/// and the model already saw them).
+struct ToolEvent {
+    tool: String,
+    args: String,
+    result: String,
+}
+
+/// How much of a result the history keeps. A step that returns a whole document
+/// would otherwise put it in every future turn's prompt and in the summarizer's
+/// input; the row is a record of the action, not a copy of its output.
+const TOOL_RESULT_LIMIT: usize = 2_000;
+
+/// Role and kind codes for one tool record (k10r's `role` / `kind` vocabulary,
+/// ADR-0008 §2). `SYSTEM` and not `TOOL`: the stored line is a RECORD that the
+/// action happened — a protocol `role:"tool"` message is only legal directly after
+/// the assistant's `tool_calls`, and replaying one three turns later is a request
+/// a provider rejects. `TOOL_CALL` (k10r's `kind`) is what marks it as this shape.
+const TOOL_RECORD_ROLE: u8 = 3;
+const TOOL_RECORD_KIND: u8 = 1;
+
+/// The line a tool record carries, as it will read in a later turn's prompt:
+/// self-describing on purpose — whoever reads the history is not parsing it.
+fn render_tool_event(event: &ToolEvent) -> String {
+    let mut result = event.result.clone();
+    if result.len() > TOOL_RESULT_LIMIT {
+        let cut = result.char_indices().nth(TOOL_RESULT_LIMIT).map(|(i, _)| i).unwrap_or(result.len());
+        result.truncate(cut);
+        result.push_str("… (truncated)");
+    }
+    format!("[tool] {} {} -> {}", event.tool, event.args, result)
+}
+
+/// Append the exchange: one ts for the whole thing, `sub` ordering the events —
+/// user first, then one row per successful tool call, then the answer. Reached
+/// only after a successful stream: a failed turn appends NOTHING (the user
+/// re-sends next turn), and its tools append nothing either.
+fn append_exchange(
+    turn: &Turn<'_>,
+    user_message: &str,
+    reply: &str,
+    tool_events: &[ToolEvent],
+) -> anyhow::Result<()> {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .context("turn: clock before epoch")?;
-    for (sub, role, content) in [(0u16, 0u8, user_message), (1, 1, reply)] {
+    let mut rows: Vec<(u16, u8, u8, String)> =
+        vec![(0, 0, 0, user_message.to_string())];
+    for (index, event) in tool_events.iter().enumerate() {
+        // `sub` is u16: the loop caps at 8 rounds, so this cannot be reached by a
+        // running turn — the saturating cast is for the type, not for a case.
+        let sub = 1 + u16::try_from(index).unwrap_or(u16::MAX - 2);
+        rows.push((sub, TOOL_RECORD_ROLE, TOOL_RECORD_KIND, render_tool_event(event)));
+    }
+    let answer_sub = 1 + u16::try_from(tool_events.len()).unwrap_or(u16::MAX - 2);
+    rows.push((answer_sub, 1, 0, reply.to_string()));
+    for (sub, role, kind, content) in rows {
         let url = format!("{}/channels/{}/messages", turn.store_url, turn.channel_id);
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_string(
-                &json!({ "ts_ms": ts, "sub": sub, "role": role, "kind": 0, "content": content })
+                &json!({ "ts_ms": ts, "sub": sub, "role": role, "kind": kind, "content": content })
                     .to_string(),
             )
             .context("turn: append failed")?;

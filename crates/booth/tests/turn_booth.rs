@@ -888,6 +888,40 @@ async fn two_calls_in_one_round_reach_the_model_as_one_round() {
         .map(|task| task["name"].as_str().unwrap_or_default().to_string())
         .collect();
     assert_eq!(names, vec!["alpha", "beta"], "the store kept both: {tasks}");
+
+    // The NET EFFECT of the round lands in the history: one row per successful
+    // call, between the question and the answer (k10r ADR-0008's one-ts exchange,
+    // `sub` ordering the events). A tool record is a SYSTEM row of kind
+    // TOOL_CALL — never a protocol `role:"tool"` message, which is only legal
+    // directly after the assistant's `tool_calls` and would be rejected three
+    // turns later. The line is self-describing so a reader is not parsing it.
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    let view = surface.fetch_session(7, 1).await.unwrap();
+    let rows: Vec<(u16, Option<String>, u8, String)> = view
+        .increment
+        .iter()
+        .map(|(key, message)| {
+            (key.sub, message.role.clone(), message.kind, message.content.clone())
+        })
+        .collect();
+    assert_eq!(rows.len(), 4, "question + two calls + answer: {rows:#?}");
+    assert_eq!(rows[0].1.as_deref(), Some("user"));
+    assert_eq!(rows[0].2, 0, "the question is text");
+    for (index, name) in [(1usize, "open_task"), (2, "open_task")] {
+        assert_eq!(rows[index].1.as_deref(), Some("system"), "a record, not a speaker");
+        assert_eq!(rows[index].2, 1, "kind TOOL_CALL");
+        assert!(
+            rows[index].3.starts_with(&format!("[tool] {name} ")),
+            "the line names the tool it records: {}",
+            rows[index].3
+        );
+    }
+    assert_eq!(rows[3].1.as_deref(), Some("assistant"), "the answer is last");
+    assert_eq!(rows[3].0, 3, "and it carries the last sub of the exchange");
+    assert!(
+        rows.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "subs order the exchange"
+    );
 }
 
 /// The dispatch loop's cap is a runaway stop, not a budget to spend

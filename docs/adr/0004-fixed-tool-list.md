@@ -92,6 +92,11 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    before a correction or after one went wrong. Writing needs no mount: a language no mount serves can be
    stored and is refused at INVOCATION, the door that actually needs a runner.
 
+   **`recall_memory` is permanent.** It is not a bootstrap affordance the system
+   outgrows once memory is injected at turn start: it is the model's own second,
+   sharper search — the one it can aim with what the first answer did not say.
+   A list without it is a one-shot reader.
+
    The task group (`task_open` / `task_done` / `task_list`) is declared but NOT
    listed: its write face has no route yet and the read side rides the session
    projection (SEAM.md §2 "Task progress"; ADR-0003 §3, PLAN Phase 2.6). A tool
