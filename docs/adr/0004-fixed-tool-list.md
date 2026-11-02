@@ -70,9 +70,25 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    | `resolve_skills` | `{query}`, `{limit}` | the SELECTABLE SKILL LIST — what the model consults when it cannot finish on its own; k10r answers candidates by intent | LISTED (2026-10-26): k10r ADR-0015 landed the skill node and `POST /skills/{memory_scope}/resolve` — a skill is a node in the same graph, so the graph's scope addresses it |
    | `invoke_skill` | `{skill_id, step?, arguments?}` | read the skill, pick the step, `GET /code/{id}` for its script, then the governed call `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` on an effector node mount (SEAM.md §3) | LISTED (2026-10-26): ONE step per call — the sequence is the model's (§3) |
    | `create_skill` | `{name, title?, content, preconditions?, steps?, verification?}` | `POST /skills/{memory_scope}` — the declaration door k10r already serves (ADR-0015); the step-shaped parts travel as JSON TEXT, so the array→text conversion happens here, at the boundary that owns the wire | LISTED (2026-10-26, k10r ADR-0018): the model's act, symmetric with `commit_memory` — a skill that is never written down is a procedure the next conversation reinvents |   | `create_skill` | `{name, title?, content, preconditions?, steps?, verification?}` | `POST /skills/{memory_scope}` — the declaration door k10r already serves (ADR-0015); the step-shaped parts travel as JSON TEXT, so the array→text conversion happens here, at the boundary that owns the wire | LISTED (2026-10-26, k10r ADR-0018): the model's act, symmetric with `commit_memory` — a skill that is never written down is a procedure the next conversation reinvents |
+   | `write_code` | `{language, source, description?, parameters?, code_id?}` | `POST /code/{memory_scope}` — k10r's code door (ADR-0023): no `code_id` delivers a NEW script (the store assigns it), a `code_id` appends the next REVISION of that script and answers `{code_id, rev}` | LISTED (2026-10-31): the writing half of execution. Until it existed a skill's steps were prose the deployment could not carry out — `invoke_skill` can only run a `code_id` somebody delivered out of band |
    | `open_task` | `{name, next?, state?}` | `POST /tasks/{memory_scope}` — k10r's task door (k10r ADR-0021): a task is an ORDINARY vertex of the fact graph with its sheet in ns 44, so a dependency or a tag is a `commit_memory` fact and needs no tool | LISTED (2026-10-27): without it the third group of ADR-0016's list stayed a promise |
    | `move_task` | `{task_id, state?, next?}` | `POST /tasks/{memory_scope}/{task_id}/move` — absent fields are LEFT ALONE; the state is a closed set and a typo is refused at the door, because a task in a state no listing looks for is a task nobody finds | LISTED (2026-10-27) |
    | `list_tasks` | `{state?}` | `GET /tasks/{memory_scope}?state=` — the sheet's `by_state` face with a state, the kind scan without one | LISTED (2026-10-27); the turn also calls it WITHOUT a state and puts every task but `done` in front of the model — the state is on each line, because `blocked` and `open` mean different things to a reader |
+
+   **Why `write_code` is its own tool and not a field on `create_skill`.** A
+   script has a LIFECYCLE — it is written, read, and corrected — and things point
+   at it: a skill's step names its id, a task's `finishes_on` edge lands on its
+   vertex, a counter lands on it too. Inline delivery inside `create_skill` could
+   only ever express "create": every re-declaration would mint a NEW id, orphaning
+   the bindings and counters that named the old one, and a correction would be a
+   new address rather than the same script with a new body. Execution is not a
+   corner of this system either — a coordination engine whose work is running
+   code needs a first-class way to put code in, the same way memory has
+   `commit_memory` and procedure has `create_skill`.
+   A revision does not move the address: k10r appends a version (ADR-0023), so
+   what ran yesterday is still readable while every reference keeps pointing at
+   the same script. Writing needs no mount: a language no mount serves can be
+   stored and is refused at INVOCATION, the door that actually needs a runner.
 
    The task group (`task_open` / `task_done` / `task_list`) is declared but NOT
    listed: its write face has no route yet and the read side rides the session

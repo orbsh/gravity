@@ -204,6 +204,51 @@ static SPECS: &[ToolSpec] = &[
         nature: Nature::Human,
     },
     ToolSpec {
+        name: "write_code",
+        description: "Deliver a script as a piece of code this deployment stores and can run, and \
+                      get back the `code_id` a skill's step names. Give `code_id` to REVISE a script \
+                      you delivered before: a correction appends a new version, so what ran \
+                      yesterday stays readable and the address does not move. This is the writing \
+                      half of execution — a procedure with real steps needs the scripts its steps \
+                      run, or `invoke_skill` has nothing to run.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "language": {
+                        "type": "string",
+                        "description": "The language the script is written in. The call is routed \
+                                       to the mount serving it, and a language no mount serves \
+                                       cannot be invoked — but it CAN be stored here."
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "The script body, verbatim. What the mount runs."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "What it does, in one line — what you and others read when \
+                                       deciding whether to reuse this script instead of writing \
+                                       another one."
+                    },
+                    "parameters": {
+                        "type": "object",
+                        "description": "What the script expects as arguments (a JSON document; stored \
+                                       as text and not parsed by the store)."
+                    },
+                    "code_id": {
+                        "type": "integer",
+                        "description": "The script to revise. Omit to deliver a NEW script. The \
+                                       revision keeps the same `code_id`, so skills, tasks bound to \
+                                       it and its counters all keep pointing at it."
+                    }
+                },
+                "required": ["language", "source"]
+            })
+        },
+        nature: Nature::Human,
+    },
+    ToolSpec {
         name: "open_task",
         description: "Open a task: work somebody has taken on and has not finished. A task is a \
                       VERTEX in the same graph as memory, not a separate list — so a dependency, a \
@@ -472,6 +517,7 @@ pub fn call(
             doors.get(&url)
         }
         "create_skill" => create_skill(doors, args, facts, store_url),
+        "write_code" => write_code(doors, args, facts, store_url),
         "invoke_skill" => invoke(doors, args, facts, store_url, walked),
         other => Err(format!(
             "unknown tool `{other}`; this deployment serves: {}",
@@ -516,6 +562,52 @@ fn create_skill(
         }
     }
     doors.post(&format!("{store_url}/skills/{scope}"), &body)
+}
+
+/// `write_code`: a script becomes a code row, and a correction becomes the next
+/// version of the SAME row (k10r ADR-0023's chain).
+///
+/// This is the writing half of execution. Without it `invoke_skill` can only run
+/// scripts somebody delivered out of band, so a skill's steps are prose the
+/// deployment cannot carry out — the model can declare a procedure and never run
+/// it. Two manners are the store's and are not restated here: a `code_id` it
+/// never wrote is refused by id, and a revision never overwrites the version it
+/// supersedes.
+///
+/// `parameters` arrives as an OBJECT when a model writes it naturally; the door
+/// carries a JSON document in TEXT (the store parses none of it), so the
+/// conversion happens at this boundary — the producer owns the shape (ADR-0012
+/// §2), exactly as `create_skill`'s step-shaped parts do.
+fn write_code(
+    doors: &mut impl Doors,
+    args: &Value,
+    facts: &Facts<'_>,
+    store_url: &str,
+) -> Result<Value, String> {
+    let language = args
+        .get("language")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+        .ok_or("write_code: `language` is required (the mount that runs it is chosen by it)")?;
+    let source = args
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or("write_code: `source` is required (the script body)")?;
+    let scope = facts.scope("write_code")?;
+    let mut body = json!({ "language": language, "source": source });
+    if let Some(description) = args.get("description").and_then(Value::as_str) {
+        body["description"] = json!(description);
+    }
+    match args.get("parameters") {
+        Some(Value::String(text)) => body["parameters"] = json!(text),
+        Some(doc @ (Value::Object(_) | Value::Array(_))) => body["parameters"] = json!(doc.to_string()),
+        _ => {}
+    }
+    if let Some(code_id) = args.get("code_id").and_then(Value::as_u64) {
+        body["code_id"] = json!(code_id);
+    }
+    doors.post(&format!("{store_url}/code/{scope}"), &body)
 }
 
 /// Count one record of an invocation. Silent on failure: the store answers a
@@ -576,7 +668,7 @@ fn invoke(
         format!("invoke_skill: step {index} names no `code_id`")
     })?;
 
-    // A code row is scoped since k10r ADR-0024 (it is a vertex of that corpus's
+    // A code row is scoped since k10r ADR-0023 (it is a vertex of that corpus's
     // graph), so the door carries the same scope the skill did.
     let code = doors.get(&format!("{store_url}/code/{scope}/{code_id}"))?;
     let language = code
@@ -984,6 +1076,7 @@ mod tests {
                 "resolve_skills",
                 "invoke_skill",
                 "create_skill",
+                "write_code",
                 "open_task",
                 "move_task",
                 "list_tasks"
@@ -1409,6 +1502,97 @@ mod tests {
             "a part the model did not state stays ABSENT — the store merges, \
              so an empty one would erase what a previous declaration filled"
         );
+    }
+
+    #[test]
+    fn write_code_delivers_a_new_script_and_stringifies_its_parameters() {
+        // The writing half of execution: a model states a script and its
+        // arguments the way it writes naturally (parameters as an OBJECT); the
+        // door carries TEXT, so the conversion is this boundary's.
+        let mut doors = Recorder::default();
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+
+        let value = call(
+            &mut doors,
+            "write_code",
+            &json!({
+                "language": "python",
+                "source": "print(sum(args[\"n\"]))",
+                "description": "sum the numbers",
+                "parameters": { "n": "array of integers" },
+            }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect("the script lands");
+        assert_eq!(value["posted"], true);
+
+        let (url, body) = &doors.posts[0];
+        assert_eq!(url, "http://mem.test/code/37", "scoped like every door now");
+        assert_eq!(body["language"], "python");
+        assert_eq!(body["source"], "print(sum(args[\"n\"]))", "verbatim");
+        assert_eq!(
+            body["parameters"],
+            r#"{"n":"array of integers"}"#,
+            "the object travels as the JSON TEXT k10r stores (it parses nothing)"
+        );
+        assert!(
+            body.get("code_id").is_none(),
+            "a write with no `code_id` is a NEW script — the store assigns the id"
+        );
+    }
+
+    #[test]
+    fn write_code_revises_in_place_by_naming_the_id() {
+        // A correction keeps the address: skills that name this `code_id`, tasks
+        // bound to it and its counters all keep pointing at the same script,
+        // while the version that ran stays readable (k10r ADR-0023).
+        let mut doors = Recorder::default();
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+
+        let value = call(
+            &mut doors,
+            "write_code",
+            &json!({ "language": "python", "source": "print(2)", "code_id": 4 }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect("the revision lands");
+        assert_eq!(value["posted"], true);
+
+        let (url, body) = &doors.posts[0];
+        assert_eq!(url, "http://mem.test/code/37");
+        assert_eq!(body["code_id"], 4);
+        assert_eq!(body["source"], "print(2)");
+    }
+
+    #[test]
+    fn write_code_refuses_a_call_it_cannot_carry_out() {
+        let mut doors = Recorder::default();
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+        let err = call(
+            &mut doors,
+            "write_code",
+            &json!({ "source": "print(1)" }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect_err("a script without a language cannot be routed");
+        assert!(err.contains("language"), "{err}");
+
+        let err = call(
+            &mut doors,
+            "write_code",
+            &json!({ "language": "python" }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect_err("a language without a body is not code");
+        assert!(err.contains("source"), "{err}");
+        assert!(doors.posts.is_empty(), "nothing was posted");
     }
 
     #[test]
