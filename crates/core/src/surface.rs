@@ -390,19 +390,6 @@ pub struct HttpSurface {
     format: MemoryFormat,
 }
 
-/// Request body of `POST /channels/{id}/messages` (mem-server's wire
-/// shape — kept in step with mem-server's `AppendMessage`).
-#[derive(serde::Serialize)]
-struct AppendMessageDto {
-    /// The turn the record is written under (k10r ADR-0024).
-    turn_id: u64,
-    ts_ms: u64,
-    sub: u16,
-    role: u8,
-    kind: u8,
-    content: String,
-}
-
 impl HttpSurface {
     pub fn new(base: &str) -> Self {
         Self {

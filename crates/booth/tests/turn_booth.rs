@@ -341,12 +341,12 @@ fn turn_args(msg: &str) -> Value {
     })
 }
 
-/// The same payload asking for FRAMES: the drawing caller names its slots (gravity does not
-/// own a layout, so it cannot know them).
+/// The same payload asking for FRAMES. `protocol: fluxen` is the whole declaration: the
+/// application serves the layout, so it names its own slot and asks the caller nothing about
+/// the renderer's vocabulary.
 fn view_args(msg: &str) -> Value {
     let mut args = turn_args(msg);
     args["protocol"] = json!("fluxen");
-    args["slots"] = json!({ "rack": "chat", "text": "say" });
     args
 }
 
@@ -1353,32 +1353,33 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
         3,
         "the stage on the OPEN, then one batch per chunk (ADR-0010: the person's message is          drawn when they send it, not when the first token arrives): {batches:?}"
     );
-    let first = &batches[0];
+    let open = &batches[0];
+    assert_eq!(open.len(), 1, "the open draws exactly the person's bubble");
     assert_eq!(
-        first.len(),
-        3,
-        "the stage is set in one ordered batch, without a chunk: {first:?}"
+        open[0]["slot"], "messages",
+        "it lands in the conversation the APPLICATION declares — not a slot the caller named"
     );
     assert_eq!(
-        first[0]["slot"], "chat",
-        "the user's line lands in the rack"
+        open[0]["data"]["id"], "7:1_0",
+        "the bubble is keyed by the turn: the id every later frame can group by"
     );
     assert_eq!(
-        first[0]["data"]["children"][0]["bind"]["value"]["default"],
+        open[0]["data"]["attrs"]["selector"], "user",
+        "appearance is the layout's item template, chosen by selector — no class list here"
+    );
+    assert_eq!(
+        open[0]["data"]["children"][0]["bind"]["value"]["default"],
         "hi"
     );
-    assert_eq!(first[1]["action"], "set");
-    assert_eq!(
-        first[1]["slot"], "say",
-        "the region is the caller's own name"
-    );
-    assert_eq!(
-        first[2]["data"]["children"][0]["bind"]["value"]["source"],
-        "say"
-    );
-    // Then the chunks, one batch each, patching the region the open created.
-    assert_eq!(batches[1][0]["action"], "patch");
-    assert_eq!(batches[1][0]["value"], "hel");
+    // The reply's bubble is created WITH the first chunk (an empty one would linger if the
+    // turn failed), then patched BY ROW — so two turns in flight cannot interleave.
+    assert_eq!(batches[1].len(), 2, "append the reply bubble, then its text");
+    assert_eq!(batches[1][0]["data"]["id"], "7:1_1");
+    assert_eq!(batches[1][0]["data"]["attrs"]["selector"], "assistant");
+    assert_eq!(batches[1][1]["action"], "patch");
+    assert_eq!(batches[1][1]["id"], "7:1_1");
+    assert_eq!(batches[1][1]["value"], "hel");
+    assert_eq!(batches[2].len(), 1, "later chunks only patch");
     assert_eq!(batches[2][0]["value"], "lo");
 
     // And the exchange landed: the stream was live enough to be a turn.
@@ -1390,24 +1391,6 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
             .map(|(_, row)| row.content.clone())
             .unwrap_or_default(),
         "hello"
-    );
-}
-
-/// A drawing caller that names no slots is REFUSED by name: gravity owns no layout, so it
-/// cannot invent them, and a booth that guessed would draw into a slot the page does not
-/// have.
-#[tokio::test]
-async fn a_drawing_caller_must_name_its_slots() {
-    let endpoint = sse_server(vec!["hel"]).await;
-    let store_url = mem_server().await;
-    let (engine, seen) = boot(&store_url, &endpoint).await;
-
-    let mut args = turn_args("hi");
-    args["protocol"] = json!("fluxen");
-    let failure = run_turn(&engine, &seen, args).await.unwrap_err();
-    assert!(
-        failure.contains("needs `slots`"),
-        "the refusal names the missing declaration: {failure}"
     );
 }
 

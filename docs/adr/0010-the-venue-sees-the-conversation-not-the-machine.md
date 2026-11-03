@@ -53,23 +53,24 @@ limit at the end).
 ## The pattern, drawn
 
 The order is: the client sends an event → the store writes the row (and mints the turn id) →
-the application speaks the receipt and one batch of operations (the person's row, the region,
-the bubble that reads it) → only then does the work run, patching what the open created →
-the end is said. Nothing is drawn by the client, and nothing is re-drawn by a chunk.
+the application speaks the receipt and appends the person's bubble, keyed `<turn>_0` → only
+then does the work run, and the reply's bubble `<turn>_1` is created with its first content
+and patched BY ROW from there → the end is said. Nothing is drawn by the client, no chunk
+re-draws anything, and two turns in flight patch different bubbles because the id is the row.
 
-The drawing side of this — the five steps, where container shape lives, and what is
+Slot names are the application's: it serves the layout, so it names the conversation slot
+(`messages`) and the caller names nothing. Bubble ids count up from the turn — `_0` the
+person, `_1` the reply (tool calls fold in), `_2`, `_3` for anything that earns a bubble of
+its own. The reply's bubble is NOT created at the open: an empty one a failed turn never
+fills would sit on screen saying nothing.
+
+Appearance is the layout's: each row carries a `selector` and an item template decides
+alignment and accent, so no class list appears in a frame.
+
+The drawing side in full — the five steps, where container shape lives, and what is
 deliberately absent from a frame — belongs to the renderer's own documentation:
 **`fluxen/docs/interaction-patterns.md`**. This ADR keeps only what the application owes:
 write first, speak before working, key every frame with the turn.
-
-## Known limit
-
-Two turns in flight on one device draw into slots the CALLER named at submit time, and those
-names are the same for both — so their patches interleave in one region. The id cannot fix it
-from outside: the caller has to pick the names before the id exists. Closing it means the
-application deriving per-turn names from the id it minted (say `<region>-<turn>`) and stating
-them in the receipt, which is the same rule as everywhere else — names inside a rendering are
-declared by whoever serves the layout. Not done yet; recorded so it is not mistaken for solved.
 
 ## Consequences
 

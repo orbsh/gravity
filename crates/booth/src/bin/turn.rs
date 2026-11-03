@@ -239,19 +239,17 @@ const SAVE_REFUSED_EVENT: &str = "ui:gravity-model.error";
 /// and lands in that slot as a whole value, which is a different shape from a row append.
 const NOTICE_EVENT: &str = "ui:gravity-model.notice";
 
-/// Where the frames go when the caller asked for the view protocol. THE CALLER DECLARES
-/// THEM (gravity does not own a layout, so it cannot know a slot's name): `slots.rack` is
-/// the list the turn appends to, `slots.text` the region the answer streams into.
-struct View {
-    rack: String,
-    text: String,
-}
+/// The list a turn appends its bubbles to. THE APPLICATION NAMES IT: it serves the layout
+/// that declares `messages`, so it does not ask a caller what its own slot is called — and a
+/// caller that had to answer would be speaking the renderer's vocabulary (`rack`, `text`)
+/// about a business object.
+const MESSAGES_SLOT: &str = "messages";
 
 /// What the caller asked its chunks to BE. Both shapes ride `ctx.emit`; the difference is
 /// whether a renderer draws them or a consumer reads them.
 enum Out<'a> {
-    /// Accrete frames against the slots the caller declared.
-    View(View),
+    /// Accrete frames: bubbles appended to `messages`, keyed by `<turn>_<n>`.
+    View,
     /// Raw deltas at the event the caller named (`event`). Gravity owns no event names:
     /// a consumer that wants `{"delta": …}` says what it wants it called.
     Data(&'a str),
@@ -259,23 +257,9 @@ enum Out<'a> {
 
 fn out_of(args: &Value) -> anyhow::Result<Out<'_>> {
     match args.get("protocol").and_then(Value::as_str) {
-        Some("fluxen") => {
-            let slots = args
-                .get("slots")
-                .context("turn: `protocol: fluxen` needs `slots`")?;
-            Ok(Out::View(View {
-                rack: slots
-                    .get("rack")
-                    .and_then(Value::as_str)
-                    .context("turn: `slots.rack` is the list the turn appends to")?
-                    .to_string(),
-                text: slots
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .context("turn: `slots.text` is the region the answer streams into")?
-                    .to_string(),
-            }))
-        }
+        // `fluxen` says "draw it"; the drawing itself is the application's, so nothing
+        // else is asked of the caller.
+        Some("fluxen") => Ok(Out::View),
         _ => Ok(Out::Data(
             args.get("event")
                 .and_then(Value::as_str)
@@ -315,82 +299,69 @@ fn emit(
     ctx.emit(event, envelope)
 }
 
-/// The text region the answer streams into: an empty text node bound to a default value.
-fn frame_text_region(text: &str) -> Value {
-    json!({
-        "action": "set",
-        "slot": text,
-        "data": {"type": "text", "bind": {"value": {"kind": "default", "default": ""}}},
-    })
-}
 
 /// One bubble in the rack whose text child reads the streaming region — so a patch of the
-/// region re-renders the paragraph, not the box (fluxen's walkthrough rule).
-fn frame_answer_bubble(rack: &str, text: &str) -> Value {
-    json!({
-        "action": "append",
-        "slot": rack,
-        "data": {
-            "type": "case",
-            "attrs": {"class": ["nogrow", "as-stretch", "box", "border", "round", "shadow"]},
-            "children": [{
-                "type": "text",
-                "bind": {"value": {"kind": "source", "source": text}},
-            }],
-        },
-    })
-}
 
 /// The user's own line, so the rack shows the question above the answer.
-fn frame_ask_bubble(rack: &str, ask: &str) -> Value {
+/// One bubble, appended to the conversation. The row carries its own identity (`data.id`)
+/// and a `selector` the LAYOUT's item template matches on — appearance is the template's
+/// business, so no class list appears here (fluxen ADR 0020/0024).
+fn frame_message(id: &str, selector: &str, text: &str) -> Value {
     json!({
         "action": "append",
-        "slot": rack,
+        "slot": MESSAGES_SLOT,
         "data": {
+            "id": id,
             "type": "case",
-            "attrs": {
-                "class": ["nogrow", "as-end", "accent", "box", "border", "round", "shadow"],
-                "selector": "ask",
-            },
+            "attrs": { "selector": selector },
             "children": [{
                 "type": "text",
-                "bind": {"value": {"kind": "default", "default": ask}},
+                "bind": { "value": { "kind": "default", "default": text } },
             }],
         },
     })
 }
 
-/// One streamed chunk into the region (fluxen's frame vocabulary: patch, append, value).
-fn frame_chunk(text: &str, chunk: &str) -> Value {
+/// One chunk into the bubble `id` — ADDRESSED BY ROW, not by a shared slot: two turns in
+/// flight patch their own bubbles and cannot interleave.
+fn frame_chunk(id: &str, chunk: &str) -> Value {
     json!({
         "action": "patch",
-        "slot": text,
-        "path": "/bind/value/default",
+        "slot": MESSAGES_SLOT,
+        "id": id,
+        "path": "/children/0/bind/value/default",
         "op": "append",
         "value": chunk,
     })
 }
 
-/// The frames the turn draws the moment it OPENS: the question, the region, the bubble
-/// that reads it — one batch, in order, because the patch that fills the region must find
-/// it. They leave with the receipt, not with the first token: the UI holds no logic of its
-/// own and draws only what it is told (ADR-0010), so "the person's message appears when
-/// they send it" is a frame the APPLICATION owes, not something a client can infer — and
-/// waiting for the first token made a send look like nothing had happened.
-fn frames_open(view: &View, ask: Option<&str>) -> Vec<Value> {
-    match ask {
-        Some(ask) => vec![
-            frame_ask_bubble(&view.rack, ask),
-            frame_text_region(&view.text),
-            frame_answer_bubble(&view.rack, &view.text),
-        ],
-        None => Vec::new(),
-    }
+/// The id of the `n`-th bubble of one turn: `<turn>_0` is the person's message, `<turn>_1`
+/// the reply (tool calls fold into it), and anything that owns a bubble of its own — a
+/// confirmation form, say — continues the count. The turn id stays the grouping key.
+fn bubble_id(turn_id: &str, n: u8) -> String {
+    format!("{turn_id}_{n}")
 }
 
-/// The frames one chunk draws: the chunk itself, into the region the open put there.
-fn frames_for(view: &View, chunk: &str) -> Vec<Value> {
-    vec![frame_chunk(&view.text, chunk)]
+/// What the turn draws the moment it OPENS: the person's own message, as a bubble with the
+/// turn as its key. It leaves with the receipt, not with the first token — a UI holds no
+/// logic of its own (ADR-0010), so "the person's message appears when they send it" is a
+/// frame the application owes, and waiting for the first token made a send look like nothing
+/// had happened. The reply's bubble is NOT created here: one that never fills would leave an
+/// empty bubble on screen when a turn fails.
+fn frames_open(turn_id: &str, ask: Option<&str>) -> Vec<Value> {
+    ask.map(|ask| vec![frame_message(&bubble_id(turn_id, 0), "user", ask)])
+        .unwrap_or_default()
+}
+
+/// One chunk draws: the reply's bubble (once, id `<turn>_1`) and then the text in it.
+fn frames_chunk(turn_id: &str, first: bool, chunk: &str) -> Vec<Value> {
+    let id = bubble_id(turn_id, 1);
+    let mut frames = Vec::new();
+    if first {
+        frames.push(frame_message(&id, "assistant", ""));
+    }
+    frames.push(frame_chunk(&id, chunk));
+    frames
 }
 
 /// The caller's payload, whichever way this booth was reached. A venue puts the caller's
@@ -685,13 +656,13 @@ fn turn(
     // And the stage: the person's message, the region its answer will fill, and the
     // bubble that reads it. The question is in `args` from the start, so a renderer that
     // knows nothing but operations can draw the send immediately.
-    if let Out::View(view) = &out {
+    if matches!(out, Out::View) {
         let ask = turn
             .args
             .get("user_message")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let frames = frames_open(view, ask.as_deref());
+        let frames = frames_open(&turn.id, ask.as_deref());
         if !frames.is_empty() {
             emit(ctx, UI_EVENT, device.as_deref(), Some(&turn.id), json!(frames))?;
         }
@@ -877,21 +848,23 @@ fn stream_answer(
     tails: &mut Vec<Tail>,
 ) -> anyhow::Result<String> {
     let mut reply = String::new();
+    let mut first = true;
     loop {
         match out {
-            Out::View(view) => {
+            Out::View => {
                 emit(
                     ctx,
                     UI_EVENT,
                     device,
                     Some(&turn.id),
-                    json!(frames_for(view, &delta)),
+                    json!(frames_chunk(&turn.id, first, &delta)),
                 )?;
             }
             Out::Data(event) => {
                 emit(ctx, event, device, Some(&turn.id), json!({ "delta": delta }))?
             }
         }
+        first = false;
         reply.push_str(&delta);
 
         // The side branch advances one pull per round, on the same face: the summary is
