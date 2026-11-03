@@ -433,8 +433,15 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     match turn(ctx, args, device.as_deref(), &minted) {
         Ok(reply) => {
             if said {
+                // The id rides INSIDE the payload as well as on the envelope: a venue hands a
+                // client the payload (`{ev, args}`), so an id written only beside it never
+                // arrives (prism ui.rs: the body is `data`).
                 let id = minted.borrow().clone();
-                emit(ctx, DONE_EVENT, device.as_deref(), id.as_deref(), json!({}))?;
+                let mut data = json!({});
+                if let Some(id) = &id {
+                    data["turn"] = json!(id);
+                }
+                emit(ctx, DONE_EVENT, device.as_deref(), id.as_deref(), data)?;
             }
             Ok(json!({ "done": true, "value": { "reply": reply } }))
         }
@@ -442,13 +449,11 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
             if said {
                 let detail = format!("{error:#}");
                 let id = minted.borrow().clone();
-                let _ = emit(
-                    ctx,
-                    ERROR_EVENT,
-                    device.as_deref(),
-                    id.as_deref(),
-                    json!({ "detail": detail }),
-                );
+                let mut data = json!({ "detail": detail });
+                if let Some(id) = &id {
+                    data["turn"] = json!(id);
+                }
+                let _ = emit(ctx, ERROR_EVENT, device.as_deref(), id.as_deref(), data);
             }
             Err(error)
         }

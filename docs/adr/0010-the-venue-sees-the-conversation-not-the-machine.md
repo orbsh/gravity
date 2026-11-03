@@ -33,7 +33,7 @@ Two consequences make the rule checkable:
 
 | Fact of the turn | Venue | Why |
 | --- | --- | --- |
-| the question | **log** (its write is what mints the turn id) | spoken by the client that sent it, not by the booth |
+| the question | **log** (its write is what mints the turn id) | never echoed as a message event — the venue excludes the sender, and a client that sent it has it. It IS drawn, as a row the application appends (see the pattern below): a renderer that holds no logic cannot draw a sentence nobody sent it |
 | `ui:turn.opened {turn}` | **emit**, immediately after the mint | the sender needs the id before the answer to key its own sentence; without it two turns of one conversation cannot be untangled where they start |
 | answer chunks | **emit** | the answer IS the speech (ADR-0009: frames for a renderer, `{delta}` for a program) |
 | the model's own reasoning | **neither** | it is not the answer and not a record of the conversation. A "show the work" view is its own event name under its own name, opted into by a client — never the answer's delta stream, never a silent second stream |
@@ -44,7 +44,11 @@ Two consequences make the rule checkable:
 | configuration doors (model save, screen, layout) | **emit**, no turn id | they are not part of a turn |
 
 Every emitted frame that belongs to a turn carries `turn` = `<channel>:<turn>` — the log
-key's first two segments — on the envelope, beside `name` and `data`.
+key's first two segments. It goes on the envelope AND inside the payload: a venue delivers a
+client the payload (`{ev, args}`), so an id written only beside `data` never arrives. A
+DRAWING is the exception by nature: it is an array of operations, addressed by slot and row,
+with no place for an id — which is why concurrent turns must not aim at one region (see the
+limit at the end).
 
 ## The pattern, drawn
 
@@ -57,6 +61,15 @@ The drawing side of this — the five steps, where container shape lives, and wh
 deliberately absent from a frame — belongs to the renderer's own documentation:
 **`fluxen/docs/interaction-patterns.md`**. This ADR keeps only what the application owes:
 write first, speak before working, key every frame with the turn.
+
+## Known limit
+
+Two turns in flight on one device draw into slots the CALLER named at submit time, and those
+names are the same for both — so their patches interleave in one region. The id cannot fix it
+from outside: the caller has to pick the names before the id exists. Closing it means the
+application deriving per-turn names from the id it minted (say `<region>-<turn>`) and stating
+them in the receipt, which is the same rule as everywhere else — names inside a rendering are
+declared by whoever serves the layout. Not done yet; recorded so it is not mistaken for solved.
 
 ## Consequences
 
