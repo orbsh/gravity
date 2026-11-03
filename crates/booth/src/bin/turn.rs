@@ -46,6 +46,11 @@ use serde_json::{json, Value};
 fn main() -> anyhow::Result<()> {
     Guest::new()
         .named("gravity-turn")
+        // Rounds OVERLAP inside this one process (ADR-0046): the host answers each
+        // reply by its request id, so a device's next message is served while the
+        // previous turn is still streaming. The state a round needs is its own
+        // stack and its own streams — nothing is shared between rounds.
+        .concurrent(true)
         // The per-handler auth declaration (prism's gate reads it): the turn needs a
         // bound user — the SAME declaration face the echo plane enforces, no second ACL
         // table. The key is the EVENT the venue's gate names (ADR-0045: a declaration

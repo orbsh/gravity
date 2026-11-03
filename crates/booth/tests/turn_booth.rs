@@ -193,6 +193,9 @@ async fn boot_bare() -> (Engine, Seen) {
     engine
         .register(
             BoothType::script(TURN_TYPE, "induction", turn_bin())
+                // The production declaration (ADR-0046): one process, every round at
+                // once — a device's next message is served while one is running.
+                .unbounded()
                 // The venue's own word for "run a turn", exactly as `register` declares it:
                 // the entry is `turn`, the address field is the envelope's `channel_id`.
                 .on_as("ui:turn.submit", "device", "turn")
@@ -236,6 +239,7 @@ async fn boot_bare() -> (Engine, Seen) {
                     wildcard: false,
                 },
             ],
+            concurrency: aura_booth::Concurrency::Queued,
         })
         .await
         .unwrap();
@@ -450,6 +454,130 @@ async fn run_turn(engine: &Engine, seen: &Seen, args: Value) -> Result<Vec<Strin
         .map(str::to_string)
         .collect();
     outcome.map(|()| deltas)
+}
+
+/// An SSE stub that answers per QUESTION and DELAYS before answering: the delay is
+/// what tells a turn that accepted the next round from one that queued it.
+async fn sse_server_delayed(pairs: Vec<(&'static str, Vec<&'static str>, u64)>) -> String {
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move |body: axum::body::Bytes| {
+            let pairs = pairs.clone();
+            async move {
+                let asked = serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("messages")
+                            .and_then(|m| m.as_array())
+                            .and_then(|m| m.last())
+                            .and_then(|m| m.get("content"))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                let (chunks, delay) = pairs
+                    .into_iter()
+                    .find(|(needle, _, _)| asked.contains(needle))
+                    .map(|(_, chunks, delay)| (chunks, delay))
+                    .unwrap_or_else(|| (vec!["?"], 0));
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                let mut sse = String::new();
+                for c in chunks {
+                    let payload = json!({ "choices": [{ "delta": { "content": c } }] });
+                    sse.push_str(&format!("data: {payload}\n\n"));
+                }
+                sse.push_str("data: [DONE]\n\n");
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+fn turn_args_in(channel: u64, msg: &str) -> Value {
+    let mut args = turn_args(msg);
+    args["channel_id"] = json!(channel);
+    args
+}
+
+async fn start_turn_on(engine: &Engine, key: &str, args: Value) -> Result<(), String> {
+    let slot = Realm::iterate(
+        &engine.realm,
+        IterateOp::Start {
+            target: InstanceId {
+                booth_type: TURN_TYPE.into(),
+                key: InstanceKey::Named(key.into()),
+            },
+            handler: "turn".into(),
+            args,
+        },
+    )
+    .await
+    .unwrap();
+    let rx = match slot {
+        CallSlot::Hot { rx, .. } => rx,
+        _ => panic!("iterate is hot-only"),
+    };
+    let v = match tokio::time::timeout(Duration::from_secs(60), rx).await {
+        Ok(Ok(Ok(v))) => v,
+        Ok(Ok(Err(e))) => return Err(e.to_string()),
+        Ok(Err(_)) => panic!("reply dropped"),
+        Err(_) => panic!("the turn stalled for 60s"),
+    };
+    match v.get("value").and_then(Value::as_str) {
+        Some(error) => Err(error.to_string()),
+        None => Ok(()),
+    }
+}
+
+#[tokio::test]
+async fn a_turn_takes_the_next_round_while_it_is_still_running() {
+    // One turn instance (one device) and two rounds, both slow on the wire: 1.5 s and
+    // 0.8 s before a byte. Queued, the pair takes 2.3 s; overlapped, 1.5 s — the
+    // timing is what tells a booth that declared its slots from one that queued.
+    // The turn declares eight (ADR-0046), so both rounds are served at once.
+    let endpoint = sse_server_delayed(vec![
+        ("slow", vec!["slow ", "answer"], 1_500),
+        ("quick", vec!["quick ", "answer"], 800),
+    ])
+    .await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+
+    let started = std::time::Instant::now();
+    let (first, second) = tokio::join!(
+        start_turn_on(&engine, "s1", turn_args_in(7, "slow")),
+        start_turn_on(&engine, "s1", turn_args_in(8, "quick")),
+    );
+    first.expect("the slow turn finishes");
+    second.expect("the quick turn finishes");
+    let elapsed = started.elapsed();
+    settle(&seen).await;
+
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    let quick = surface.fetch_session(8, 1).await.unwrap();
+    assert_eq!(
+        quick
+            .increment
+            .last()
+            .map(|(_, message)| message.content.as_str())
+            .unwrap_or_default(),
+        "quick answer"
+    );
+    // Both rounds overlapped: had the second been queued, the pair could not have
+    // finished in much less than the slow round's own delay twice over.
+    assert!(
+        elapsed < std::time::Duration::from_millis(1_900),
+        "the rounds overlap (took {elapsed:?}); a queued handler would take 2.3 s"
+    );
 }
 
 #[tokio::test]

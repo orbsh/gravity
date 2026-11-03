@@ -12,8 +12,10 @@
 //! turns — are two threads, not two processes to key and evict.
 //!
 //! Nothing pulls the turn: a turn is one handler call, and its state lives on one
-//! call stack. Several turns in one process is induction's business (request/reply
-//! ids), not the venue's.
+//! call stack. Rounds OVERLAP IN THIS ONE PROCESS — the type declares `unbounded`
+//! (aura ADR-0046) and the guest runs each request on its own thread, so a
+//! device's next message is served while the previous turn is still streaming —
+//! and several turns in one process is induction's business (request/reply ids).
 //!
 //! Custody: the LLM key is read from the env var named in the args; the store URL
 //! rides the args the same way (a deployment fact the caller supplies per call —
@@ -57,6 +59,12 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 // door that writes them is an event too (auth: `ui:gravity-model.save`). A venue
                 // never learns the word — this is the application's own vocabulary, as much as
                 // `ui:turn.submit` is.
+                // Rounds OVERLAP, in ONE process (ADR-0046): a turn runs as long as
+                // the model takes, and a device's next message is served while it
+                // does. The turn holds no state outside a call's own stack and its
+                // own streams, and induction pairs every reply with its request id,
+                // so the instance is `unbounded` — no queue, no second process.
+                .unbounded()
                 .on_as("ui:gravity-model.save", "device", "save")
                 // And the SCREEN (ADR-0007 §4: management is a view). It draws forms whose buttons
                 // emit the save event above, so the vocabulary is discoverable from the venue
