@@ -12,6 +12,7 @@ fjall = "3"
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+ureq = { version = "2", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 

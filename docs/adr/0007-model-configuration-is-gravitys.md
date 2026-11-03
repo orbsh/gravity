@@ -29,7 +29,7 @@ Custody is unchanged and it constrains the shape: the KEY VALUE never leaves the
 
 5. **A fresh deployment has no rows, and that is a named error.** The turn fails loudly, naming the document and the key that is missing, instead of falling back to an environment variable. A fallback is a second home by another name.
 
-6. **Custody is untouched.** Rows carry `key_env` (a name); the value lives in the guest process's environment, read by the provider guest through that name. No configuration surface — stored, argued, or served — ever carries the key.
+6. **Custody is untouched.** Rows carry `key_env` (a name); the value lives in the turn process's environment, read when a stream opens, through that name. No configuration surface — stored, argued, or served — ever carries the key.
 
 ## Considered and rejected
 

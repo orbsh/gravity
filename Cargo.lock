@@ -2262,6 +2262,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "ureq",
 ]
 
 [[package]]

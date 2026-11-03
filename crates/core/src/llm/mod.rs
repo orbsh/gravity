@@ -7,12 +7,15 @@
 //! and key live in gravity's config/env, never in krystallizer's data.
 //!
 //! Submodules:
+//! - [`live`] — a live streaming call: the turn opens its own stream instead of
+//!   asking a provider booth for one (there is no provider booth).
 //! - [`sse`] — the SSE wire decoder (the one home for the framing and
-//!   chunk shape; the provider guest and any streaming consumer ride it).
+//!   chunk shape; every streaming consumer rides it).
 //! - [`tool_stream`] — assembling a streamed tool call from its fragments
 //!   (a real endpoint splits the argument document across deltas; a stub
 //!   never does, so this is the half a test cannot teach you).
 
+pub mod live;
 pub mod sse;
 pub mod tool_stream;
 
@@ -32,8 +35,8 @@ pub struct LlmClient {
     endpoint: String,
     model: String,
     api_key: String,
-    /// The env var NAME the key was resolved from (kept so the
-    /// provider booth can re-read per call — rotation without reload).
+    /// The env var NAME the key was resolved from (kept so a live stream
+    /// can re-read it per call — rotation without reload).
     api_key_env_name: String,
     http: reqwest::Client,
 }
@@ -55,19 +58,19 @@ impl LlmClient {
         })
     }
 
-    /// The endpoint URL (the provider booth's arg — the key itself
-    /// never crosses back out of this handle).
+    /// The endpoint URL (a live stream's arg — the key itself never
+    /// crosses back out of this handle).
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    /// The model id (the provider booth's arg).
+    /// The model id (a live stream's arg).
     pub fn model(&self) -> &str {
         &self.model
     }
 
-    /// The env var NAME the key was resolved from (the provider booth
-    /// re-reads it per call — rotation without a reload).
+    /// The env var NAME the key was resolved from (a live stream re-reads
+    /// it per call — rotation without a reload).
     pub fn api_key_env(&self) -> &str {
         &self.api_key_env_name
     }

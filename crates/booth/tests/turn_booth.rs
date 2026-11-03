@@ -38,13 +38,6 @@ use gravity_booth::TURN_TYPE;
 use gravity_core::surface::MemorySurface;
 use serde_json::{json, Value};
 
-/// The two guest binaries — cargo builds this package's own bins for
-/// its integration tests and exports `CARGO_BIN_EXE_<name>`, so the
-/// fixtures can never run stale (the induction pair.rs pattern).
-fn provider_bin() -> String {
-    env!("CARGO_BIN_EXE_gravity-provider").to_string()
-}
-
 fn turn_bin() -> String {
     env!("CARGO_BIN_EXE_gravity-turn").to_string()
 }
@@ -187,26 +180,16 @@ async fn boot(store_url: &str, endpoint: &str) -> (Engine, Seen) {
 /// The realm with both guests and the collector, and NO deployment rows — the state a fresh
 /// deployment is in before anyone configures it.
 async fn boot_bare() -> (Engine, Seen) {
-    // The provider guest reads the LLM key from the env var its args NAME
-    // (`key_env`), and that var rides the PROCESS environment the guest
-    // child inherits. The fixture owns the requirement — without it the
-    // provider bails at Start and every happy-path turn ends empty, so
-    // the suite would depend on an ambient variable no machine is told
-    // to export.
+    // The turn opens the LLM stream itself, reading the key from the env var its
+    // args NAME (`key_env`) — that var rides the PROCESS environment this test
+    // process sets, and the turn guest child inherits it. The fixture owns the
+    // requirement: without it the stream bails on open and every happy-path turn
+    // ends empty, so the suite would depend on an ambient variable no machine is
+    // told to export.
     std::env::set_var("GRAVITY_TEST_KEY", "test-key");
     let engine = Engine::start(&Default::default())
         .await
         .expect("engine boot");
-    engine
-        .register(BoothType::script(
-            "llm_provider",
-            "induction",
-            // The spawn spec is argv; the fixture bin path is absolute
-            // (no spaces — the shellish split rides them verbatim).
-            provider_bin(),
-        ))
-        .await
-        .unwrap();
     engine
         .register(
             BoothType::script(TURN_TYPE, "induction", turn_bin())

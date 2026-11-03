@@ -11,9 +11,9 @@
 //!    renders the initialization memory, gravity never assembles the graph (ADR-0010 §5).
 //! 2. Prompt assembly: head block (system) + summary preamble (system) + increment + the
 //!    user message.
-//! 3. `ctx.iterate_start(llm_provider, "", "stream", provider_args)`, and in this same
-//!    call the tool rounds and then the answer: each envelope item's `delta` leaves as a
-//!    frame on the venue wire.
+//! 3. `gravity_core::llm::live::Live::open` — this process, this thread — and then the
+//!    tool rounds and the answer: each envelope item's `delta` leaves as a frame on the
+//!    venue wire. A compression or review branch is another `Live` on its own thread.
 //! 4. The turn opens in the store BEFORE step 3 (`POST …/turns`), and every row is
 //!    written as the turn runs: the question first, one row per SUCCESSFUL tool call when
 //!    that round completes, the answer last. The tool rows are the turn's NET EFFECT (a
@@ -579,7 +579,7 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     }
     branch_prefix.extend(numbered);
     let mut tails: Vec<Tail> = Vec::new();
-    start_tails(ctx, &turn, &view, &branch_prefix, &keys, &mut tails);
+    start_tails(&turn, &view, &branch_prefix, &keys, &mut tails);
 
     // 4. The provider: open, run the tool rounds, and land on a CONTENT stream. A
     //    `tool_calls`-first reply = the model wants tools BEFORE any prose: dispatch them,
@@ -599,7 +599,8 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     let question = log.row(Role::User, Kind::Text, &user_message)?;
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
     let mut call_rows: Vec<(u64, u16)> = Vec::new();
-    let mut first = open_provider(ctx, &turn, &messages, "turn: provider stream failed to open")?;
+    let mut live = open_stream(&turn, &messages).context("turn: provider stream failed to open")?;
+    let mut first = live.pull().context("turn: provider stream failed to open")?;
     for _round in 0..8 {
         if first.get("done").and_then(Value::as_bool) == Some(true) {
             return Err(stream_failure(
@@ -715,7 +716,8 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
                 "content": content,
             }));
         }
-        first = open_provider(ctx, &turn, &messages, "turn: provider re-open failed")?;
+        live = open_stream(&turn, &messages).context("turn: provider re-open failed")?;
+        first = live.pull().context("turn: provider re-open failed")?;
     }
     // The loop must have ENDED on a content stream: the cap is the runaway
     // stop, and a provider still asking for tools after it is a failed turn —
@@ -727,11 +729,6 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
             .is_none(),
         "turn: the tool loop did not converge in 8 rounds — the provider kept requesting tools"
     );
-    let sid = first
-        .get("stream_id")
-        .and_then(Value::as_str)
-        .context("turn: provider Start reply carried no stream_id")?
-        .to_string();
     let delta = first
         .get("item")
         .and_then(|i| i.get("delta"))
@@ -740,24 +737,19 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
         .to_string();
 
     // 5. The answer, one emit per chunk, with a live side branch advanced between pulls.
-    let answer = stream_answer(ctx, &out, device, &sid, delta, &turn, &mut tails);
-    // The mandatory dual of Start (ADR-0034 §3): reached on BOTH paths — a guest is
-    // resident, so a stream left open outlives the turn that opened it.
-    let _ = ctx.iterate_dispose(&sid);
+    let answer = stream_answer(ctx, &out, device, &mut live, delta, &turn, &mut tails);
     let reply = match answer {
         Ok(reply) => reply,
         Err(error) => {
-            // Nothing lands and nothing appends: the branches were maintenance, and one
-            // left open here would be pulled by no one.
-            for branch in tails.drain(..) {
-                let _ = ctx.iterate_dispose(&branch.stream_id);
-            }
+            // Nothing lands and nothing appends: the branches were maintenance. Their
+            // threads own their own streams; dropping the receivers is the whole cleanup.
+            tails.clear();
             return Err(error);
         }
     };
     // The answer has streamed; the summary's tail is the only thing still owed (see
     // drain_tails).
-    drain_tails(ctx, &turn, &mut tails);
+    drain_tails(&turn, &mut tails);
 
     // 6. The exchange, only now: one ts, subs 0/1. Gravity's clock IS the channel's time
     //    (krystallizer ADR-0008 §3).
@@ -780,7 +772,7 @@ fn stream_answer(
     ctx: &mut Ctx,
     out: &Out<'_>,
     device: Option<&str>,
-    sid: &str,
+    live: &mut gravity_core::llm::live::Live,
     mut delta: String,
     turn: &Turn<'_>,
     tails: &mut Vec<Tail>,
@@ -802,16 +794,9 @@ fn stream_answer(
 
         // The side branch advances one pull per round, on the same face: the summary is
         // produced alongside the answer, never in front of it.
-        step_tail(ctx, turn, tails);
-        let env = ctx
-            .iterate_next(sid)
-            .context("turn: provider pull failed")?;
+        step_tail(tails, turn);
+        let env = live.pull().context("turn: provider pull failed")?;
         if env.get("done").and_then(Value::as_bool) == Some(true) {
-            // A failed stream ends with the error text as its value; the answer so far is
-            // not an exchange.
-            if let Some(error) = env.get("value").and_then(Value::as_str) {
-                anyhow::bail!("turn: the provider stream failed: {error}");
-            }
             return Ok(reply);
         }
         delta = env
@@ -826,32 +811,22 @@ fn stream_answer(
 /// Open (or reopen) the provider stream and answer its first envelope. A string reply is
 /// the provider handler's error value crossing the host bridge (errors cross as values,
 /// ADR-0012), so it fails HERE with the caller's own wording rather than at a later pull.
-fn open_provider(
-    ctx: &mut Ctx,
+fn open_stream(
     turn: &Turn<'_>,
     messages: &[Value],
-    what: &str,
-) -> anyhow::Result<Value> {
-    let reply = ctx
-        .iterate_start(
-            "llm_provider",
-            "",
-            "stream",
-            json!({
-                "endpoint": turn.endpoint,
-                "model": turn.model,
-                "key_env": turn.key_env,
-                "messages": messages,
-                // The fixed list (ADR-0004): the same bytes every turn, and
-                // the reason a real model can call anything at all.
-                "tools": gravity_booth::tools::tools_array(),
-            }),
-        )
-        .with_context(|| what.to_string())?;
-    if let Some(message) = reply.as_str() {
-        anyhow::bail!("{what}: {message}");
-    }
-    Ok(reply)
+) -> anyhow::Result<gravity_core::llm::live::Live> {
+    // In THIS process, on THIS thread: there is no provider booth to ask, and no
+    // instance to key. A second stream (the compression branch, another device's
+    // turn) is its own thread holding its own reader.
+    gravity_core::llm::live::Live::open(&gravity_core::llm::live::Request {
+        endpoint: &turn.endpoint,
+        model: &turn.model,
+        key_env: &turn.key_env,
+        messages: &json!(messages),
+        // The fixed list (ADR-0004): the same bytes every turn, and the
+        // reason a real model can call anything at all.
+        tools: Some(&gravity_booth::tools::tools_array()),
+    })
 }
 
 /// The mount table the deployment declares: operation language → the mount type serving
@@ -1334,8 +1309,10 @@ fn get_json(url: &str) -> Result<Value, String> {
 /// built the messages — is the only place that index maps back to a position.
 struct Tail {
     op: String,
-    stream_id: String,
-    parts: Vec<String>,
+    /// The product, once the thread's stream ends: its text, or why it failed.
+    /// The thread owns the connection and accumulates nothing the caller needs
+    /// mid-flight — a branch is maintenance, and no one reads it until it ends.
+    rx: std::sync::mpsc::Receiver<Result<String, String>>,
     keys: Vec<Pointer>,
 }
 
@@ -1351,7 +1328,6 @@ struct Tail {
 /// the store's list can grow before every deployed guest is upgraded, and a
 /// version skew must not take a turn down.
 fn start_tails(
-    ctx: &mut Ctx,
     turn: &Turn<'_>,
     view: &Value,
     prefix: &[Value],
@@ -1371,7 +1347,7 @@ fn start_tails(
             eprintln!("[gravity-turn] tail operation `{name}` is not known to this guest");
             continue;
         }
-        open_branch(ctx, turn, &tail, name, prefix, keys, tails);
+        open_branch(turn, &tail, name, prefix, keys, tails);
     }
 }
 
@@ -1385,7 +1361,6 @@ const OP_COMPRESS: &str = "compress";
 const OP_REVIEW: &str = "review";
 
 fn open_branch(
-    ctx: &mut Ctx,
     turn: &Turn<'_>,
     tail: &Value,
     name: &str,
@@ -1398,52 +1373,55 @@ fn open_branch(
     };
     let mut messages: Vec<Value> = prefix.to_vec();
     messages.push(json!({ "role": "user", "content": prompt }));
-    // Each request needs its own connection — a request is stateless, and the
-    // saving comes from the endpoint's prefix cache, not from a shared stream — so
-    // every operation gets its own provider instance, keyed by its name.
-    let first = match ctx.iterate_start(
-        "llm_provider",
-        name,
-        "stream",
-        json!({
-            "endpoint": turn.endpoint,
-            "model": turn.model,
-            "key_env": turn.key_env,
-            "messages": messages,
-        }),
-    ) {
-        Ok(value) => value,
-        Err(e) => {
-            eprintln!("[gravity-turn] `{name}` branch failed to open: {e:#}");
-            return;
+    let messages = json!(messages);
+    let endpoint = turn.endpoint.clone();
+    let model = turn.model.clone();
+    let key_env = turn.key_env.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A THREAD, not a shared pull loop: the endpoint caches the prefix, so the
+    // branch pays only its own delta, and nothing about it touches the answer's
+    // thread except the day it finishes. The stream dies with the thread.
+    std::thread::spawn(move || {
+        let opened = gravity_core::llm::live::Live::open(&gravity_core::llm::live::Request {
+            endpoint: &endpoint,
+            model: &model,
+            key_env: &key_env,
+            messages: &messages,
+            tools: None,
+        });
+        let mut live = match opened {
+            Ok(live) => live,
+            Err(e) => {
+                let _ = tx.send(Err(format!("{e:#}")));
+                return;
+            }
+        };
+        let mut parts = String::new();
+        loop {
+            match live.pull() {
+                Ok(env) => {
+                    if env.get("done").and_then(Value::as_bool) == Some(true) {
+                        break;
+                    }
+                    if let Some(delta) = env
+                        .get("item")
+                        .and_then(|item| item.get("delta"))
+                        .and_then(Value::as_str)
+                    {
+                        parts.push_str(delta);
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("{e:#}")));
+                    return;
+                }
+            }
         }
-    };
-    // A string reply is the provider's error value crossing the bridge.
-    if let Some(err) = first.as_str() {
-        eprintln!("[gravity-turn] `{name}` branch failed: {err}");
-        return;
-    }
-    // A branch that closed on its first round carries no stream id (the realm
-    // merges one only for a non-terminal reply): nothing to land.
-    let Some(sid) = first
-        .get("stream_id")
-        .and_then(Value::as_str)
-        .filter(|_| first.get("done").and_then(Value::as_bool) != Some(true))
-    else {
-        return;
-    };
-    let mut parts = Vec::new();
-    if let Some(delta) = first
-        .get("item")
-        .and_then(|item| item.get("delta"))
-        .and_then(Value::as_str)
-    {
-        parts.push(delta.to_string());
-    }
+        let _ = tx.send(Ok(parts));
+    });
     tails.push(Tail {
         op: name.to_string(),
-        stream_id: sid.to_string(),
-        parts,
+        rx,
         keys: keys.to_vec(),
     });
 }
@@ -1453,45 +1431,25 @@ fn open_branch(
 /// it served, so the caller never states WHERE the node ends — but the record a
 /// compression says it should have ended at is the caller's observation to make,
 /// because only the caller built the messages the model read.
-fn step_tail(ctx: &mut Ctx, turn: &Turn<'_>, tails: &mut Vec<Tail>) {
-    // One round on ONE branch, taking them in turn: the branches are pulled
-    // round-robin so a long tail cannot starve the others, and each keeps its own
-    // accumulated text (`parts`) across rounds.
+fn step_tail(tails: &mut Vec<Tail>, turn: &Turn<'_>) {
     if tails.is_empty() {
         return;
     }
-    let mut branch = tails.remove(0);
-    let env = match ctx.iterate_next(&branch.stream_id) {
-        Ok(value) => value,
-        Err(e) => {
-            eprintln!("[gravity-turn] `{}` pull failed: {e:#}", branch.op);
-            return;
+    let branch = tails.remove(0);
+    match branch.rx.try_recv() {
+        Ok(Ok(text)) => {
+            if !text.trim().is_empty() {
+                land_tail(turn, &branch, &text);
+            }
         }
-    };
-    if env.get("done").and_then(Value::as_bool) == Some(true) {
-        let _ = ctx.iterate_dispose(&branch.stream_id);
-        if let Some(err) = env.get("value").and_then(Value::as_str) {
-            eprintln!(
-                "[gravity-turn] `{}` ended without a product: {err}",
-                branch.op
-            );
-            return;
+        Ok(Err(error)) => eprintln!("[gravity-turn] `{}` branch failed: {error}", branch.op),
+        // Still working: put it back for the next round. This never blocks the
+        // answer — that is the whole point of the thread.
+        Err(std::sync::mpsc::TryRecvError::Empty) => tails.push(branch),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            eprintln!("[gravity-turn] `{}` branch vanished", branch.op)
         }
-        let text = branch.parts.concat();
-        if text.trim().is_empty() {
-            return;
-        }
-        land_tail(turn, &branch, &text);
-        return;
     }
-    if let Some(delta) = env
-        .get("item")
-        .and_then(|item| item.get("delta"))
-        .and_then(Value::as_str)
-    {
-        branch.parts.push(delta.to_string());
-    }
-    tails.push(branch);
 }
 
 /// Drain the live branch before the turn closes. The reason is NOT that the
@@ -1505,14 +1463,26 @@ fn step_tail(ctx: &mut Ctx, turn: &Turn<'_>, tails: &mut Vec<Tail>) {
 /// product's own tail. The cap keeps a runaway branch from holding the turn open;
 /// what is left unlanded is k10r's open node, which its next read treats as
 /// "compressing".
-fn drain_tails(ctx: &mut Ctx, turn: &Turn<'_>, tails: &mut Vec<Tail>) {
-    for _ in 0..64 {
-        if tails.is_empty() {
-            return;
+fn drain_tails(turn: &Turn<'_>, tails: &mut Vec<Tail>) {
+    for branch in tails.drain(..) {
+        match branch
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+        {
+            Ok(Ok(text)) => {
+                if !text.trim().is_empty() {
+                    land_tail(turn, &branch, &text);
+                }
+            }
+            Ok(Err(error)) => eprintln!("[gravity-turn] `{}` branch failed: {error}", branch.op),
+            // The cap keeps a runaway branch from holding the turn open; what is
+            // left unlanded is k10r's open node, which its next read treats as
+            // "compressing".
+            Err(_) => {
+                eprintln!("[gravity-turn] `{}` branch outlived the turn", branch.op)
+            }
         }
-        step_tail(ctx, turn, tails);
     }
-    eprintln!("[gravity-turn] a tail branch was still live after 64 pulls");
 }
 
 /// What an operation's answer MEANT. A compression answers with one JSON object
