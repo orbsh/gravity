@@ -949,47 +949,81 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     Ok(json!({ "done": true }))
 }
 
-/// The screen's tree: the title, the control that asks for the forms, and the forms themselves (or
-/// nothing at all when a renderer connects). One tree for both answers, because a screen and the
-/// layout a page connects to are the same screen with different contents.
+/// The screen's tree: an OUTER FRAME (a navigation bar over the content), never a page with
+/// everything stacked in one column. Under the bar are two areas — the scene on the left, the
+/// conversation on the right — and management is not a third area: it is a panel that opens
+/// over the content (`frame_management`), so the conversation stays mounted while the forms are
+/// being filled. That is not a nicety: a turn streams into `messages`, and a page that unmounted
+/// the slot mid-answer would be writing into a name its layout no longer has.
+///
+/// fluxen renders a bare button as nothing (a button IS a form's submit), so the control in the
+/// bar is a form with no fields: clicking it submits `{}` to `gravity-model`, which the venue
+/// turns into `ui:gravity-model` with this device as the sender.
 fn frame_root(forms: Vec<Value>) -> Value {
+    let mut children = vec![
+        frame_navbar(),
+        json!({
+            "type": "case",
+            "attrs": {"class": ["main", "row", "gap", "shrink"]},
+            "children": [frame_scene(), frame_messages()],
+        }),
+        frame_notice(),
+    ];
+    if !forms.is_empty() {
+        children.push(frame_management(forms));
+    }
     json!({
         "action": "create",
         "slot": "",
         "data": {
             "type": "case",
-            "attrs": {"class": ["maximize"], "horizontal": true},
-            "children": [{
-                "type": "case",
-                "attrs": {"class": ["main", "shrink", "box", "gap"]},
-                "children": [
-                    {
-                        "type": "case",
-                        "attrs": {"class": ["--head", "nogrow", "horizontal", "center"]},
-                        "children": [
-                            {"type": "text", "bind": {"value": {"kind": "default", "default": "this deployment"}}},
-                            {
-                                "type": "form",
-                                "attrs": {"class": ["nogrow"]},
-                                "bind": {"value": {"kind": "dest", "dest": "gravity-model"}},
-                                "children": [{
-                                    "type": "button",
-                                    "attrs": {"oneshot": true},
-                                    "bind": {"value": {"kind": "submit", "default": "manage"}},
-                                }],
-                            },
-                        ],
-                    },
-                    frame_messages(),
-                    {
-                        "type": "case",
-                        "attrs": {"class": ["main", "box", "border", "round", "scrolly", "gap"], "scroll": true},
-                        "children": forms,
-                    },
-                    frame_notice(),
-                ],
-            }],
+            "attrs": {"class": ["maximize", "col"]},
+            "children": children,
         },
+    })
+}
+
+/// The navigation bar: the deployment's name and the one control that opens management. Anything
+/// the deployment wants to become a section belongs here, above the content.
+fn frame_navbar() -> Value {
+    json!({
+        "type": "case",
+        "attrs": {"class": ["--head", "nogrow", "horizontal", "center", "box", "gap"]},
+        "children": [
+            {"type": "text", "bind": {"value": {"kind": "default", "default": "this deployment"}}},
+            {
+                "type": "form",
+                "attrs": {"class": ["nogrow"]},
+                "bind": {"value": {"kind": "dest", "dest": "gravity-model"}},
+                "children": [{
+                    "type": "button",
+                    "attrs": {"oneshot": true},
+                    "bind": {"value": {"kind": "submit", "default": "manage"}},
+                }],
+            },
+        ],
+    })
+}
+
+/// The left area: a SLOT the application fills (`scene`), not a component chosen here. A graphic,
+/// a graph, a picture — that is the deployment's business, and it can start empty.
+fn frame_scene() -> Value {
+    json!({
+        "type": "case",
+        "attrs": {"class": ["main", "box", "border", "round", "gap"]},
+        "children": [{
+            "type": "text",
+            "bind": {"value": {"kind": "source", "source": SCENE_SLOT}},
+        }],
+    })
+}
+
+/// Management as a PANEL over the content: the forms beside it, not a page that replaces it.
+fn frame_management(forms: Vec<Value>) -> Value {
+    json!({
+        "type": "float",
+        "attrs": {"class": ["--manage", "box", "border", "round", "gap", "scrolly"], "top": "0", "right": "0"},
+        "children": forms,
     })
 }
 
@@ -1027,6 +1061,10 @@ fn frame_messages() -> Value {
 /// it enters, whether it turns over, and what holds it still are the RENDERER's business (rack's
 /// `view`, fluxen ADR 0024). The venue only says the line.
 const NOTICE_SLOT: &str = "notice";
+
+/// THE SLOT THE DEPLOYMENT DRAWS ITS SCENE IN: whatever the left area shows is content the
+/// deployment pushes, not a widget the shell decides on.
+const SCENE_SLOT: &str = "scene";
 
 fn frame_notice() -> Value {
     json!({

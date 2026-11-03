@@ -1466,6 +1466,35 @@ async fn the_shell_declares_the_conversation() {
         items[1]["attrs"].get("selector").is_none(),
         "the fallback template takes everything else — the reply, and whatever earns a bubble later: {items:?}"
     );
+
+    // The OUTER FRAME: a navigation bar, then the content — scene on the left, conversation on
+    // the right. Management is a panel over this, so the conversation is never unmounted.
+    let column = &frames[0]["data"];
+    assert_eq!(
+        column["attrs"]["class"][1], "col",
+        "the page is a column: bar above, content below"
+    );
+    let bar = &column["children"][0];
+    assert_eq!(bar["attrs"]["class"][0], "--head", "the navigation bar comes first");
+    let bar_children = bar["children"].as_array().expect("the bar's items");
+    assert!(
+        bar_children
+            .iter()
+            .any(|c| c["bind"]["value"]["dest"] == "gravity-model"),
+        "the bar holds the control that opens management: {bar:?}"
+    );
+    let content = &column["children"][1];
+    let areas: Vec<&Value> = content["children"].as_array().map(|c| c.iter().collect()).unwrap_or_default();
+    assert_eq!(areas.len(), 2, "two areas side by side: scene and conversation");
+    assert!(
+        areas[0]["children"][0]["bind"]["value"]["source"] == "scene",
+        "the left area is a slot the deployment fills, not a widget the shell picked: {:?}",
+        areas[0]
+    );
+    assert_eq!(
+        areas[1]["bind"]["value"]["source"], "messages",
+        "the right area is the conversation"
+    );
 }
 
 /// A fresh deployment has no rows, and that is a NAMED error (ADR-0007 §5): the turn says which
