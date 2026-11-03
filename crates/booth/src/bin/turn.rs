@@ -507,7 +507,9 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     // point at one (the compression's cut) answers with an index, because the
     // store owns positions and a model cannot see them.
     let mut numbered: Vec<Value> = Vec::new();
-    let mut keys: Vec<(u64, u16)> = Vec::new();
+    // A position in the log is a POINTER — `(turn, ts, sub)` since k10r ADR-0024:
+    // the turn comes before the millisecond, so two turns cannot be confused.
+    let mut keys: Vec<Pointer> = Vec::new();
     for (index, entry) in view
         .get("increment")
         .and_then(Value::as_array)
@@ -530,13 +532,18 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
             .to_string();
         messages.push(json!({ "role": role, "content": content }));
         if let Some(key) = entry.get("key") {
-            let (Some(ts), Some(sub)) = (
+            let (Some(turn), Some(ts), Some(sub)) = (
+                key.get("turn_id").and_then(Value::as_u64),
                 key.get("ts_ms").and_then(Value::as_u64),
                 key.get("sub").and_then(Value::as_u64),
             ) else {
                 continue;
             };
-            keys.push((ts, sub as u16));
+            keys.push(Pointer {
+                turn_id: turn,
+                ts_ms: ts,
+                sub: sub as u16,
+            });
             numbered.push(json!({
                 "role": role,
                 "content": format!("[{}] {content}", index + 1),
@@ -580,6 +587,14 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     // else. The loop's failures stay in the working messages above — the model
     // needed them to fix its call, a later turn does not.
     let mut tool_events: Vec<ToolEvent> = Vec::new();
+    // The turn OPENS in the store before the first inference (k10r ADR-0024): the
+    // question lands as its first row. A turn that is suspended on a cold call, or
+    // that dies, therefore leaves a working set a resumed turn can read back —
+    // and a turn still running is OPEN, so no one else's projection sees it.
+    let mut log = TurnLog::open(&turn.store_url, channel_id)?;
+    let question = log.row(Role::User, Kind::Text, &user_message)?;
+    // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
+    let mut call_rows: Vec<(u64, u16)> = Vec::new();
     let mut first = open_provider(ctx, &turn, &messages, "turn: provider stream failed to open")?;
     for _round in 0..8 {
         if first.get("done").and_then(Value::as_bool) == Some(true) {
@@ -667,6 +682,11 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
                             args: call.function.arguments.to_string(),
                             result: value.to_string(),
                         };
+                        // ADR-0024: the round lands in the store as it completed, not
+                        // at the end of the turn — the same net-effect record the
+                        // history keeps, written where a resumed turn can read it.
+                        let line = render_tool_event(&event);
+                        call_rows.push(log.row(Role::System, Kind::ToolCall, &line)?);
                         match tool_events.last_mut() {
                             Some(last)
                                 if last.tool == event.tool && last.args == event.args =>
@@ -738,9 +758,15 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
     // 6. The exchange, only now: one ts, subs 0/1. Gravity's clock IS the channel's time
     //    (krystallizer ADR-0008 §3).
     if reply.is_empty() {
+        // No answer, no closing record: the rows already written stay OPEN, and
+        // the projection skips them — a failure costs visibility, not correctness.
         anyhow::bail!("turn: provider stream yielded no tokens");
     }
-    append_exchange(&turn, &user_message, &reply, &tool_events)?;
+    let answer = log.row(Role::Assistant, Kind::Text, &reply)?;
+    let mut keep = vec![question];
+    keep.extend(call_rows);
+    keep.push(answer);
+    log.close(&keep)?;
     Ok(reply)
 }
 
@@ -1306,7 +1332,7 @@ struct Tail {
     op: String,
     stream_id: String,
     parts: Vec<String>,
-    keys: Vec<(u64, u16)>,
+    keys: Vec<Pointer>,
 }
 
 /// Open the tail branches k10r asked for (ADR-0008 §4): the same prefix the main
@@ -1325,7 +1351,7 @@ fn start_tails(
     turn: &Turn<'_>,
     view: &Value,
     prefix: &[Value],
-    keys: &[(u64, u16)],
+    keys: &[Pointer],
     tails: &mut Vec<Tail>,
 ) {
     let wanted = view
@@ -1360,7 +1386,7 @@ fn open_branch(
     tail: &Value,
     name: &str,
     prefix: &[Value],
-    keys: &[(u64, u16)],
+    keys: &[Pointer],
     tails: &mut Vec<Tail>,
 ) {
     let Some(prompt) = tail.get("prompt").and_then(Value::as_str) else {
@@ -1492,7 +1518,7 @@ fn drain_tails(ctx: &mut Ctx, turn: &Turn<'_>, tails: &mut Vec<Tail>) {
 /// The fallback is deliberate: compression is necessary, and a model that
 /// ignored the format still produced a usable summary. Dropping the whole product
 /// over a shape slip would lose the only thing the branch exists to make.
-fn read_products(text: &str, keys: &[(u64, u16)]) -> (String, Option<(u64, u16)>) {
+fn read_products(text: &str, keys: &[Pointer]) -> (String, Option<Pointer>) {
     let trimmed = text.trim();
     let unfenced = trimmed
         .strip_prefix("```json")
@@ -1588,15 +1614,18 @@ fn land_review(turn: &Turn<'_>, facts: &[Value]) {
 /// opened when it served the verdict. The suggestion rides along and is the
 /// only thing this caller states about position; k10r validates it against the
 /// span it opened.
-fn land_summary(turn: &Turn<'_>, summary: &str, suggested: Option<(u64, u16)>) {
+fn land_summary(turn: &Turn<'_>, summary: &str, suggested: Option<Pointer>) {
     let url = format!(
         "{}/channels/{}/members/{}/checkpoint",
         turn.store_url, turn.channel_id, turn.member_id
     );
     let mut body = json!({ "summary": summary });
-    if let Some((ts, sub)) = suggested {
-        body["suggested_ts"] = json!(ts);
-        body["suggested_sub"] = json!(sub);
+    if let Some(point) = suggested {
+        // The whole pointer: k10r refuses a suggestion that names no record, and
+        // `(ts, sub)` alone names two once turns can share a millisecond.
+        body["suggested_turn"] = json!(point.turn_id);
+        body["suggested_ts"] = json!(point.ts_ms);
+        body["suggested_sub"] = json!(point.sub);
     }
     match ureq::post(&url)
         .set("Content-Type", "application/json")
@@ -1606,6 +1635,18 @@ fn land_summary(turn: &Turn<'_>, summary: &str, suggested: Option<(u64, u16)>) {
         Ok(resp) => eprintln!("[gravity-turn] checkpoint door answered {}", resp.status()),
         Err(e) => eprintln!("[gravity-turn] checkpoint door failed: {e}"),
     }
+}
+
+/// A position in k10r's log: `(turn, ts, sub)` (k10r ADR-0024).
+///
+/// Local to this binary on purpose: the guest speaks the store's WIRE, not its
+/// crate, and these three numbers are all a branch needs to resolve the index a
+/// model gave it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Pointer {
+    turn_id: u64,
+    ts_ms: u64,
+    sub: u16,
 }
 
 /// One tool call's net effect, as the history records it: what was asked and what
@@ -1714,43 +1755,76 @@ fn compact_finished_rounds(messages: &mut Vec<Value>) {
     }
     *messages = out;
 }
+/// The turn's rows in k10r (ADR-0024), written AS THE TURN RUNS.
+///
+/// The store mints the id (`POST /channels/{c}/turns`); every round appends its
+/// rows under it; the turn closes with ONE `kind = FINAL` record that names the
+/// records to keep, and k10r collapses the rest. A turn that never closes keeps
+/// its rows as OPEN — working state the projection skips — which is exactly what
+/// a suspended or failed turn should leave behind, and what makes a resumed turn
+/// able to read its own working set back.
+struct TurnLog<'a> {
+    store_url: &'a str,
+    channel: u64,
+    turn_id: u64,
+    /// `(ts_ms, sub)` of every row this turn wrote, in order. The keep set is
+    /// chosen from this, so it can never name a row that was not written.
+    rows: Vec<(u64, u16)>,
+}
 
-/// Append the exchange: one ts for the whole thing, `sub` ordering the events —
-/// user first, then one row per successful tool call, then the answer. Reached
-/// only after a successful stream: a failed turn appends NOTHING (the user
-/// re-sends next turn), and its tools append nothing either.
-fn append_exchange(
-    turn: &Turn<'_>,
-    user_message: &str,
-    reply: &str,
-    tool_events: &[ToolEvent],
-) -> anyhow::Result<()> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .context("turn: clock before epoch")?;
-    // A tool record is `System` and not `Tool`: the stored line is a RECORD that
-    // the action happened — a protocol `role:"tool"` message is only legal
-    // directly after the assistant's `tool_calls`, and replaying one three turns
-    // later is a request a provider rejects.
-    let mut rows: Vec<(u16, Role, Kind, String)> =
-        vec![(0, Role::User, Kind::Text, user_message.to_string())];
-    for (index, event) in tool_events.iter().enumerate() {
-        // `sub` is u16: the loop caps at 8 rounds, so this cannot be reached by a
-        // running turn — the saturating cast is for the type, not for a case.
-        let sub = 1 + u16::try_from(index).unwrap_or(u16::MAX - 2);
-        rows.push((sub, Role::System, Kind::ToolCall, render_tool_event(event)));
+impl<'a> TurnLog<'a> {
+    /// Open the turn and take the id the store minted: a caller-side counter
+    /// would collide across devices, retries and two turns opened at once.
+    fn open(store_url: &'a str, channel: u64) -> anyhow::Result<Self> {
+        let url = format!("{store_url}/channels/{channel}/turns");
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_string("{}")
+            .context("turn: opening the turn failed")?;
+        anyhow::ensure!(
+            (200..300).contains(&resp.status()),
+            "turn: opening the turn returned {}",
+            resp.status()
+        );
+        let body: Value =
+            serde_json::from_reader(resp.into_reader()).context("turn: bad turn-open answer")?;
+        let turn_id = body
+            .get("turn_id")
+            .and_then(Value::as_u64)
+            .context("turn: the turn door answered no turn_id")?;
+        Ok(Self {
+            store_url,
+            channel,
+            turn_id,
+            rows: Vec::new(),
+        })
     }
-    let answer_sub = 1 + u16::try_from(tool_events.len()).unwrap_or(u16::MAX - 2);
-    rows.push((answer_sub, Role::Assistant, Kind::Text, reply.to_string()));
-    for (sub, role, kind, content) in rows {
-        let (role, kind) = (role.code(), kind.code());
-        let url = format!("{}/channels/{}/messages", turn.store_url, turn.channel_id);
+
+    /// Write one row, with gravity's clock as its key (k10r ADR-0008 §3) and
+    /// `sub` 0: inside a turn the clock already orders the rows, and `sub` is the
+    /// same-millisecond tiebreak, which a round boundary never needs.
+    fn row(&mut self, role: Role, kind: Kind, content: &str) -> anyhow::Result<(u64, u16)> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .context("turn: clock before epoch")?;
+        let sub = self.rows.last().filter(|(ts_last, _)| *ts_last == ts).map_or(0, |(_, last)| last + 1);
+        let url = format!(
+            "{}/channels/{}/messages",
+            self.store_url, self.channel
+        );
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
             .send_string(
-                &json!({ "ts_ms": ts, "sub": sub, "role": role, "kind": kind, "content": content })
-                    .to_string(),
+                &json!({
+                    "turn_id": self.turn_id,
+                    "ts_ms": ts,
+                    "sub": sub,
+                    "role": role.code(),
+                    "kind": kind.code(),
+                    "content": content,
+                })
+                .to_string(),
             )
             .context("turn: append failed")?;
         anyhow::ensure!(
@@ -1758,8 +1832,56 @@ fn append_exchange(
             "turn: append returned {}",
             resp.status()
         );
+        let pointer = (ts, sub);
+        self.rows.push(pointer);
+        Ok(pointer)
     }
-    Ok(())
+
+    /// Close the turn: the closing record plus the records to keep. The list is
+    /// what the caller asked to survive — the question, one row per successful
+    /// call, the answer — and k10r purges the rest of the turn in the same write.
+    fn close(&self, keep: &[(u64, u16)]) -> anyhow::Result<()> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .context("turn: clock before epoch")?;
+        // The closing record must FOLLOW the turn's last row — k10r refuses one
+        // that does not, because a FINAL that sorted before a later row would read
+        // as an open turn with a stray closing record in it. Same-millisecond rows
+        // are the ordinary case here (the answer was just written), so the
+        // tiebreak is not optional.
+        let sub = self
+            .rows
+            .last()
+            .filter(|(last_ts, _)| *last_ts == ts)
+            .map_or(0, |(_, last_sub)| last_sub + 1);
+        let url = format!(
+            "{}/channels/{}/turns/{}/close",
+            self.store_url, self.channel, self.turn_id
+        );
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(
+                &json!({
+                    "ts_ms": ts,
+                    "sub": sub,
+                    "role": Role::Assistant.code(),
+                    "content": "",
+                    "keep": keep
+                        .iter()
+                        .map(|(ts_ms, sub)| json!({ "ts_ms": ts_ms, "sub": sub }))
+                        .collect::<Vec<_>>(),
+                })
+                .to_string(),
+            )
+            .context("turn: closing the turn failed")?;
+        anyhow::ensure!(
+            (200..300).contains(&resp.status()),
+            "turn: close returned {}",
+            resp.status()
+        );
+        Ok(())
+    }
 }
 
 /// File one composition: the code rows the walk has visited so far, in order
@@ -1805,10 +1927,22 @@ fn fetch_tasks(store_url: &str, scope: u64) -> Option<Vec<Value>> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{read_products, read_review_facts};
+    use super::{read_products, read_review_facts, Pointer};
 
-    fn keys() -> Vec<(u64, u16)> {
-        vec![(100, 0), (200, 0), (300, 1)]
+    fn keys() -> Vec<Pointer> {
+        vec![
+            pointer(1, 100, 0),
+            pointer(2, 200, 0),
+            pointer(3, 300, 1),
+        ]
+    }
+
+    fn pointer(turn_id: u64, ts_ms: u64, sub: u16) -> Pointer {
+        Pointer {
+            turn_id,
+            ts_ms,
+            sub,
+        }
     }
 
     #[test]
@@ -1820,7 +1954,7 @@ mod tests {
         assert_eq!(summary, "they agreed on the cut");
         assert_eq!(
             cut,
-            Some((200, 0)),
+            Some(pointer(2, 200, 0)),
             "the index the model gave is resolved by the turn that built the messages"
         );
     }
@@ -1843,7 +1977,7 @@ mod tests {
         let (summary, cut) =
             read_products("```json\n{\"summary\": \"s\", \"cut\": 1}\n```", &keys());
         assert_eq!(summary, "s");
-        assert_eq!(cut, Some((100, 0)));
+        assert_eq!(cut, Some(pointer(1, 100, 0)));
     }
 
     #[test]

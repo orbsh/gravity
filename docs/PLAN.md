@@ -13,12 +13,16 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and
   THE LIST LANDED 2026-10-26 (ADR-0004): the loop now has affordances to parse against — the turn sends a FIXED, hardcoded `tools` array on every inference round (including the loop's re-opens) and dispatches by NAME to the door that name belongs to. Three entries are wired because three doors answer: `recall_memory` (`POST /memories/{scope}/recall`, k10r renders with its own read budget), `commit_memory` (`POST /memories/{scope}`, the 8-slot fact tuples, k10r's ingest adjudicates functional relations and answers landed / rewritten / dropped), and — since the same day — `resolve_skills` (`POST /skills/{scope}/resolve`, k10r ADR-0015 landed the skill node and its door; a skill is a node in the same graph, so the graph's scope addresses it). `invoke_skill` followed the same day, once the walk existed (Phase 4.6, below): a tool the substrate cannot serve teaches the model that failing tools are normal, and the substrate now serves this one. The scope rides the turn args (`memory_scope`, from prism's `GRAVITY_MEMORY_SCOPE`), never a compiled constant — k10r's namespace numbers are k10r's declarations, and a missing scope makes the affected tool name the absent fact instead of reading a namespace nobody declared. Every tool failure is a VALUE the model reads (`{"error": …}`), never a turn failure. The old `tool_target` arg and its ctx.invoke dispatch are gone with the list: mounts are reached by `invoke_skill` when it lands, not by whatever name a model invents. Gates: gravity 38/0 — `a_tool_call_reaches_its_door_and_feeds_back` asserts the list rode BOTH rounds, that the ingest answered an outcome, and that `/graph/37` shows the entity the tuple named (a tool's own text is not evidence that the write landed); four unit tests pin the list's shape, the unlisted-name refusal, and the missing-scope refusal. prism `turn_e2e` 5/5. `scripts/smoke-venue.sh` rides the whole real stack with the stub asking for `resolve_skills` on round 0 (and refusing to serve round 1 unless the declared skill's name came back in the tool message) and `commit_memory` on round 1 — and asserts the fact in `/graph/37` (`alice`/`tea`/`likes`), not the reply alone. That run found the boundary the unit tests could not: the turn was surfacing tool_result items on its pull face, and prism's pump refuses anything that is not `item.delta` ("envelope item carries no delta string") — the turn died mid-flight over its own progress. Tool results now stay in the loop and in the turn's transcript; a UI-facing tool frame would be prism's protocol to add.
   LANDED 2026-10-13 (first cut — gravity `4a82359`; the Start-face dispatch loop and its e2e land in the same day's follow-up batch): gravity-core gains the `tool` module — the OpenAI tool-call shapes with the wire's JSON-string `arguments` decoded ONCE at the boundary (`parse_tool_calls`), `ToolResultMessage`/`ToolDispatch`, and the standing rule that a tool FAILURE is a value into the next inference, never a turn failure. The SSE decoder carries `tool_calls` through the chunk stream as its own event (`SseEvent::ToolCalls`, arguments verbatim — the caller parses); the provider guest forwards them verbatim inside its envelope (the provider is transport, not policy). The turn guest runs the loop on its START face: a `tool_calls`-first reply (no content) is parsed, dispatched through `ctx.invoke(tool_target, "", name, args)` to a SIBLING booth type, the result is appended to the working message list as the OpenAI feed-back pair (assistant call + `role: "tool"`), and the provider is re-opened with it; the results also ride `TOOL_RESULTS`, which the PULL face surfaces first — the consumer sees the loop's progress before the content deltas. The cap is 8 rounds, and a provider still asking for tools when it runs out fails the turn with a named error (never an empty first token, never a stream that opens and then dies on an empty reply). `tool_target` is a DEPLOYMENT fact read from the turn args (default `effector`) — gravity resolves no locations itself (Phase 4.5's target shape). Gates: workspace 23/0 (`tool_call_dispatches_to_the_sibling_booth` dispatches into effector's `induction_loop` fixture registered as a sibling booth type and pins the loop's exactly-one re-open; `a_provider_that_never_stops_asking_for_tools_fails_the_turn` pins the cap and "a failed turn appends nothing"), clippy 0, fmt clean. Test-recipe note (superseded 2026-10-26): `boot()` sets `GRAVITY_TEST_KEY` itself, so the suite asks the machine for nothing. Before that, six of the seven tests failed on any machine that had not exported the variable by hand — and they failed as an EMPTY stream, because a failed guest answers a STRING value (`{done:true, value:"…"}`) and `drain_turn` read `done` alone; the terminal round is checked now, so the failure names its cause instead of reading as "the model said nothing". Residual (2.5's face): the transcript/history split (what the working message list persists at turn end vs what the next inference replays), the tool list's source (targets come from the tool list, never from gravity code), and `tool_call`/`tool_result` delta accounting.
 - [ ] Phase 2.5 — Transcript/history split + cold-call declaration:
-  **HALF LANDED 2026-10-31 — the history half (net effect as rows).** The working
-  messages (assistant `tool_calls` + `role:"tool"` results, failures, retries) stay
-  in RESIDENT memory for the loop and are never persisted; the store gets the net
-  effect, in the channel log that already exists (no new table, no new ns):
-  question at `sub 0`, ONE row per SUCCESSFUL tool call at `subs 1..n`, the answer
-  last. A tool row is `role=system` + `kind=TOOL_CALL` (k10r's vocabulary, which
+  **LANDED 2026-10-31 — the history half (net effect as rows, written per round).** The
+  working messages (assistant `tool_calls` + `role:"tool"` results, failures, retries)
+  stay in RESIDENT memory for the loop and are never persisted; the store gets the net
+  effect, in the channel log that already exists (no new table, no new ns). The rows are
+  written AS THE TURN RUNS, under a turn id the STORE mints at the turn's open
+  (`POST /channels/{c}/turns`): the question lands before the first inference, one row per
+  SUCCESSFUL tool call lands when that round completes, the answer lands last, and the turn
+  closes with ONE `kind = FINAL` record naming the records to keep — the question, the
+  successful calls, the answer — whereupon k10r purges the rest of the turn (k10r
+  ADR-0024). Each row carries its own clock; `sub` is the same-millisecond tiebreak. A tool row is `role=system` + `kind=TOOL_CALL` (k10r's vocabulary, which
   was declared from the start and had no writer until now) and its content is the
   self-describing line `[tool] <name> <args> -> <result>`, result truncated at
   2 000 chars. Why SYSTEM and not `role:"tool"`: a protocol tool message is only
@@ -28,8 +32,8 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and
   not, and a retried-identical call keeps only its last answer. A failed turn
   writes no closing record: its rows stay OPEN and the projection skips them
   (k10r ADR-0024), so a failure costs visibility, not correctness. The net-effect
-  row shape above is unchanged — what the turn axis moves is WHEN it is written,
-  from the end of the turn to every round.
+  row shape above is unchanged by the turn axis; what moved is WHEN it is written — the
+  end of the turn became every round, and the closing record is what publishes them.
   The writer states codes through
   `gravity_core::surface::{Role, Kind}` (`#[repr(u8)]`, discriminants spelled as
   k10r's own constants, `TryFrom<u8>` total) instead of literals — and the labels
@@ -77,8 +81,12 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and
   lands as it runs, the turn carries an id the STORE mints at its open, and an
   open turn is working state the projection skips. The turn closes with ONE
   `kind = FINAL` record naming the subs to keep and k10r collapses the rest
-  (k10r ADR-0024). What this phase still owes is the code: the turn axis in k10r's
-  key, and gravity writing per round and submitting the final record.
+  (k10r ADR-0024). BOTH HALVES OF THAT CODE EXIST NOW: k10r's key carries the turn (ADR-0024
+  landed in mem-core and the HTTP surface), and gravity writes per round and submits the
+  closing record (`TurnLog` in the turn binary: open before the first inference, one row
+  per successful call, answer, close with the keep set). A turn that fails writes no
+  closing record at all — its rows stay OPEN and the projection skips them, which is why a
+  failure costs visibility and not correctness.
   RECORDED, NOT ADOPTED (2026-10-31, user's call): "recall happens when the
   question arrives" — the turn would send the question to k10r, k10r would search
   its own memory and append whatever looks useful as NOTES behind the question

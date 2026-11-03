@@ -11,6 +11,18 @@ use gravity_core::surface::{InProcessSurface, MemorySurface};
 use mem_core::channel::{kind, role};
 use mem_core::FactTuple;
 
+/// A position in the log: k10r's `(turn, ts, sub)` pointer (ADR-0024). Each
+/// in-process `append_message` closes its own turn, so the rows these fixtures
+/// seed are turns 1, 2, 3… in write order.
+fn pointer(turn_id: u64, ts_ms: u64, sub: u16) -> mem_core::Pointer {
+    mem_core::Pointer {
+        turn_id,
+        ts_ms,
+        sub,
+    }
+}
+
+
 /// The head's corpus: one fact about the channel's default member node
 /// (channel 7, member 1 — the node k10r names `member-7-1`), so the head
 /// block participates in the byte comparison.
@@ -210,7 +222,7 @@ async fn checkpoint_compression_rewrites_the_view_deliberately() {
     let mut stores = mem_core::open_service(dir.path()).unwrap();
     stores
         .channels
-        .append_checkpoint(7, (100, 0), "compressed summary", &[])
+        .append_checkpoint(7, pointer(1, 100, 0), "compressed summary", &[])
         .unwrap();
     let surface2 = InProcessSurface::wrap(stores);
     let after = surface2.fetch_session(7, 1).await.unwrap();

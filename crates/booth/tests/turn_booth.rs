@@ -496,22 +496,24 @@ async fn the_exchange_lands_after_the_stream_ends() {
         .unwrap();
     assert_eq!(deltas.join(""), "hello");
 
-    // The memory seam saw the exchange: user + assistant, one ts, subs
-    // 0/1. Read through gravity's own HTTP surface (the same wire the
-    // guest posted through).
+    // The memory seam saw the exchange as ONE turn (k10r ADR-0024): the question
+    // and the answer are two rows of the same turn, each with the clock it was
+    // written on, and the turn is CLOSED — that is what makes them readable.
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
     let view = surface.fetch_session(7, 1).await.unwrap();
-    assert_eq!(view.increment.len(), 2);
+    assert_eq!(view.increment.len(), 2, "question and answer, nothing else");
     assert_eq!(view.increment[0].1.role.as_deref(), Some("user"));
     assert_eq!(view.increment[0].1.content, "hi");
     assert_eq!(view.increment[1].1.role.as_deref(), Some("assistant"));
     assert_eq!(view.increment[1].1.content, "hello");
     assert_eq!(
-        view.increment[0].0.ts_ms, view.increment[1].0.ts_ms,
-        "one exchange one timestamp"
+        view.increment[0].0.turn_id, view.increment[1].0.turn_id,
+        "one exchange, one turn"
     );
-    assert_eq!(view.increment[0].0.sub, 0);
-    assert_eq!(view.increment[1].0.sub, 1);
+    assert!(
+        view.increment[0].0.ts_ms <= view.increment[1].0.ts_ms,
+        "the rows are written as the turn runs, so the answer cannot precede the question"
+    );
 }
 
 #[tokio::test]
@@ -897,13 +899,28 @@ async fn two_calls_in_one_round_reach_the_model_as_one_round() {
     // turns later. The line is self-describing so a reader is not parsing it.
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
     let view = surface.fetch_session(7, 1).await.unwrap();
-    let rows: Vec<(u16, Option<String>, u8, String)> = view
+    // The whole KEY, not the sub: since k10r ADR-0024 a row's position is
+    // `(turn, ts_ms, sub)`, and each row carries the clock it was written on.
+    type Row = ((u64, u64), Option<String>, u8, String);
+    let rows: Vec<Row> = view
         .increment
         .iter()
         .map(|(key, message)| {
-            (key.sub, message.role.clone(), message.kind, message.content.clone())
+            (
+                (key.ts_ms, u64::from(key.sub)),
+                message.role.clone(),
+                message.kind,
+                message.content.clone(),
+            )
         })
         .collect();
+    assert!(
+        view.increment.windows(2).all(|pair| {
+            (pair[0].0.turn_id, pair[0].0.ts_ms, pair[0].0.sub)
+                <= (pair[1].0.turn_id, pair[1].0.ts_ms, pair[1].0.sub)
+        }),
+        "the rows come back in key order"
+    );
     assert_eq!(rows.len(), 4, "question + two calls + answer: {rows:#?}");
     assert_eq!(rows[0].1.as_deref(), Some("user"));
     assert_eq!(rows[0].2, 0, "the question is text");
@@ -917,11 +934,6 @@ async fn two_calls_in_one_round_reach_the_model_as_one_round() {
         );
     }
     assert_eq!(rows[3].1.as_deref(), Some("assistant"), "the answer is last");
-    assert_eq!(rows[3].0, 3, "and it carries the last sub of the exchange");
-    assert!(
-        rows.windows(2).all(|pair| pair[0].0 < pair[1].0),
-        "subs order the exchange"
-    );
 }
 
 /// The dispatch loop's cap is a runaway stop, not a budget to spend

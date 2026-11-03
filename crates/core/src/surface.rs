@@ -180,7 +180,10 @@ pub struct ViewRow {
 /// back — gravity never states one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Compression {
+    /// The record the summary should end at (k10r ADR-0024): a pointer in the
+    /// log's key space, so the turn is part of the address.
     pub checkpoint: u64,
+    pub checkpoint_turn: u64,
     pub prompt: String,
 }
 
@@ -189,6 +192,8 @@ pub struct SessionProjection {
     /// Initialization memory, rendered by k10r in the requested format;
     /// empty when the user node has no facts yet.
     pub head: String,
+    /// The turn the coverage point falls in (ADR-0024).
+    pub coverage_turn: u64,
     pub coverage_ts: u64,
     pub summary: Option<String>,
     pub increment: Vec<(MessageKey, ViewRow)>,
@@ -212,6 +217,12 @@ pub trait MemorySurface: Send + Sync {
     ) -> anyhow::Result<SessionProjection>;
 
     /// Append one log entry; returns the full key (the delta record).
+    ///
+    /// This surface writes a FINISHED record: it opens a turn, writes the row and
+    /// closes the turn keeping it (k10r ADR-0024). The live path — a turn that
+    /// runs for many rounds and is resumed after a cold call — is the booth's
+    /// (`TurnLog` in `booth/src/bin/turn.rs`); this one exists for the two-line
+    /// exchange and for tests, where a row IS the whole turn.
     async fn append_message(
         &self,
         channel_id: u64,
@@ -307,12 +318,13 @@ impl MemorySurface for InProcessSurface {
             // what it carries; a decision that is not written down is not one.
             let head_ids: Vec<u64> = projection.head.iter().map(|fact| fact.edge_id).collect();
             channels
-                .open_checkpoint(channel_id, (v.checkpoint_ts, v.checkpoint_sub), &head_ids)
+                .open_checkpoint(channel_id, v.checkpoint, &head_ids)
                 .map_err(anyhow::Error::msg)?;
         }
         Ok(SessionProjection {
             head: mem_core::render_head(&projection.head, self.format.render()),
-            coverage_ts: projection.view.coverage_ts,
+            coverage_ts: projection.view.coverage.ts_ms,
+            coverage_turn: projection.view.coverage.turn_id,
             summary: projection.view.summary,
             increment: projection
                 .view
@@ -330,7 +342,8 @@ impl MemorySurface for InProcessSurface {
                 })
                 .collect(),
             compress: verdict.map(|v| Compression {
-                checkpoint: v.checkpoint_ts,
+                checkpoint: v.checkpoint.ts_ms,
+                checkpoint_turn: v.checkpoint.turn_id,
                 prompt: mem_core::TAIL_PROMPT.to_string(),
             }),
         })
@@ -346,9 +359,24 @@ impl MemorySurface for InProcessSurface {
         content: &str,
     ) -> anyhow::Result<MessageKey> {
         let mut store = self.channels.lock().await;
+        let turn = store.open_turn(channel_id).map_err(anyhow::Error::msg)?;
+        let key = store
+            .append(channel_id, turn, ts_ms, sub, role, kind, content)
+            .map_err(anyhow::Error::msg)?;
+        // A row written here is a finished exchange, so the turn closes at once
+        // and keeps exactly that row. The closing record must sort after it.
         store
-            .append(channel_id, ts_ms, sub, role, kind, content)
-            .map_err(anyhow::Error::msg)
+            .close_turn(
+                channel_id,
+                turn,
+                ts_ms,
+                sub + 1,
+                role,
+                "",
+                &[(ts_ms, sub)],
+            )
+            .map_err(anyhow::Error::msg)?;
+        Ok(key)
     }
 }
 
@@ -364,6 +392,8 @@ pub struct HttpSurface {
 /// shape — kept in step with mem-server's `AppendMessage`).
 #[derive(serde::Serialize)]
 struct AppendMessageDto {
+    /// The turn the record is written under (k10r ADR-0024).
+    turn_id: u64,
     ts_ms: u64,
     sub: u16,
     role: u8,
@@ -399,6 +429,8 @@ impl MemorySurface for HttpSurface {
         #[derive(serde::Deserialize)]
         struct KeyDto {
             channel_id: u64,
+            /// The turn the record belongs to (k10r ADR-0024).
+            turn_id: u64,
             ts_ms: u64,
             sub: u16,
         }
@@ -416,6 +448,10 @@ impl MemorySurface for HttpSurface {
         #[derive(serde::Deserialize)]
         struct CompressDto {
             checkpoint: u64,
+            /// The turn the checkpoint's pointer falls in (ADR-0024). Defaulted:
+            /// an older server sent `(ts, sub)` alone.
+            #[serde(default)]
+            checkpoint_turn: u64,
             prompt: String,
         }
         #[derive(serde::Deserialize)]
@@ -425,6 +461,11 @@ impl MemorySurface for HttpSurface {
             /// format is validated where it is configured.
             #[serde(default)]
             head: String,
+            /// The turn the coverage point falls in (k10r ADR-0024). Defaulted:
+            /// a server that predates the turn axis sends no such field, and a
+            /// pointer without a turn is the older `(0, ts, sub)` reading.
+            #[serde(default)]
+            coverage_turn: u64,
             coverage_ts: u64,
             summary: Option<String>,
             increment: Vec<EntryDto>,
@@ -448,10 +489,12 @@ impl MemorySurface for HttpSurface {
             .context("mem-server session response was not the expected shape")?;
         Ok(SessionProjection {
             head: dto.head,
+            coverage_turn: dto.coverage_turn,
             coverage_ts: dto.coverage_ts,
             summary: dto.summary,
             compress: dto.compress.map(|c| Compression {
                 checkpoint: c.checkpoint,
+                checkpoint_turn: c.checkpoint_turn,
                 prompt: c.prompt,
             }),
             increment: dto
@@ -463,6 +506,7 @@ impl MemorySurface for HttpSurface {
                     (
                         MessageKey {
                             channel_id: entry.key.channel_id,
+                            turn_id: entry.key.turn_id,
                             ts_ms: entry.key.ts_ms,
                             sub: entry.key.sub,
                         },
@@ -486,10 +530,28 @@ impl MemorySurface for HttpSurface {
         kind: u8,
         content: &str,
     ) -> anyhow::Result<MessageKey> {
+        // One call = one FINISHED turn (see the trait's note): open, write, close
+        // keeping the row. The live multi-round turn is the booth's own path.
+        let opened = self
+            .http
+            .post(format!("{base}/channels/{channel_id}/turns", base = self.base))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .context("mem-server turn-open request failed (transport)")?
+            .error_for_status()
+            .context("mem-server turn-open rejected (HTTP status)")?
+            .json::<serde_json::Value>()
+            .await
+            .context("mem-server turn-open answered the wrong shape")?;
+        let turn_id = opened["turn_id"]
+            .as_u64()
+            .context("mem-server turn-open answered no turn_id")?;
         let url = format!("{base}/channels/{channel_id}/messages", base = self.base);
         self.http
             .post(&url)
             .json(&AppendMessageDto {
+                turn_id,
                 ts_ms,
                 sub,
                 role,
@@ -501,8 +563,26 @@ impl MemorySurface for HttpSurface {
             .context("mem-server append request failed (transport)")?
             .error_for_status()
             .context("mem-server append rejected (HTTP status)")?;
+        self.http
+            .post(format!(
+                "{base}/channels/{channel_id}/turns/{turn_id}/close",
+                base = self.base
+            ))
+            .json(&serde_json::json!({
+                "ts_ms": ts_ms,
+                "sub": sub + 1,
+                "role": role,
+                "content": "",
+                "keep": [{ "ts_ms": ts_ms, "sub": sub }],
+            }))
+            .send()
+            .await
+            .context("mem-server turn-close request failed (transport)")?
+            .error_for_status()
+            .context("mem-server turn-close rejected (HTTP status)")?;
         Ok(MessageKey {
             channel_id,
+            turn_id,
             ts_ms,
             sub,
         })

@@ -14,6 +14,18 @@ use gravity_core::TurnInput;
 use mem_core::channel::{kind, role};
 use mem_core::FactTuple;
 
+/// A position in the log: k10r's `(turn, ts, sub)` pointer (ADR-0024). Each
+/// in-process `append_message` closes its own turn, so the rows these fixtures
+/// seed are turns 1, 2, 3… in write order.
+fn pointer(turn_id: u64, ts_ms: u64, sub: u16) -> mem_core::Pointer {
+    mem_core::Pointer {
+        turn_id,
+        ts_ms,
+        sub,
+    }
+}
+
+
 /// The turn body, parameterized over the reply — a test-local copy so
 /// the LLM call is stubbed while the memory-seam behavior (fetch →
 /// append on success only, one ts two subs) is the real code under
@@ -254,7 +266,7 @@ async fn checkpoint_flows_through_surface() {
     let mut stores = mem_core::open_service(dir.path()).unwrap();
     stores
         .channels
-        .append_checkpoint(3, (100, 0), "compressed", &[])
+        .append_checkpoint(3, pointer(1, 100, 0), "compressed", &[])
         .unwrap();
     let surface = InProcessSurface::wrap(stores);
     let view = surface
