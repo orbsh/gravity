@@ -14,15 +14,19 @@
 //! 3. `ctx.iterate_start(llm_provider, "", "stream", provider_args)`, and in this same
 //!    call the tool rounds and then the answer: each envelope item's `delta` leaves as a
 //!    frame on the venue wire.
-//! 4. On the provider's `done`: append the exchange — the question at sub 0, one row per
-//!    SUCCESSFUL tool call at subs 1..n, the answer last. One shared `ts_ms`, and the
-//!    tool rows are the turn's NET EFFECT (a correction loop's failures stay in the
-//!    working messages, where the model needed them, and never reach the store)
-//!    — ONLY after a successful stream (a failed turn appends nothing; the user re-sends
-//!    next turn). Gravity's clock IS the channel's time (krystallizer ADR-0008 §3).
+//! 4. The turn opens in the store BEFORE step 3 (`POST …/turns`), and every row is
+//!    written as the turn runs: the question first, one row per SUCCESSFUL tool call when
+//!    that round completes, the answer last. The tool rows are the turn's NET EFFECT (a
+//!    correction loop's failures stay in the working messages, where the model needed
+//!    them, and never reach the store). Each row carries its own clock — gravity's clock
+//!    IS the channel's time (krystallizer ADR-0008 §3) — and `sub` is the
+//!    same-millisecond tiebreak inside one turn.
+//! 5. On success the turn CLOSES with one `kind = FINAL` record naming the rows to keep;
+//!    k10r purges the rest (k10r ADR-0024).
 //!
 //! Failure is a value (ADR-0012): the handler's answer carries the error text, and a
-//! drawing caller is told on the same wire (`ui:turn.error`) — but nothing is appended.
+//! drawing caller is told on the same wire (`ui:turn.error`). A failed turn writes no
+//! closing record — its rows stay OPEN, working state the projection skips.
 //!
 //! Args (the envelope's `data`, or the flat call of a direct caller):
 //! `{"channel_id", "member_id", "user_message", "store_url", "endpoint", "model",
