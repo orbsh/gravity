@@ -220,6 +220,13 @@ fn read_recipe(ctx: &mut Ctx, id: u64) -> anyhow::Result<Recipe> {
 const UI_EVENT: &str = "ui:turn";
 /// A drawing turn's end, said as an event so the page can stop its streaming state
 /// without knowing a verb.
+/// The turn's own opening receipt: `{turn}` the moment the store minted it. It is
+/// what lets a client tag the sentence it just sent with the id every later frame
+/// will carry — without it the user's own message has no key into its answer, and
+/// two turns of one conversation cannot be untangled at the point they start (the
+/// reason the induction wire carries `call`, one layer down).
+const OPENED_EVENT: &str = "ui:turn.opened";
+
 const DONE_EVENT: &str = "ui:turn.done";
 /// A drawing turn's failure, said the same way.
 const ERROR_EVENT: &str = "ui:turn.error";
@@ -653,6 +660,15 @@ fn turn(
     // every channel and two of them in flight at one device would still collide.
     turn.id = format!("{channel_id}:{}", log.turn_id);
     *minted.borrow_mut() = Some(turn.id.clone());
+    // The receipt: the id exists now, and whoever sent the message needs it BEFORE
+    // the first delta to key that message to its answer.
+    emit(
+        ctx,
+        OPENED_EVENT,
+        device.as_deref(),
+        Some(&turn.id),
+        json!({ "turn": turn.id }),
+    )?;
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
     let mut call_rows: Vec<(u64, u16)> = Vec::new();
     let mut live = open_stream(&turn, &messages).context("turn: provider stream failed to open")?;

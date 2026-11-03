@@ -682,10 +682,19 @@ async fn failed_provider_appends_nothing() {
         failure.contains("provider stream failed to open"),
         "the failure names itself: {failure}"
     );
+    // A failed turn DRAWS nothing — but it speaks its receipt first, and that is the
+    // useful part: the client that sent the message learns which turn it was even
+    // though nothing came of it (ADR-0010). Everything after the receipt must be
+    // silent.
+    let spoken = seen.events();
+    assert_eq!(
+        spoken.first().and_then(|e| e.get("name")).and_then(Value::as_str),
+        Some("ui:turn.opened"),
+        "the receipt is the only thing said: {spoken:?}"
+    );
     assert!(
-        seen.events().is_empty(),
-        "a failed turn draws nothing: {:?}",
-        seen.events()
+        spoken.iter().all(|e| e["name"] == "ui:turn.opened"),
+        "a failed turn draws nothing: {spoken:?}"
     );
 
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
