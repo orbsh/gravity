@@ -46,6 +46,39 @@ Two consequences make the rule checkable:
 Every emitted frame that belongs to a turn carries `turn` = `<channel>:<turn>` — the log
 key's first two segments — on the envelope, beside `name` and `data`.
 
+## The pattern, drawn
+
+One exchange in a conversation view, in the order it happens. This is the shape a new
+interaction copies; it is not special-cased anywhere in the renderer.
+
+1. **The client sends an event** carrying what the person did — for a turn, the message
+   text — plus, if the caller wants a drawing, the slots it wants drawn into (`rack` = the
+   list, `text` = the region). The client draws nothing: it holds no business logic, so it
+   cannot know that a message is a row, that a row goes in a rack, or what a row looks
+   like. A button press or a form submit is the same case, and gets the same treatment:
+   only the application knows what it means.
+2. **The store writes the row that makes the act a fact** — and, being the write, that is
+   where the turn id is minted.
+3. **The application speaks, before doing any work**: the receipt (`{turn}`), then one
+   batch of operations that appends the person's row to the rack, sets up the region its
+   answer will stream into, and appends the bubble that reads that region. Everything in
+   flight is keyed by the same `turn`.
+4. **Only now does the work start.** Each answer chunk patches the region the open put
+   there; nothing re-draws the stage.
+5. **The end is said** (`done`, or `error` with the reason). A failure still leaves the
+   person's message on screen, which is the truth: they did send it.
+
+Container shape belongs to the application and lives in the frames, not in the renderer:
+the person's row and the answer's row are two rows in one rack, and the difference between
+them — end-aligned and accented versus stretched and plain — is a class list the frame
+carries. A renderer that has never heard of a conversation draws both correctly.
+
+What is NOT in any frame here: how long a row stays, whether it fades, whether the list
+pins to the newest row. Those are the renderer's vocabulary (fluxen ADR 0024: the server
+sends rows, the UI owns presentation), which is the same division of labour seen from the
+other side — the application does not describe effects, and the renderer does not invent
+rows.
+
 ## Consequences
 
 - A client that misses `opened` can still recover the id from the first chunk's `turn`; a
