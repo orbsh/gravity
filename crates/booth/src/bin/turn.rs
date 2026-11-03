@@ -980,6 +980,7 @@ fn frame_root(forms: Vec<Value>) -> Value {
                             },
                         ],
                     },
+                    frame_messages(),
                     {
                         "type": "case",
                         "attrs": {"class": ["main", "box", "border", "round", "scrolly", "gap"], "scroll": true},
@@ -989,6 +990,35 @@ fn frame_root(forms: Vec<Value>) -> Value {
                 ],
             }],
         },
+    })
+}
+
+/// THE CONVERSATION: a rack over `messages`, with the two bubbles declared ONCE as item
+/// templates. A row appended to `messages` carries a `selector` and the rack indexes these by
+/// it (fluxen rack.rs), so the application decides neither alignment nor accent — it sends rows
+/// and says what each one IS. `user` is the accented, end-aligned bubble; the second template
+/// carries no selector and is the fallback, which is what the reply and anything else lands on.
+fn frame_messages() -> Value {
+    json!({
+        "type": "rack",
+        "attrs": {
+            "class": ["main", "box", "border", "round", "gap"],
+            "view": {"layout": "adaptive", "scroll": "bar"},
+        },
+        "bind": {"value": {"kind": "source", "source": MESSAGES_SLOT}},
+        "item": [
+            {
+                "type": "case",
+                "attrs": {
+                    "selector": "user",
+                    "class": ["nogrow", "as-end", "accent", "box", "border", "round", "shadow"],
+                },
+            },
+            {
+                "type": "case",
+                "attrs": {"class": ["nogrow", "as-stretch", "box", "border", "round", "shadow"]},
+            },
+        ],
     })
 }
 

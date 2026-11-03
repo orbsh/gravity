@@ -1394,6 +1394,80 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
     );
 }
 
+/// The shell that answers `ui:connect` declares the CONVERSATION: one rack over `messages`
+/// whose item templates are the two bubbles, picked by the `selector` a row carries. Without
+/// this the turn's frames name a slot nobody's layout has — and a slot name the layout never
+/// wrote is an error, not a new slot (fluxen ADR 0024's rule, from the other side).
+#[tokio::test]
+async fn the_shell_declares_the_conversation() {
+    let endpoint = sse_server(vec!["hi"]).await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+    let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
+
+    Realm::emit(
+        &engine.realm,
+        None,
+        "ui:connect",
+        json!({
+            "name": "ui:connect",
+            "device": device,
+            "sender": { "device": device },
+            "data": { "device": device },
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut layout = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        layout = seen.all("ui:layout").into_iter().next();
+        if layout.is_some() {
+            break;
+        }
+    }
+    let root = layout.expect("the shell answered the connection");
+    let frames = root["data"].as_array().expect("the answer is an action list");
+
+    // Find the conversation rack anywhere in the tree: this test cares that it exists and is
+    // wired to the slot the turn writes, not where in the column it sits.
+    fn find(node: &Value) -> Option<&Value> {
+        if node["type"] == "rack"
+            && node["bind"]["value"]["source"] == "messages"
+        {
+            return Some(node);
+        }
+        for key in ["children", "item"] {
+            if let Some(list) = node[key].as_array() {
+                for child in list {
+                    if let Some(found) = find(child) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        if let Some(data) = node.get("data") {
+            return find(data);
+        }
+        None
+    }
+    let rack = frames
+        .iter()
+        .find_map(find)
+        .expect("the layout declares a rack over `messages`");
+
+    let items = rack["item"].as_array().expect("its item templates");
+    assert_eq!(
+        items[0]["attrs"]["selector"], "user",
+        "the person's bubble is picked by selector, so the application sends rows and no class list"
+    );
+    assert!(
+        items[1]["attrs"].get("selector").is_none(),
+        "the fallback template takes everything else — the reply, and whatever earns a bubble later: {items:?}"
+    );
+}
+
 /// A fresh deployment has no rows, and that is a NAMED error (ADR-0007 §5): the turn says which
 /// document and which keys are missing, instead of falling back to an environment variable.
 #[tokio::test]
