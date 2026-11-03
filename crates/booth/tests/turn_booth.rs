@@ -605,6 +605,12 @@ async fn a_turn_takes_the_next_round_while_it_is_still_running() {
         vec!["quick answer", "slow answer"],
         "each chunk came back under its own turn's id: {by_turn:?}"
     );
+    // And the id is the STORE's, spelled the way the store scopes it: `<channel>:<turn>`,
+    // the log key's first two segments — k10r mints a turn id PER channel, so a bare
+    // number would name another conversation's turn.
+    let mut ids: Vec<&str> = by_turn.keys().map(String::as_str).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["7:1", "8:1"], "one id per turn, named by its log key");
 }
 
 #[tokio::test]

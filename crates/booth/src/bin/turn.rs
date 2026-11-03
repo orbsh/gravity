@@ -412,22 +412,26 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // terminal value, which is what ADR-0009 states for the data protocol. The drawing caller is
     // always event-routed, and it needs the end regardless: its submit was an emit.
     let said = drawing || envelope.get("name").is_some();
-    let turn_id = turn_id_of(args);
-    match turn(ctx, args, device.as_deref(), &turn_id) {
+    // The store mints the turn id when the log opens; the branch hands it back here so
+    // the end frames carry the same one the chunks did.
+    let minted: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
+    match turn(ctx, args, device.as_deref(), &minted) {
         Ok(reply) => {
             if said {
-                emit(ctx, DONE_EVENT, device.as_deref(), Some(&turn_id), json!({}))?;
+                let id = minted.borrow().clone();
+                emit(ctx, DONE_EVENT, device.as_deref(), id.as_deref(), json!({}))?;
             }
             Ok(json!({ "done": true, "value": { "reply": reply } }))
         }
         Err(error) => {
             if said {
                 let detail = format!("{error:#}");
+                let id = minted.borrow().clone();
                 let _ = emit(
                     ctx,
                     ERROR_EVENT,
                     device.as_deref(),
-                    Some(&turn_id),
+                    id.as_deref(),
                     json!({ "detail": detail }),
                 );
             }
@@ -439,24 +443,15 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// The deployment facts one turn holds: what the tail doors and the append need. A LOCAL,
 /// not a static — the whole turn is one call stack, so nothing has to survive a call
 /// boundary (a resident guest no longer carries one turn's state into the next).
-/// THIS turn's identity on the wire. The caller may name one (`turn_id` in its payload); a
-/// caller that does not gets one minted here, which is enough for the only use the id has:
-/// telling one turn's chunks from a sibling's when both arrive at one device.
-fn turn_id_of(args: &Value) -> String {
-    if let Some(named) = args.get("turn_id").and_then(Value::as_str) {
-        return named.to_string();
-    }
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    format!(
-        "t{}",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
-}
-
 struct Turn<'a> {
     /// The caller's payload: what the PAGE knows (its conversation, the text, the mount table).
     args: &'a Value,
-    /// The id every chunk of this turn carries (see `turn_id_of`).
+    /// `<channel>:<turn_id>` — the id the STORE minted when this turn's log opened (k10r
+    /// owns the number: a caller-side one would collide across devices, retries and two
+    /// turns opened at once), prefixed by its channel because the store mints per
+    /// channel. Every chunk of this turn carries it, so a client can put two answers
+    /// arriving at one device back together and find the same pair in the log keys.
+    /// Empty until the log is open.
     id: String,
     /// Already trailing-slash-trimmed.
     store_url: String,
@@ -471,7 +466,12 @@ struct Turn<'a> {
     key_env: String,
 }
 
-fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>, turn_id: &str) -> anyhow::Result<String> {
+fn turn(
+    ctx: &mut Ctx,
+    args: &Value,
+    device: Option<&str>,
+    minted: &std::cell::RefCell<Option<String>>,
+) -> anyhow::Result<String> {
     // THE DEPLOYMENT FACTS ARE ROWS, NOT ARGUMENTS (ADR-0007): the store, the memory scope, the
     // representation and the model recipe live in this type's own namespace, so a gateway never
     // carries them and a caller cannot forget one.
@@ -491,9 +491,11 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>, turn_id: &str) -> any
         .and_then(Value::as_str)
         .context("turn: missing `user_message`")?
         .to_string();
-    let turn = Turn {
+    let mut turn = Turn {
         args,
-        id: turn_id.to_string(),
+        // Filled in below, the moment the store mints one: a turn that never opens its
+        // log (a refusal before the first row) has no id, and no chunk to mislabel.
+        id: String::new(),
         store_url: store_url.clone(),
         channel_id,
         member_id,
@@ -639,6 +641,11 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>, turn_id: &str) -> any
     // that dies, therefore leaves a working set a resumed turn can read back —
     // and a turn still running is OPEN, so no one else's projection sees it.
     let mut log = TurnLog::open(&turn.store_url, channel_id)?;
+    // The turn's identity on the wire is the log key's first two segments: an id is
+    // minted PER CHANNEL, so a bare number names a different conversation's turn in
+    // every channel and two of them in flight at one device would still collide.
+    turn.id = format!("{channel_id}:{}", log.turn_id);
+    *minted.borrow_mut() = Some(turn.id.clone());
     let question = log.row(Role::User, Kind::Text, &user_message)?;
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
     let mut call_rows: Vec<(u64, u16)> = Vec::new();
