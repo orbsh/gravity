@@ -282,8 +282,22 @@ fn out_of(args: &Value) -> anyhow::Result<Out<'_>> {
 /// it; `device` is the recipient (one device: an application that has groups would name
 /// more, but this one has no channel to be a member of); the payload hangs off `data`,
 /// which is the shape the venue reads as "a delivery, not a request".
-fn emit(ctx: &mut Ctx, event: &str, device: Option<&str>, data: Value) -> anyhow::Result<()> {
+fn emit(
+    ctx: &mut Ctx,
+    event: &str,
+    device: Option<&str>,
+    turn: Option<&str>,
+    data: Value,
+) -> anyhow::Result<()> {
     let mut envelope = json!({ "name": event });
+    if let Some(turn) = turn {
+        // WHICH turn this chunk belongs to. A device may have several in flight — the type
+        // declares `unbounded` (aura ADR-0046) — and every chunk of every turn arrives at the
+        // same recipient, so without this a second answer interleaves into the first and the
+        // client cannot untangle them. The induction wire learned the same lesson one layer
+        // down (`host.call`, induction ADR-0002).
+        envelope["turn"] = json!(turn);
+    }
     if let Some(device) = device {
         // NO `sender` on a booth's own speech: the venue excludes the sender from its
         // fan-out, so marking the asking device as the sender would send the answer to
@@ -398,17 +412,24 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // terminal value, which is what ADR-0009 states for the data protocol. The drawing caller is
     // always event-routed, and it needs the end regardless: its submit was an emit.
     let said = drawing || envelope.get("name").is_some();
-    match turn(ctx, args, device.as_deref()) {
+    let turn_id = turn_id_of(args);
+    match turn(ctx, args, device.as_deref(), &turn_id) {
         Ok(reply) => {
             if said {
-                emit(ctx, DONE_EVENT, device.as_deref(), json!({}))?;
+                emit(ctx, DONE_EVENT, device.as_deref(), Some(&turn_id), json!({}))?;
             }
             Ok(json!({ "done": true, "value": { "reply": reply } }))
         }
         Err(error) => {
             if said {
                 let detail = format!("{error:#}");
-                let _ = emit(ctx, ERROR_EVENT, device.as_deref(), json!({ "detail": detail }));
+                let _ = emit(
+                    ctx,
+                    ERROR_EVENT,
+                    device.as_deref(),
+                    Some(&turn_id),
+                    json!({ "detail": detail }),
+                );
             }
             Err(error)
         }
@@ -418,9 +439,25 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// The deployment facts one turn holds: what the tail doors and the append need. A LOCAL,
 /// not a static — the whole turn is one call stack, so nothing has to survive a call
 /// boundary (a resident guest no longer carries one turn's state into the next).
+/// THIS turn's identity on the wire. The caller may name one (`turn_id` in its payload); a
+/// caller that does not gets one minted here, which is enough for the only use the id has:
+/// telling one turn's chunks from a sibling's when both arrive at one device.
+fn turn_id_of(args: &Value) -> String {
+    if let Some(named) = args.get("turn_id").and_then(Value::as_str) {
+        return named.to_string();
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!(
+        "t{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 struct Turn<'a> {
     /// The caller's payload: what the PAGE knows (its conversation, the text, the mount table).
     args: &'a Value,
+    /// The id every chunk of this turn carries (see `turn_id_of`).
+    id: String,
     /// Already trailing-slash-trimmed.
     store_url: String,
     channel_id: u64,
@@ -434,7 +471,7 @@ struct Turn<'a> {
     key_env: String,
 }
 
-fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<String> {
+fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>, turn_id: &str) -> anyhow::Result<String> {
     // THE DEPLOYMENT FACTS ARE ROWS, NOT ARGUMENTS (ADR-0007): the store, the memory scope, the
     // representation and the model recipe live in this type's own namespace, so a gateway never
     // carries them and a caller cannot forget one.
@@ -456,6 +493,7 @@ fn turn(ctx: &mut Ctx, args: &Value, device: Option<&str>) -> anyhow::Result<Str
         .to_string();
     let turn = Turn {
         args,
+        id: turn_id.to_string(),
         store_url: store_url.clone(),
         channel_id,
         member_id,
@@ -790,9 +828,17 @@ fn stream_answer(
                 let ask = first
                     .then(|| turn.args.get("user_message").and_then(Value::as_str))
                     .flatten();
-                emit(ctx, UI_EVENT, device, json!(frames_for(view, ask, &delta)))?;
+                emit(
+                    ctx,
+                    UI_EVENT,
+                    device,
+                    Some(&turn.id),
+                    json!(frames_for(view, ask, &delta)),
+                )?;
             }
-            Out::Data(event) => emit(ctx, event, device, json!({ "delta": delta }))?,
+            Out::Data(event) => {
+                emit(ctx, event, device, Some(&turn.id), json!({ "delta": delta }))?
+            }
         }
         first = false;
         reply.push_str(&delta);
@@ -875,7 +921,7 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // THE ANSWER IS THE ACTION LIST ITSELF, never a `{frames: [...]}` wrapper: prism forwards an
     // array as the renderer's message and would INJECT anything else into a slot named by the
     // event — a page that gets a map draws nothing and reports nothing (ADR-0017 §8).
-    emit(ctx, LAYOUT_EVENT, device.as_deref(), json!([frame_root(Vec::new())]))?;
+    emit(ctx, LAYOUT_EVENT, device.as_deref(), None, json!([frame_root(Vec::new())]))?;
     Ok(json!({ "done": true }))
 }
 
@@ -982,7 +1028,7 @@ fn screen(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // leaves one screen. The caller names no slot: a click cannot carry one, and this booth owns
     // what a screen looks like anyway.
     let forms = frames_model(ctx)?;
-    emit(ctx, SCREEN_EVENT, device.as_deref(), json!([frame_root(forms)]))?;
+    emit(ctx, SCREEN_EVENT, device.as_deref(), None, json!([frame_root(forms)]))?;
     Ok(json!({ "done": true }))
 }
 
@@ -1114,7 +1160,7 @@ fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let args = payload(envelope);
     match write_row(ctx, args) {
         Ok(saved) => {
-            emit(ctx, SAVED_EVENT, device.as_deref(), saved)?;
+            emit(ctx, SAVED_EVENT, device.as_deref(), None, saved)?;
             Ok(json!({ "done": true }))
         }
         Err(error) => {
@@ -1123,6 +1169,7 @@ fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
                 ctx,
                 SAVE_REFUSED_EVENT,
                 device.as_deref(),
+                None,
                 json!({ "detail": detail }),
             );
             // THE PERSON SEES IT TOO. The fact above is for programs; a page that only got that sees
@@ -1131,7 +1178,7 @@ fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
             // decides how long it stays on screen.
             let mut rows = Vec::new();
             let _ = say_notice(&mut rows, &detail)
-                .and_then(|()| emit(ctx, NOTICE_EVENT, device.as_deref(), json!(rows)));
+                .and_then(|()| emit(ctx, NOTICE_EVENT, device.as_deref(), None, json!(rows)));
             Err(error)
         }
     }

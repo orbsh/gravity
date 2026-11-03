@@ -547,8 +547,9 @@ async fn start_turn_on(engine: &Engine, key: &str, args: Value) -> Result<(), St
 async fn a_turn_takes_the_next_round_while_it_is_still_running() {
     // One turn instance (one device) and two rounds, both slow on the wire: 1.5 s and
     // 0.8 s before a byte. Queued, the pair takes 2.3 s; overlapped, 1.5 s — the
-    // timing is what tells a booth that declared its slots from one that queued.
-    // The turn declares eight (ADR-0046), so both rounds are served at once.
+    // timing is what tells a booth whose type serves every call at once from one that
+    // queues. The type declares `unbounded` (ADR-0046), so both rounds run in the one
+    // resident process.
     let endpoint = sse_server_delayed(vec![
         ("slow", vec!["slow ", "answer"], 1_500),
         ("quick", vec!["quick ", "answer"], 800),
@@ -582,6 +583,27 @@ async fn a_turn_takes_the_next_round_while_it_is_still_running() {
     assert!(
         elapsed < std::time::Duration::from_millis(1_900),
         "the rounds overlap (took {elapsed:?}); a queued handler would take 2.3 s"
+    );
+
+    // AND THE CHUNKS STAY APART. Two answers arrive at one device, so every chunk names
+    // the turn it belongs to; taken from the wire they group back into two replies.
+    // Without it a second answer interleaves into the first and neither can be read —
+    // the same reason the induction wire carries `call`.
+    let mut by_turn: std::collections::BTreeMap<String, String> = Default::default();
+    for event in seen.events() {
+        let Some(turn) = event.get("turn").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(chunk) = event.get("data").and_then(|d| d.get("delta")).and_then(Value::as_str) {
+            by_turn.entry(turn.to_string()).or_default().push_str(chunk);
+        }
+    }
+    let mut answers: Vec<&str> = by_turn.values().map(String::as_str).collect();
+    answers.sort_unstable();
+    assert_eq!(
+        answers,
+        vec!["quick answer", "slow answer"],
+        "each chunk came back under its own turn's id: {by_turn:?}"
     );
 }
 
