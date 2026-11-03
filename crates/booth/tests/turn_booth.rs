@@ -1348,12 +1348,16 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
         .into_iter()
         .filter_map(|e| e.get("data").and_then(Value::as_array).cloned())
         .collect();
-    assert_eq!(batches.len(), 2, "one batch per chunk: {batches:?}");
+    assert_eq!(
+        batches.len(),
+        3,
+        "the stage on the OPEN, then one batch per chunk (ADR-0010: the person's message is          drawn when they send it, not when the first token arrives): {batches:?}"
+    );
     let first = &batches[0];
     assert_eq!(
         first.len(),
-        4,
-        "the stage is set in one ordered batch: {first:?}"
+        3,
+        "the stage is set in one ordered batch, without a chunk: {first:?}"
     );
     assert_eq!(
         first[0]["slot"], "chat",
@@ -1372,9 +1376,10 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
         first[2]["data"]["children"][0]["bind"]["value"]["source"],
         "say"
     );
-    assert_eq!(first[3]["action"], "patch");
-    assert_eq!(first[3]["value"], "hel");
-    assert_eq!(batches[1][0]["value"], "lo");
+    // Then the chunks, one batch each, patching the region the open created.
+    assert_eq!(batches[1][0]["action"], "patch");
+    assert_eq!(batches[1][0]["value"], "hel");
+    assert_eq!(batches[2][0]["value"], "lo");
 
     // And the exchange landed: the stream was live enough to be a turn.
     let surface = gravity_core::surface::HttpSurface::new(&store_url);

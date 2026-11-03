@@ -371,18 +371,26 @@ fn frame_chunk(text: &str, chunk: &str) -> Value {
     })
 }
 
-/// The frames one chunk draws. The FIRST chunk also sets the stage (the question, the
-/// region, the bubble that reads it) — one batch, in order, because the patch that fills
-/// the region must find it.
-fn frames_for(view: &View, first: Option<&str>, chunk: &str) -> Vec<Value> {
-    let mut frames: Vec<Value> = Vec::new();
-    if let Some(ask) = first {
-        frames.push(frame_ask_bubble(&view.rack, ask));
-        frames.push(frame_text_region(&view.text));
-        frames.push(frame_answer_bubble(&view.rack, &view.text));
+/// The frames the turn draws the moment it OPENS: the question, the region, the bubble
+/// that reads it — one batch, in order, because the patch that fills the region must find
+/// it. They leave with the receipt, not with the first token: the UI holds no logic of its
+/// own and draws only what it is told (ADR-0010), so "the person's message appears when
+/// they send it" is a frame the APPLICATION owes, not something a client can infer — and
+/// waiting for the first token made a send look like nothing had happened.
+fn frames_open(view: &View, ask: Option<&str>) -> Vec<Value> {
+    match ask {
+        Some(ask) => vec![
+            frame_ask_bubble(&view.rack, ask),
+            frame_text_region(&view.text),
+            frame_answer_bubble(&view.rack, &view.text),
+        ],
+        None => Vec::new(),
     }
-    frames.push(frame_chunk(&view.text, chunk));
-    frames
+}
+
+/// The frames one chunk draws: the chunk itself, into the region the open put there.
+fn frames_for(view: &View, chunk: &str) -> Vec<Value> {
+    vec![frame_chunk(&view.text, chunk)]
 }
 
 /// The caller's payload, whichever way this booth was reached. A venue puts the caller's
@@ -669,6 +677,20 @@ fn turn(
         Some(&turn.id),
         json!({ "turn": turn.id }),
     )?;
+    // And the stage: the person's message, the region its answer will fill, and the
+    // bubble that reads it. The question is in `args` from the start, so a renderer that
+    // knows nothing but operations can draw the send immediately.
+    if let Out::View(view) = &out {
+        let ask = turn
+            .args
+            .get("user_message")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let frames = frames_open(view, ask.as_deref());
+        if !frames.is_empty() {
+            emit(ctx, UI_EVENT, device.as_deref(), Some(&turn.id), json!(frames))?;
+        }
+    }
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
     let mut call_rows: Vec<(u64, u16)> = Vec::new();
     let mut live = open_stream(&turn, &messages).context("turn: provider stream failed to open")?;
@@ -850,26 +872,21 @@ fn stream_answer(
     tails: &mut Vec<Tail>,
 ) -> anyhow::Result<String> {
     let mut reply = String::new();
-    let mut first = true;
     loop {
         match out {
             Out::View(view) => {
-                let ask = first
-                    .then(|| turn.args.get("user_message").and_then(Value::as_str))
-                    .flatten();
                 emit(
                     ctx,
                     UI_EVENT,
                     device,
                     Some(&turn.id),
-                    json!(frames_for(view, ask, &delta)),
+                    json!(frames_for(view, &delta)),
                 )?;
             }
             Out::Data(event) => {
                 emit(ctx, event, device, Some(&turn.id), json!({ "delta": delta }))?
             }
         }
-        first = false;
         reply.push_str(&delta);
 
         // The side branch advances one pull per round, on the same face: the summary is
