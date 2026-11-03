@@ -192,7 +192,12 @@ async fn boot_bare() -> (Engine, Seen) {
         .expect("engine boot");
     engine
         .register(
+            // Production's codec, exactly as `register` declares it (CBOR: one
+            // self-delimited document per frame). The concurrent reader routes both
+            // codecs, and a fixture that spoke JSON would leave the branch the stack
+            // actually runs untested.
             BoothType::script(TURN_TYPE, "induction", turn_bin())
+                .encoded(aura_booth::Encoding::Cbor)
                 // The production declaration (ADR-0046): one process, every round at
                 // once — a device's next message is served while one is running.
                 .unbounded()
