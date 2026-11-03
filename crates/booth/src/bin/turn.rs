@@ -14,7 +14,7 @@
 //! 3. `gravity_core::llm::live::Live::open` — this process, this thread — and then the
 //!    tool rounds and the answer: each envelope item's `delta` leaves as a frame on the
 //!    venue wire. A compression or review branch is another `Live` on its own thread.
-//! 4. The turn opens in the store BEFORE step 3 (`POST …/turns`), and every row is
+//! 4. The turn opens WITH its first row (`POST …/messages`, no `turn_id`): the store
 //!    written as the turn runs: the question first, one row per SUCCESSFUL tool call when
 //!    that round completes, the answer last. The tool rows are the turn's NET EFFECT (a
 //!    correction loop's failures stay in the working messages, where the model needed
@@ -640,13 +640,19 @@ fn turn(
     // question lands as its first row. A turn that is suspended on a cold call, or
     // that dies, therefore leaves a working set a resumed turn can read back —
     // and a turn still running is OPEN, so no one else's projection sees it.
-    let mut log = TurnLog::open(&turn.store_url, channel_id)?;
+    // The question OPENS the turn: one write, and the store's answer names the id.
+    let (mut log, question) = TurnLog::open(
+        &turn.store_url,
+        channel_id,
+        &user_message,
+        Role::User,
+        Kind::Text,
+    )?;
     // The turn's identity on the wire is the log key's first two segments: an id is
     // minted PER CHANNEL, so a bare number names a different conversation's turn in
     // every channel and two of them in flight at one device would still collide.
     turn.id = format!("{channel_id}:{}", log.turn_id);
     *minted.borrow_mut() = Some(turn.id.clone());
-    let question = log.row(Role::User, Kind::Text, &user_message)?;
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
     let mut call_rows: Vec<(u64, u16)> = Vec::new();
     let mut live = open_stream(&turn, &messages).context("turn: provider stream failed to open")?;
@@ -1790,7 +1796,8 @@ fn compact_finished_rounds(messages: &mut Vec<Value>) {
 }
 /// The turn's rows in k10r (ADR-0024), written AS THE TURN RUNS.
 ///
-/// The store mints the id (`POST /channels/{c}/turns`); every round appends its
+/// The store mints the id at the first row (`POST /channels/{c}/messages`, no `turn_id`);
+/// every round appends its
 /// rows under it; the turn closes with ONE `kind = FINAL` record that names the
 /// records to keep, and k10r collapses the rest. A turn that never closes keeps
 /// its rows as OPEN — working state the projection skips — which is exactly what
@@ -1806,13 +1813,37 @@ struct TurnLog<'a> {
 }
 
 impl<'a> TurnLog<'a> {
-    /// Open the turn and take the id the store minted: a caller-side counter
-    /// would collide across devices, retries and two turns opened at once.
-    fn open(store_url: &'a str, channel: u64) -> anyhow::Result<Self> {
-        let url = format!("{store_url}/channels/{channel}/turns");
+    /// Open the turn by writing its FIRST row — the user's message — and take the id
+    /// the store minted for it (k10r ADR-0024 §2). There is no separate open call: a
+    /// turn exists because a user said something, and the store reads its id off the
+    /// log inside the same append that puts that sentence there, so two turns starting
+    /// in one channel cannot be handed one id. A retry that never lands a row costs
+    /// nothing but a gap.
+    fn open(
+        store_url: &'a str,
+        channel: u64,
+        content: &str,
+        role: Role,
+        kind: Kind,
+    ) -> anyhow::Result<(Self, (u64, u16))> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .context("turn: clock before epoch")?;
+        let url = format!("{store_url}/channels/{channel}/messages");
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
-            .send_string("{}")
+            .send_string(
+                // NO `turn_id`: the omission is what asks the store to mint one.
+                &json!({
+                    "ts_ms": ts,
+                    "sub": 0,
+                    "role": role.code(),
+                    "kind": kind.code(),
+                    "content": content,
+                })
+                .to_string(),
+            )
             .context("turn: opening the turn failed")?;
         anyhow::ensure!(
             (200..300).contains(&resp.status()),
@@ -1820,17 +1851,20 @@ impl<'a> TurnLog<'a> {
             resp.status()
         );
         let body: Value =
-            serde_json::from_reader(resp.into_reader()).context("turn: bad turn-open answer")?;
+            serde_json::from_reader(resp.into_reader()).context("turn: bad append answer")?;
         let turn_id = body
             .get("turn_id")
             .and_then(Value::as_u64)
-            .context("turn: the turn door answered no turn_id")?;
-        Ok(Self {
-            store_url,
-            channel,
-            turn_id,
-            rows: Vec::new(),
-        })
+            .context("turn: the append answer named no turn_id")?;
+        Ok((
+            Self {
+                store_url,
+                channel,
+                turn_id,
+                rows: vec![(ts, 0)],
+            },
+            (ts, 0),
+        ))
     }
 
     /// Write one row, with gravity's clock as its key (k10r ADR-0008 §3) and

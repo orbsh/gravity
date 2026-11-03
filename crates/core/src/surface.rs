@@ -359,10 +359,12 @@ impl MemorySurface for InProcessSurface {
         content: &str,
     ) -> anyhow::Result<MessageKey> {
         let mut store = self.channels.lock().await;
-        let turn = store.open_turn(channel_id).map_err(anyhow::Error::msg)?;
+        // One row, one turn: the append OPENS it and the store mints the id (k10r
+        // ADR-0024 §2) — there is no separate open for a turn that writes one row.
         let key = store
-            .append(channel_id, turn, ts_ms, sub, role, kind, content)
+            .append_opening(channel_id, ts_ms, sub, role, kind, content)
             .map_err(anyhow::Error::msg)?;
+        let turn = key.turn_id;
         // A row written here is a finished exchange, so the turn closes at once
         // and keeps exactly that row. The closing record must sort after it.
         store
@@ -530,39 +532,32 @@ impl MemorySurface for HttpSurface {
         kind: u8,
         content: &str,
     ) -> anyhow::Result<MessageKey> {
-        // One call = one FINISHED turn (see the trait's note): open, write, close
-        // keeping the row. The live multi-round turn is the booth's own path.
-        let opened = self
-            .http
-            .post(format!("{base}/channels/{channel_id}/turns", base = self.base))
-            .json(&serde_json::json!({}))
-            .send()
-            .await
-            .context("mem-server turn-open request failed (transport)")?
-            .error_for_status()
-            .context("mem-server turn-open rejected (HTTP status)")?
-            .json::<serde_json::Value>()
-            .await
-            .context("mem-server turn-open answered the wrong shape")?;
-        let turn_id = opened["turn_id"]
-            .as_u64()
-            .context("mem-server turn-open answered no turn_id")?;
+        // One call = one FINISHED turn (see the trait's note): write the row that
+        // OPENS it (the store mints the id there, k10r ADR-0024 §2), close keeping
+        // that row. The live multi-round turn is the booth's own path.
         let url = format!("{base}/channels/{channel_id}/messages", base = self.base);
-        self.http
+        let key = self
+            .http
             .post(&url)
-            .json(&AppendMessageDto {
-                turn_id,
-                ts_ms,
-                sub,
-                role,
-                kind,
-                content: content.to_string(),
-            })
+            .json(&serde_json::json!({
+                // No `turn_id`: the omission asks the store to mint one.
+                "ts_ms": ts_ms,
+                "sub": sub,
+                "role": role,
+                "kind": kind,
+                "content": content,
+            }))
             .send()
             .await
             .context("mem-server append request failed (transport)")?
             .error_for_status()
-            .context("mem-server append rejected (HTTP status)")?;
+            .context("mem-server append rejected (HTTP status)")?
+            .json::<serde_json::Value>()
+            .await
+            .context("mem-server append answered the wrong shape")?;
+        let turn_id = key["turn_id"]
+            .as_u64()
+            .context("mem-server append answered no turn_id")?;
         self.http
             .post(format!(
                 "{base}/channels/{channel_id}/turns/{turn_id}/close",

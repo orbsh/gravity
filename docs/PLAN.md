@@ -18,7 +18,7 @@ Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and
   stay in RESIDENT memory for the loop and are never persisted; the store gets the net
   effect, in the channel log that already exists (no new table, no new ns). The rows are
   written AS THE TURN RUNS, under a turn id the STORE mints at the turn's open
-  (`POST /channels/{c}/turns`): the question lands before the first inference, one row per
+  (`POST /channels/{c}/messages` with no `turn_id` — the question's own row opens the turn and the store mints its id): the question lands before the first inference, one row per
   SUCCESSFUL tool call lands when that round completes, the answer lands last, and the turn
   closes with ONE `kind = FINAL` record naming the records to keep — the question, the
   successful calls, the answer — whereupon k10r purges the rest of the turn (k10r
