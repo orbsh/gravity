@@ -1512,6 +1512,12 @@ async fn the_shell_declares_the_conversation() {
     let home = page("home");
     let areas: Vec<Value> = home["data"]["children"].as_array().unwrap().clone();
     assert_eq!(areas.len(), 2, "the home page is two areas: scene and conversation");
+    // The widths are the bundle's CSS and the classes are the ones those rules name: the graph
+    // absorbs the compression, the stream keeps its 620px basis (examples/yaml/00.main.yaml).
+    assert_eq!(home["data"]["attrs"]["class"][1], "stage-split");
+    assert_eq!(home["data"]["attrs"]["horizontal"], true);
+    assert_eq!(areas[0]["attrs"]["class"][0], "stage-graph");
+    assert_eq!(areas[1]["attrs"]["class"][0], "stage-stream", "{:?}", areas[1]);
     let left: Vec<Value> = areas[0]["children"].as_array().unwrap().clone();
     assert_eq!(left[0]["type"], "forcegraph", "the scene is the field: {:?}", left[0]);
     assert_eq!(
@@ -1522,7 +1528,11 @@ async fn the_shell_declares_the_conversation() {
         left[1]["bind"]["value"]["source"], "menu",
         "under it a menu, in a rack — where a channel list would sit in a conventional application"
     );
-    assert_eq!(areas[1]["bind"]["value"]["source"], "messages", "the right area is the conversation");
+    assert_eq!(
+        areas[1]["children"][0]["bind"]["value"]["source"], "messages",
+        "the right area is the conversation: {:?}",
+        areas[1]
+    );
     assert_eq!(
         page("manage")["data"]["id"], "manage",
         "management is its own page, not a panel over the conversation"

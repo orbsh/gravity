@@ -1001,8 +1001,13 @@ fn frame_root(forms: Vec<Value>) -> Vec<Value> {
             "data": {
                 "id": "home",
                 "type": "case",
-                "attrs": {"class": ["main", "row", "gap", "shrink"]},
-                "children": [frame_scene(), frame_messages()],
+                // THE SPLIT THE EXAMPLE USES (examples/yaml/00.main.yaml): a horizontal case with
+                // `stage-split`, a `stage-graph` column on the left and a `stage-stream` column on
+                // the right. The widths are the bundle's own CSS — graph `1 1 40%`, stream
+                // `1 0 620px`, and under 1000px the graph pins to 240px — which is what makes the
+                // GRAPH absorb the compression while the stream keeps its width.
+                "attrs": {"class": ["maximize", "stage-split", "shrink"], "horizontal": true},
+                "children": [frame_scene(), frame_stream()],
             },
         }),
         json!({
@@ -1088,13 +1093,13 @@ fn frame_pager() -> Value {
 fn frame_scene() -> Value {
     json!({
         "type": "case",
-        "attrs": {"class": ["main", "col", "gap", "shrink"]},
+        "attrs": {"class": ["stage-graph", "col", "gap"], "horizontal": false},
         "children": [
             {
                 "type": "forcegraph",
-                // A CONCRETE height: `100%` inside a flex column resolves against a parent with no
-                // height of its own and comes out zero — the canvas was 1x1 and the host invisible.
-                "attrs": {"class": ["main"], "width": "100%", "height": "60vh"},
+                // `100%` of a box that has a height: the graph's own case grows (class `main`), so
+                // the percentage resolves against a real size — the example's shape, verbatim.
+                "attrs": {"class": ["main"], "width": "100%", "height": "100%"},
                 "style": {
                     "node_size_ratio": 2,
                     "link_width_px": 2.5,
@@ -1138,6 +1143,14 @@ fn frame_menu() -> Value {
 /// it (fluxen rack.rs), so the application decides neither alignment nor accent — it sends rows
 /// and says what each one IS. `user` is the accented, end-aligned bubble; the second template
 /// carries no selector and is the fallback, which is what the reply and anything else lands on.
+fn frame_stream() -> Value {
+    json!({
+        "type": "case",
+        "attrs": {"class": ["stage-stream", "main", "shrink", "col"]},
+        "children": [frame_messages()],
+    })
+}
+
 fn frame_messages() -> Value {
     json!({
         "type": "rack",
