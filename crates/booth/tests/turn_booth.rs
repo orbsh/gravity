@@ -1486,10 +1486,15 @@ async fn the_shell_declares_the_conversation() {
     let content = &column["children"][1];
     let areas: Vec<&Value> = content["children"].as_array().map(|c| c.iter().collect()).unwrap_or_default();
     assert_eq!(areas.len(), 2, "two areas side by side: scene and conversation");
-    assert!(
-        areas[0]["children"][0]["bind"]["value"]["source"] == "scene",
-        "the left area is a slot the deployment fills, not a widget the shell picked: {:?}",
-        areas[0]
+    let left = areas[0]["children"].as_array().expect("the left column's items");
+    assert_eq!(left[0]["type"], "forcegraph", "the scene is the field: {:?}", left[0]);
+    assert_eq!(
+        left[0]["bind"]["value"]["source"], "scene",
+        "and what it draws is data the deployment pushes, not a picture baked into the layout"
+    );
+    assert_eq!(
+        left[1]["bind"]["value"]["source"], "menu",
+        "under it a menu, in a rack — where a channel list would sit in a conventional application"
     );
     assert_eq!(
         areas[1]["bind"]["value"]["source"], "messages",

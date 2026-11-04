@@ -1005,15 +1005,53 @@ fn frame_navbar() -> Value {
     })
 }
 
-/// The left area: a SLOT the application fills (`scene`), not a component chosen here. A graphic,
-/// a graph, a picture — that is the deployment's business, and it can start empty.
+/// THE LEFT AREA: the scene is a forcegraph, and what it draws is data the deployment pushes
+/// into `scene` as `{nodes, links, focus?}` (fluxen ADR 0018 — a native node, not a canvas
+/// module: the layout lives in wasm, no URL, no options bag). Below it a menu, in a rack, so
+/// the same column that shows the field of things also lists the ways into them — the shape a
+/// channel list would take in a conventional application.
 fn frame_scene() -> Value {
     json!({
         "type": "case",
-        "attrs": {"class": ["main", "box", "border", "round", "gap"]},
-        "children": [{
-            "type": "text",
-            "bind": {"value": {"kind": "source", "source": SCENE_SLOT}},
+        "attrs": {"class": ["main", "col", "gap", "shrink"]},
+        "children": [
+            {
+                "type": "forcegraph",
+                "attrs": {"class": ["main"], "width": "100%", "height": "100%"},
+                "style": {
+                    "node_size_ratio": 2,
+                    "link_width_px": 2.5,
+                    "link_opacity": 0.85,
+                    "highlight_reach": true,
+                    "reach_hops": 1,
+                    "fit_padding_px": 56,
+                    "link_shape": "straight",
+                },
+                "bind": {"value": {"kind": "source", "source": SCENE_SLOT}},
+            },
+            frame_menu(),
+        ],
+    })
+}
+
+/// The menu under the scene: a rack over `menu`, rows appended by the deployment. Its row
+/// template is a line of text for now — what a row DOES when clicked is a decision the
+/// deployment owns (an event name, a channel to open), and the shell will not invent one.
+fn frame_menu() -> Value {
+    json!({
+        "type": "rack",
+        "attrs": {
+            "class": ["nogrow", "box", "border", "round", "gap"],
+            "view": {"layout": "adaptive", "scroll": "bar"},
+        },
+        "bind": {"value": {"kind": "source", "source": MENU_SLOT}},
+        "item": [{
+            "type": "case",
+            "attrs": {"class": ["nogrow", "horizontal", "center", "gap"]},
+            "children": [{
+                "type": "text",
+                "bind": {"value": {"kind": "default", "default": ""}},
+            }],
         }],
     })
 }
@@ -1022,7 +1060,12 @@ fn frame_scene() -> Value {
 fn frame_management(forms: Vec<Value>) -> Value {
     json!({
         "type": "float",
-        "attrs": {"class": ["--manage", "box", "border", "round", "gap", "scrolly"], "top": "0", "right": "0"},
+        "attrs": {
+            "class": ["--manage", "box", "border", "round", "gap", "scrolly"],
+            "top": "0",
+            "right": "0",
+            "bottom": "0",
+        },
         "children": forms,
     })
 }
@@ -1065,6 +1108,9 @@ const NOTICE_SLOT: &str = "notice";
 /// THE SLOT THE DEPLOYMENT DRAWS ITS SCENE IN: whatever the left area shows is content the
 /// deployment pushes, not a widget the shell decides on.
 const SCENE_SLOT: &str = "scene";
+
+/// The menu under the scene: the deployment appends rows, in its own vocabulary.
+const MENU_SLOT: &str = "menu";
 
 fn frame_notice() -> Value {
     json!({
