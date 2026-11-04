@@ -1092,7 +1092,9 @@ fn frame_scene() -> Value {
         "children": [
             {
                 "type": "forcegraph",
-                "attrs": {"class": ["main"], "width": "100%", "height": "100%"},
+                // A CONCRETE height: `100%` inside a flex column resolves against a parent with no
+                // height of its own and comes out zero — the canvas was 1x1 and the host invisible.
+                "attrs": {"class": ["main"], "width": "100%", "height": "60vh"},
                 "style": {
                     "node_size_ratio": 2,
                     "link_width_px": 2.5,
