@@ -1467,26 +1467,41 @@ async fn the_shell_declares_the_conversation() {
         "the fallback template takes everything else — the reply, and whatever earns a bubble later: {items:?}"
     );
 
-    // The OUTER FRAME: a navigation bar, then the content — scene on the left, conversation on
-    // the right. Management is a panel over this, so the conversation is never unmounted.
-    let column = &frames[0]["data"];
+    // The OUTER FRAME: a bar over a PAGER. The pages are dictionary rows, so the assertion
+    // walks the whole answer rather than one node.
+    let all = frames;
+    let root = all
+        .iter()
+        .find(|f| f["action"] == "create" && f["slot"] == "")
+        .expect("the frame itself");
+    let column = &root["data"];
     assert_eq!(
         column["attrs"]["class"][1], "col",
-        "the page is a column: bar above, content below"
+        "the page is a column: bar above, pager below"
     );
     let bar = &column["children"][0];
     assert_eq!(bar["attrs"]["class"][0], "--head", "the navigation bar comes first");
-    let bar_children = bar["children"].as_array().expect("the bar's items");
-    assert!(
-        bar_children
-            .iter()
-            .any(|c| c["bind"]["value"]["dest"] == "gravity-model"),
-        "the bar holds the control that opens management: {bar:?}"
+    assert_eq!(
+        bar["children"][1]["type"], "select",
+        "the bar switches pages from the tab rows: {bar:?}"
     );
-    let content = &column["children"][1];
-    let areas: Vec<&Value> = content["children"].as_array().map(|c| c.iter().collect()).unwrap_or_default();
-    assert_eq!(areas.len(), 2, "two areas side by side: scene and conversation");
-    let left = areas[0]["children"].as_array().expect("the left column's items");
+    let pager = &column["children"][1];
+    assert_eq!(pager["type"], "pages");
+    assert_eq!(
+        pager["display"], "dom",
+        "both pages stay mounted: a turn streams into `messages` while a form is being filled"
+    );
+
+    let page = |id: &str| -> Value {
+        all.iter()
+            .find(|f| f["slot"] == "pages" && f["data"]["id"] == id)
+            .unwrap_or_else(|| panic!("the `{id}` page is in the answer: {all:?}"))
+            .clone()
+    };
+    let home = page("home");
+    let areas: Vec<Value> = home["data"]["children"].as_array().unwrap().clone();
+    assert_eq!(areas.len(), 2, "the home page is two areas: scene and conversation");
+    let left: Vec<Value> = areas[0]["children"].as_array().unwrap().clone();
     assert_eq!(left[0]["type"], "forcegraph", "the scene is the field: {:?}", left[0]);
     assert_eq!(
         left[0]["bind"]["value"]["source"], "scene",
@@ -1496,9 +1511,10 @@ async fn the_shell_declares_the_conversation() {
         left[1]["bind"]["value"]["source"], "menu",
         "under it a menu, in a rack — where a channel list would sit in a conventional application"
     );
+    assert_eq!(areas[1]["bind"]["value"]["source"], "messages", "the right area is the conversation");
     assert_eq!(
-        areas[1]["bind"]["value"]["source"], "messages",
-        "the right area is the conversation"
+        page("manage")["data"]["id"], "manage",
+        "management is its own page, not a panel over the conversation"
     );
 }
 
@@ -1917,14 +1933,19 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
     let frames = screen_frames(&seen);
     assert_eq!(
         frames.len(),
-        1,
-        "the screen is ONE tree, not a row per table: a second set of rows would stack up on the \
-         next ask: {frames:?}"
+        5,
+        "one tree, two pages keyed by id and two bar items — nothing per table: {frames:?}"
     );
     assert_eq!(frames[0]["action"], "create", "{}", frames[0]);
+    // The pages carry `id`s, so asking twice REPLACES them (row identity) instead of stacking a
+    // second set of forms — the reason the old screen had to rebuild the whole tree.
+    let pages: Vec<&Value> = frames.iter().filter(|f| f["slot"] == "pages").collect();
+    assert_eq!(pages.len(), 2, "home and management: {pages:?}");
+    assert!(pages.iter().all(|p| p["data"]["id"].is_string()));
     // TWO forms, and not the header's: the control that ASKS for the screen is a form too, whose
     // uplink is the request (`gravity-model`). The save forms are the ones with a row behind them.
-    let forms: Vec<Value> = forms_in(&frames[0]["data"])
+    // The forms live on the management PAGE now, so the search covers every frame's tree.
+    let forms: Vec<Value> = frames.iter().flat_map(|f| forms_in(&f["data"]))
         .into_iter()
         .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
         .collect();
@@ -1996,8 +2017,12 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
         .expect("a configured deployment re-draws");
     settle(&seen).await;
     let frames = screen_frames(&seen);
-    assert_eq!(frames.len(), 1, "one tree per answer: {frames:?}");
-    let redrawn: Vec<Value> = forms_in(&frames[0]["data"])
+    assert_eq!(
+        frames.iter().filter(|f| f["action"] == "create").count(),
+        1,
+        "one tree per answer — the rest are the pages and the bar's items: {frames:?}"
+    );
+    let redrawn: Vec<Value> = frames.iter().flat_map(|f| forms_in(&f["data"]))
         .into_iter()
         .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
         .collect();

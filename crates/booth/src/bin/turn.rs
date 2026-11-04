@@ -945,63 +945,115 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // THE ANSWER IS THE ACTION LIST ITSELF, never a `{frames: [...]}` wrapper: prism forwards an
     // array as the renderer's message and would INJECT anything else into a slot named by the
     // event — a page that gets a map draws nothing and reports nothing (ADR-0017 §8).
-    emit(ctx, LAYOUT_EVENT, device.as_deref(), None, json!([frame_root(Vec::new())]))?;
+    // The management page ships WITH its forms: the layout is rebuilt on every save anyway
+    // (`screen`), so there is no separate "load the forms" step to trigger.
+    let forms = frames_model(ctx).unwrap_or_default();
+    emit(ctx, LAYOUT_EVENT, device.as_deref(), None, json!(frame_root(forms)))?;
     Ok(json!({ "done": true }))
 }
 
-/// The screen's tree: an OUTER FRAME (a navigation bar over the content), never a page with
-/// everything stacked in one column. Under the bar are two areas — the scene on the left, the
-/// conversation on the right — and management is not a third area: it is a panel that opens
-/// over the content (`frame_management`), so the conversation stays mounted while the forms are
-/// being filled. That is not a nicety: a turn streams into `messages`, and a page that unmounted
-/// the slot mid-answer would be writing into a name its layout no longer has.
+/// The screen's tree: an OUTER FRAME (a navigation bar over a set of PAGES), never a page with
+/// everything stacked in one column. Two pages live in the frame — home (the field and the
+/// conversation) and management (the model's forms) — and the bar switches between them.
 ///
-/// fluxen renders a bare button as nothing (a button IS a form's submit), so the control in the
-/// bar is a form with no fields: clicking it submits `{}` to `gravity-model`, which the venue
-/// turns into `ui:gravity-model` with this device as the sender.
-fn frame_root(forms: Vec<Value>) -> Value {
-    let mut children = vec![
-        frame_navbar(),
+/// Management is its own page rather than a panel over the conversation, and the pager keeps
+/// every page MOUNTED (`display: dom`): a turn streams into `messages` while a person may be
+/// filling a form, and a pager that unmounted the home page would leave those frames naming a
+/// slot the layout no longer has.
+fn frame_root(forms: Vec<Value>) -> Vec<Value> {
+    vec![
         json!({
-            "type": "case",
-            "attrs": {"class": ["main", "row", "gap", "shrink"]},
-            "children": [frame_scene(), frame_messages()],
+            "action": "create",
+            "slot": "",
+            "data": {
+                "type": "case",
+                "attrs": {"class": ["maximize", "col"]},
+                "children": [frame_navbar(), frame_pager(), frame_notice()],
+            },
         }),
-        frame_notice(),
-    ];
-    if !forms.is_empty() {
-        children.push(frame_management(forms));
-    }
-    json!({
-        "action": "create",
-        "slot": "",
-        "data": {
-            "type": "case",
-            "attrs": {"class": ["maximize", "col"]},
-            "children": children,
-        },
-    })
+        // The pages, as a dictionary: a row's `id` IS its key, and the bar selects by it.
+        json!({
+            "action": "append",
+            "slot": PAGES_SLOT,
+            "data": {
+                "id": "home",
+                "type": "case",
+                "attrs": {"class": ["main", "row", "gap", "shrink"]},
+                "children": [frame_scene(), frame_messages()],
+            },
+        }),
+        json!({
+            "action": "append",
+            "slot": PAGES_SLOT,
+            "data": {
+                "id": "manage",
+                "type": "case",
+                "attrs": {"class": ["main", "col", "gap", "scrolly"]},
+                "children": forms,
+            },
+        }),
+        // The bar's items: a short label per page, same ids.
+        json!({
+            "action": "append",
+            "slot": TABS_SLOT,
+            "data": {
+                "id": "home",
+                "type": "text",
+                "bind": {"value": {"kind": "default", "default": "对话"}},
+            },
+        }),
+        json!({
+            "action": "append",
+            "slot": TABS_SLOT,
+            "data": {
+                "id": "manage",
+                "type": "text",
+                "bind": {"value": {"kind": "default", "default": "管理"}},
+            },
+        }),
+    ]
 }
 
-/// The navigation bar: the deployment's name and the one control that opens management. Anything
-/// the deployment wants to become a section belongs here, above the content.
+/// The navigation bar: the deployment's name and the page switch. Clicking an item is LOCAL —
+/// the pager reads the same local slot — so switching pages costs no round trip.
 fn frame_navbar() -> Value {
     json!({
         "type": "case",
         "attrs": {"class": ["--head", "nogrow", "horizontal", "center", "box", "gap"]},
         "children": [
-            {"type": "text", "bind": {"value": {"kind": "default", "default": "this deployment"}}},
             {
-                "type": "form",
+                "type": "text",
                 "attrs": {"class": ["nogrow"]},
-                "bind": {"value": {"kind": "dest", "dest": "gravity-model"}},
-                "children": [{
-                    "type": "button",
-                    "attrs": {"oneshot": true},
-                    "bind": {"value": {"kind": "submit", "default": "manage"}},
-                }],
+                "bind": {"value": {"kind": "default", "default": "this deployment"}},
+            },
+            {
+                "type": "select",
+                "attrs": {"horizontal": true},
+                "bind": {
+                    "value": {
+                        "kind": "local",
+                        "slot": PAGE_SLOT,
+                        "path": "/data",
+                        "default": "home",
+                    },
+                    "options": {"kind": "source", "source": TABS_SLOT},
+                },
             },
         ],
+    })
+}
+
+/// The pager: every page stays mounted (`dom`), so a conversation being streamed into one page
+/// survives a look at another.
+fn frame_pager() -> Value {
+    json!({
+        "type": "pages",
+        "attrs": {"class": ["main", "shrink"]},
+        "bind": {
+            "value": {"kind": "source", "source": PAGES_SLOT},
+            "select": {"kind": "local", "slot": PAGE_SLOT, "path": "/data", "default": "home"},
+        },
+        "display": "dom",
     })
 }
 
@@ -1056,20 +1108,6 @@ fn frame_menu() -> Value {
     })
 }
 
-/// Management as a PANEL over the content: the forms beside it, not a page that replaces it.
-fn frame_management(forms: Vec<Value>) -> Value {
-    json!({
-        "type": "float",
-        "attrs": {
-            "class": ["--manage", "box", "border", "round", "gap", "scrolly"],
-            "top": "0",
-            "right": "0",
-            "bottom": "0",
-        },
-        "children": forms,
-    })
-}
-
 /// THE CONVERSATION: a rack over `messages`, with the two bubbles declared ONCE as item
 /// templates. A row appended to `messages` carries a `selector` and the rack indexes these by
 /// it (fluxen rack.rs), so the application decides neither alignment nor accent — it sends rows
@@ -1108,6 +1146,15 @@ const NOTICE_SLOT: &str = "notice";
 /// THE SLOT THE DEPLOYMENT DRAWS ITS SCENE IN: whatever the left area shows is content the
 /// deployment pushes, not a widget the shell decides on.
 const SCENE_SLOT: &str = "scene";
+
+/// The page the frame shows: a LOCAL slot — the bar writes it, the pager reads it.
+const PAGE_SLOT: &str = "page";
+
+/// The pager's rows: one per page, `id` is the page's key.
+const PAGES_SLOT: &str = "pages";
+
+/// The bar's items.
+const TABS_SLOT: &str = "tabs";
 
 /// The menu under the scene: the deployment appends rows, in its own vocabulary.
 const MENU_SLOT: &str = "menu";
@@ -1166,7 +1213,7 @@ fn screen(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // leaves one screen. The caller names no slot: a click cannot carry one, and this booth owns
     // what a screen looks like anyway.
     let forms = frames_model(ctx)?;
-    emit(ctx, SCREEN_EVENT, device.as_deref(), None, json!([frame_root(forms)]))?;
+    emit(ctx, SCREEN_EVENT, device.as_deref(), None, json!(frame_root(forms)))?;
     Ok(json!({ "done": true }))
 }
 
