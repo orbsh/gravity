@@ -1348,9 +1348,20 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
         .into_iter()
         .filter_map(|e| e.get("data").and_then(Value::as_array).cloned())
         .collect();
+    // The last batch is the FIELD: the turn and the rows it wrote, as one snapshot.
+    assert_eq!(
+        batches[3][0]["slot"], "scene",
+        "what the turn just did is drawn in the scene: {:?}",
+        batches[3]
+    );
+    assert_eq!(batches[3][0]["action"], "set", "a whole payload, diffed by node id");
+    assert_eq!(
+        batches[3][0]["data"]["nodes"][0]["id"], "7:1",
+        "the turn is a node, keyed by its id"
+    );
     assert_eq!(
         batches.len(),
-        3,
+        4,
         "the stage on the OPEN, then one batch per chunk (ADR-0010: the person's message is          drawn when they send it, not when the first token arrives): {batches:?}"
     );
     let open = &batches[0];

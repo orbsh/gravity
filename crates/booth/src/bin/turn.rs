@@ -833,6 +833,29 @@ fn turn(
     keep.extend(call_rows);
     keep.push(answer);
     log.close(&keep)?;
+    // The field on the left shows what the turn just did: the turn as a node, everything it
+    // wrote hanging off it. A whole SNAPSHOT, because that is how a forcegraph is fed
+    // (fluxen ADR 0018) — it diffs by node id, so resending is idempotent.
+    if matches!(out, Out::View) {
+        let mut nodes = vec![json!({
+            "id": turn.id,
+            "label": turn.id,
+            "kind": "turn",
+        })];
+        let mut links = Vec::new();
+        for (n, (ts, sub)) in keep.iter().enumerate() {
+            let id = bubble_id(&turn.id, n as u8);
+            nodes.push(json!({ "id": id, "label": format!("{ts}:{sub}"), "kind": "row" }));
+            links.push(json!({ "source": turn.id, "target": id, "kind": "wrote" }));
+        }
+        emit(
+            ctx,
+            UI_EVENT,
+            device,
+            Some(&turn.id),
+            json!([{ "action": "set", "slot": SCENE_SLOT, "data": { "nodes": nodes, "links": links } }]),
+        )?;
+    }
     Ok(reply)
 }
 
