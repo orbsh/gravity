@@ -2,8 +2,8 @@
 
 > **语言：** [English](0001-toolrunner-execution-surface.md)（主文档） · [中文](0001-toolrunner-execution-surface.zh-CN.md)
 
-**状态：** Accepted（2026-10-14）。该面当天即已落地——文末更新记录了落了什么、以及
-仍欠的那一件；下面的形态仍是各相位排队的依据。
+**状态：** Accepted（2026-10-14）。该面当天即已落地；仍欠的那一件记在「后果」里，
+下面的形态是各相位排队的依据。
 **日期：** 2026-10-14
 
 ## 背景
@@ -96,10 +96,10 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
    所以 nu guest 只能 shell 出一个子进程，而子进程永远看不到 guest 的 ctx 作用域。
    进程内求值正是常驻的前提：python 可以——guest 进程里的 `exec` 让下发脚本跑在自己的
    作用域里，而 guest 的 ctx 辅助函数在那可见——nu 不行。于是 nu 是一次性系统语言
-   （`deploy/runners/runner_nu.nu`），python 今天是一次性
-   （`deploy/runners/runner_py.py`），并且是常驻形态的候选语言（等一份 python guest
-   存在；那份 guest 目前是尚不存在的部署件）。嵌入式 python 载具（pyo3，进程内 CPython
-   跑在节点自己的进程里）依旧**不是** runner 形态：它不容纳进程边界。
+   （`deploy/runners/runner_nu.nu`），python 两形皆有：一次性
+   （`deploy/runners/runner_py.py`）与常驻（`deploy/runners/runner_py_guest.py`，见下）。
+   嵌入式 python 载具（pyo3，进程内 CPython 跑在节点自己的进程里）**不是** runner 形态：
+   它不容纳进程边界。
 
    状态：一次性形态两门语言都已落地（`deploy/runners/runner_nu.nu`、
    `deploy/runners/runner_py.py`），常驻形态已在 python 落地
@@ -135,18 +135,29 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
 ## 后果
 
 - **gravity：** 无执行面依赖；工具表固定且极小（skill 检索 + run）；调用点一处——
-  `invoke(mount, key, entry, args{code, args})`；脚本从 k10r 的 HTTP 面来，以参数
-  形态走。
+  `Doors::mount` 就是 `ctx.invoke(type_name, key, "execute", args)`
+  （`crates/booth/src/bin/turn.rs`），目标由部署声明的「操作语言 → mount」表解析、
+  该表随 turn 参数传入（`crates/booth/src/tools.rs` 的 `mount_for`）；脚本从 k10r 的
+  HTTP 面来，以参数形态走，即 `{code, args}`。`mount_for` 是对操作语言的 MATCH；
+  没有 mount 服务的语言是一句点名「谁被服务」的拒绝，永不兜底。`write_code` 把
+  `language` 定为必填参数——给默认值等于 gravity 替别人挑 mount；`crates/` 里不再有
+  任何 `effector` 类型。
 - **k10r：** 脚本的家，且 gravity 是它唯一的客户；节点永不与它说话——字节路径是
   gravity → 控制路径 → 节点。
-- **prism：** 多出一件工作——mount 注册面。按 (别名 × 操作语言) 注册一个
-  `Remote` 类型，source 是那份 runner 部署件。`Remote` 定义不持久化，所以
-  这是每次启动的幂等注册；拨入帧 `Frame::Register { node_alias, carriers }` 已经提供
-  了别名与载具集，可作触发源。
-- **aura：** 零改动。用的全是既有面（`engine.register`、`Body::Remote`）。
-- **effector：** 零改动。runner 是定义，skill 脚本是参数；帧词汇、编解码、代码引用
-  全部照旧。
-- **部署：** 每台机器（含控制面）跑一个节点；每语言一份 runner 部署件（或一台
+- **prism：** 多出一件工作——mount 注册面（`prism/src/mounts.rs`：`MountDecl` /
+  `PRISM_MOUNTS` / `register_all`）。按 (别名 × 操作语言) 注册一个 `Remote` 类型，
+  source 是那份 runner 部署件。`Remote` 定义不持久化，所以这是每次启动重放的幂等
+  注册；拨入帧 `Frame::Register { node_alias, carriers }` 提供了别名与载具集，可作
+  触发源。
+- **aura：** 不新增任何面（`engine.register`、`Body::Remote`）；这道执行面要求的那一处
+  引擎修复在拨入侧读循环上——它现在只管关联、解析是 spawn 出去的
+  （`crates/engine/src/effectors.rs`），这正是 ctx 调用打到同节点兄弟 mount 时不会自锁
+  到调用期限的原因（§8）。
+- **effector：** 协议原样——runner 是定义，skill 脚本是参数；帧词汇、编解码、代码引用
+  全部照旧。节点侧的 containment 半边落在这里（effector ADR-0001）：牢笼由节点自己
+  声明的 `CapabilitySurface` 构建（`fs_scope` 作写范围、`deny_read`、`cwd`），
+  `config.sandbox` 就是这里清单行所假定的那个开关，而没有执法点的声明会让启动失败。
+- **部署：** 每台机器（含控制面）跑一个节点；每语言、每载具形态一份 runner 部署件（或一台
   dispatcher）随它安装；节点清单声明载具、沙箱策略与容量。"部署在哪，就能操作哪"
   （aura ADR-0015）变成字面事实：一台机器的能力就是它的清单。
 - **驻留：** 一张会话表、一份驱逐策略、一套沙箱配置——场域与节点的，永远不是
@@ -160,45 +171,13 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
   重做一遍，只换来省掉几个静态注册。清单的撰写与审核归**部署层**（ADR-0015：节点身份
   不是用户身份）；**谁能用哪个节点**归**应用层**（gravity 的 realm/实例键 + prism 的
   auth 门）。
-- **已闭合（2026-10-14）：** prism 的 mount 声明两个轴都写了，拨入路径也会比对——帧里
-  宣告的载具集与声明所声称的那份相比（`prism/src/mounts.rs::dial_in_note`），"语言 ↔
-  节点"这条事实因此有了落点。至今仍不是**文件**形态的是**节点自己的**清单：挂载清单是
-  编译期声明，节点那一半是它的 effector config。
-
-## 更新（2026-10-14）：该面已落地，仍欠一件
-
-上面的裁决写在它存在之前，而当天它大半成了事实。已落地：prism 的 mount 注册面
-（`prism/src/mounts.rs` —— `MountDecl`/`PRISM_MOUNTS`/`register_all`，启动时幂等重放，
-因为 `Remote` 定义不持久化）、三份 runner 部署件
-（`effector/deploy/runners/runner_nu.nu`、`runner_py.py`、`runner_py_guest.py`），以及
-第 8 条裁决在 python 上的常驻形态——`runner_py_guest.py` 是一个 induction guest，跨调用
-的驻留成立，且从它出去的 ctx bridge 端到端验证过：交付的脚本经宿主场域调用兄弟 mount
-并拿回它的值（`prism/crates/prism/tests/runner_mount.rs`）。路上定位并修掉三处断点，每层
-一处——guest 的协议帧走了 `sys.stdout`，而交付脚本的包装器正把 stdout 重定向进结果捕获
-（线的 fd 在重定向之前就已钉死）；常驻会话留着冷启动那次调用的 bridge，于是后续调用报出
-一个没人在等的 call id（bridge 是**按调用**的数据，由分派缝在每次调用时重挂）；dial-in
-读取循环内联解析 host 调用，停在一个只有它自己能读到 Result 帧的兄弟调用上——目标就在
-同一节点时（也就是通常情况）自锁到超时。第三处就是 aura 当前 HEAD（`4992e8e`）动
-`crates/engine/src/effectors.rs` 的原因。
-
-节点侧的 containment 半边落在 effector（effector ADR-0001）：牢笼由节点自己声明的
-`CapabilitySurface` 构建（`fs_scope` 作写范围、`deny_read`、`cwd`），`config.sandbox` 就是
-这里清单行所假定的那个开关，而没有执法点的声明会让启动失败。
-
-gravity 自己的调用点——这块执行面真正被读取的地方：
-
-- **mount 调用存在了。** `Doors::mount` 就是
-  `ctx.invoke(type_name, key, "execute", args)`（`crates/booth/src/bin/turn.rs`），目标由
-  部署声明的「操作语言 → mount」表解析、该表随 turn 参数传入（`crates/booth/src/tools.rs`
-  的 `mount_for`），skill 的脚本按 §2 以 `{code, args}` 随调用走。`mount_for` 是对操作语言
-  的 MATCH；没有 mount 服务的语言是一句点名"谁被服务"的拒绝，永不兜底。
-- **不再有 `effector` 类型。** `crates/` 里一处都不提。
-- **语言默认值靠"不给默认值"了结。** `write_code` 把 `language` 定为工具调用的必填参数：
-  给默认值等于 gravity 替别人挑 mount，而路由是部署事实。
-
-由此浮出的一个管路问题仍开着：这张表随 turn 参数走，于是每个调用方都得自己带（CLI 从它的
-venue 配置里读）。prism 已经持有同一张表（`PRISM_MOUNTS`），每多一个客户端多一份声明就是
-一个漂移源；该不该由 venue 在路由 `ui:turn.submit` 时把表注入 turn 参数，尚未裁决。
+- **mount 声明把两根轴都写了**，拨入路径也会比对：帧里宣告的载具集与声明所声称的那份
+  相比（`prism/src/mounts.rs::dial_in_note`），"语言 ↔ 节点"这条事实因此有了落点。至今
+  仍不是**文件**形态的是**节点自己的**清单：挂载清单是编译期声明，节点那一半是它的
+  effector config。
+- **仍开：** mount 表随 turn 参数走，于是每个调用方都得自己带（CLI 从它的 venue 配置里
+  读）。prism 已经持有同一张表（`PRISM_MOUNTS`），每多一个客户端多一份声明就是一个漂移
+  源；该不该由 venue 在路由 `ui:turn.submit` 时把表注入 turn 参数，尚未裁决。
 
 ## 相关记录
 

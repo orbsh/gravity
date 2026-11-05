@@ -2,9 +2,9 @@
 
 > **Languages:** [English](0003-skill-execution-shape.md) (primary) · [中文](0003-skill-execution-shape.zh-CN.md)
 
-**Status:** Accepted (2026-10-14). Design ruling: the pieces it names are partly
-landed (the ctx bridge out of a resident guest, the turn-start projection) and
-partly owed (the task rows, the pre-dispatch gate).
+**Status:** Accepted (2026-10-14). Design ruling: the pieces it names are landed
+— the ctx bridge out of a resident guest, the turn-start task listing with its
+`finishes_on` bindings, and the pre-dispatch gate.
 **Date:** 2026-10-14
 
 ## Context
@@ -26,12 +26,12 @@ Three shapes were on the table for the execution half:
 They are not three answers to one question. The first two are about control flow
 INSIDE one invocation; the third is about progress ACROSS turns, and it exists
 because advancing a multi-step task by LLM turns is slow. What they need is
-mostly already there, verified: the ctx bridge out of a resident guest (a
-delivered script calls a sibling mount and gets its value back — ADR-0001's
-status), one line per relation in okm (`link` / `unlink` write and delete every
-face in one batch; a row deletes via `Collection::delete`; nothing cascades —
-the imperative pairing IS the discipline, okm ADR-0015 §B), and the projection
-fetch gravity already performs at turn start.
+already there, verified: the ctx bridge out of a resident guest (a delivered
+script calls a sibling mount and gets its value back — ADR-0001 §8), one line
+per relation in okm (`link` / `unlink` write and delete every face in one
+batch; a row deletes via `Collection::delete`; nothing cascades — the imperative
+pairing IS the discipline, okm ADR-0015 §B), and the reads gravity already
+performs at turn start.
 
 ## Decision
 
@@ -50,18 +50,32 @@ history never edits the graph's topology.**
    `carrier` axis (ADR-0001 §7) therefore STATES which mounts can host a
    composed operation — "can this mount run glue" is a declaration, not a guess.
 3. **Progress is data: one task row per step, bound to the call that completes
-   it.** The binding is an edge in the same graph as the facts (the task-graph
-   ruling: task vertices + their link edges in the graph; their completion state
-   is structured application state, not a memory-pipeline fact — approximate
-   retrieval cannot answer an enumeration question). Completion is a write at
-   the call site, never a model judgement.
+   it.** The binding is `task --finishes_on--> code`, an ordinary edge in the
+   same graph as the facts (k10r ADR-0023 made a code row a VERTEX, which is what
+   gives the edge something to point at; the task-graph ruling: task vertices +
+   their link edges in the graph; their completion state is structured
+   application state, not a memory-pipeline fact — approximate retrieval cannot
+   answer an enumeration question). The door states it at open
+   (`POST /tasks/{scope} {name, finishes_on: [code_id…]}`); a code id nobody
+   delivered is refused by name, and re-stating it is idempotent without moving
+   the task's state. Completion is a write at the CALL SITE, never a model
+   judgement, and the write is gravity's: gravity reads the binding off the
+   turn-start listing, builds one local table per turn, and after a step
+   SUCCEEDS moves every task bound to that code row to `done` — a failed or
+   refused step writes nothing. The tool result reports what it closed
+   (`finished_tasks`), because the model must not be surprised by work
+   disappearing from its list, and the step's own document rides whole under
+   `result`: the executor does not edit the script's answer.
 4. **The pre-dispatch gate is code, and inside a turn it reads memory.** Gravity
-   pulls the session's open todos WITH the projection it already fetches at turn
-   start; every in-turn check before dispatching a call is then a memory read —
-   zero per-call round trips, no LLM on the path. The truth stays in k10r and
-   the snapshot refreshes once per turn: progress written in this turn is
-   visible to this turn's later checks, and a change from elsewhere arrives with
-   the next projection.
+   pulls the session's open tasks, with their bindings, as its own read at turn
+   start — two doors, not one: the session projection is channel state
+   (`GET …/session`), and the open-task listing is `GET /tasks/{scope}`.
+   Merging them would make one door's shape bend to the other's. The listing is
+   fetched ONCE per turn, before the loop, and every in-turn check before
+   dispatching a call reads that local table — zero per-call round trips, no
+   LLM on the path. The truth stays in k10r and the snapshot refreshes once per
+   turn: progress written in this turn is visible to this turn's later checks,
+   and a change from elsewhere arrives with the next projection.
 5. **Execution history writes numbers, never topology.** Counters and weights
    are additive and reversible data (the `tool_invoke_count` write-back is the
    counter's home, Phase 5); a glue script is a session-scoped artifact (a data
@@ -136,12 +150,10 @@ history never edits the graph's topology.**
   case is a mount's own runner source, which a residency loads ONCE at cold
   start: that one stays content-addressed (ADR-0027's blob + reference), because
   an id-addressed residency source would silently keep running the old code.
-- **Open:** the task row's schema (fields, the binding edge's kind, what
-  "session" scopes the gate) and whether the completion write is gravity's or the
-  runner's. The promotion path's form is no longer open: k10r ADR-0016 landed it —
-  a proposal is a row (kind `skill_proposal`, counted, invisible to the resolver),
-  gravity files it at turn end when a turn walked two different code rows, and the
-  act that turns one into a skill is a HUMAN's declaration that copies the steps.
+- **Open:** what "session" scopes the gate. The task row carries `name` and its
+  `finishes_on` edges (decision 3), the completion write is gravity's, and a
+  promotion is k10r ADR-0016's proposal row, filed by gravity when the walk
+  reaches a composition (decision 5).
 
 ## Related records
 
@@ -151,29 +163,3 @@ ADR-0015 §B and `okm/docs/PLAN.md` (relations: `link`/`unlink`, no implicit
 cleanup), aura ADR-0043 (the ctx surface a glue script calls through), and the
 memory records on emergent skill boundaries (usage statistics, not edge
 rewrites).
-
-## Update (2026-10-31) — §3's binding and §4's gate landed
-
-**§3's binding is `task --finishes_on--> code`, and it is an ordinary fact.** k10r
-ADR-0023 made a code row a VERTEX of the fact graph (it was a bare surrogate id with
-nothing to point at, which is why this clause had no way to be written), so the edge
-lands where every other edge lands. The door states it at open
-(`POST /tasks/{scope} {name, finishes_on: [code_id…]}`), a code id nobody delivered is
-refused by name, and re-stating it is idempotent without moving the task's state.
-
-**The completion write is GRAVITY'S, at the call site** — the open half of this ADR is
-now closed. Gravity reads the binding off the turn-start listing
-(`finishes_on` per task, resolved from the edges), builds one local table per turn, and
-after a step SUCCEEDS moves every task bound to that code row to `done`; a failed or
-refused step writes nothing. The tool result reports what it closed
-(`finished_tasks`), because the model must not be surprised by work disappearing from
-its list. The step's own document rides whole under `result` — the executor does not
-edit the script's answer.
-
-**§4's "with the projection it already fetches" was wrong on the ground, and the
-implementation keeps two reads.** The session projection is one door (channel state,
-`GET …/session`); the open-task listing is another (`GET /tasks/{scope}`) and carries
-the bindings. Merging them would make one door's shape bend to the other's. What the
-clause MEANT still holds: the listing is fetched ONCE per turn, before the loop, and
-every in-turn check reads that local table — zero per-call round trips, no LLM on the
-path.

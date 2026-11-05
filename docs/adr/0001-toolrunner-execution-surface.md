@@ -2,9 +2,9 @@
 
 > **Languages:** [English](0001-toolrunner-execution-surface.md) (primary) · [中文](0001-toolrunner-execution-surface.zh-CN.md)
 
-**Status:** Accepted (2026-10-14). The surface itself landed the same day — the
-Update at the end records what, and the one piece still owed; the shape below is
-what the phases are sequenced against.
+**Status:** Accepted (2026-10-14). The surface itself landed the same day; the
+shape below is what the phases are sequenced against, and the one piece still
+owed is named under Consequences.
 **Date:** 2026-10-14
 
 ## Context
@@ -126,11 +126,11 @@ What the wire already provides (verified against the code, not assumed):
    what puts residency within reach: python can — a guest process whose `exec`
    runs the delivered script in its own scope, where the guest's ctx helpers are
    visible — and nu cannot. So nu is the one-shot systems language
-   (`deploy/runners/runner_nu.nu`), python is one-shot today
-   (`deploy/runners/runner_py.py`) and the resident candidate once a python
-   guest exists, and that guest is a deployment artifact that does not exist
-   yet. The embedded python carrier (pyo3, in-process CPython in the node's own
-   process) is still NOT a runner form: it admits no process boundary.
+   (`deploy/runners/runner_nu.nu`), and python is both: one-shot
+   (`deploy/runners/runner_py.py`) and the resident form
+   (`deploy/runners/runner_py_guest.py`, below). The embedded python
+   carrier (pyo3, in-process CPython in the node's own process) is NOT a runner
+   form: it admits no process boundary.
 
    Status: the one-shot form is landed for BOTH languages
    (`deploy/runners/runner_nu.nu`, `deploy/runners/runner_py.py`), the resident
@@ -180,23 +180,40 @@ What the wire already provides (verified against the code, not assumed):
 ## Consequences
 
 - **gravity:** no execution-plane dependency; the tool list is fixed and tiny
-  (skill search + run); one call site — `invoke(mount, key, entry, args{code,
-  args})`; scripts come from k10r's HTTP face and travel as arguments.
+  (skill search + run); one call site — `Doors::mount` is
+  `ctx.invoke(type_name, key, "execute", args)` (`crates/booth/src/bin/turn.rs`),
+  the target resolved from the language → mount table the deployment declares
+  and the turn carries in its args (`crates/booth/src/tools.rs`, `mount_for`);
+  scripts come from k10r's HTTP face and travel as arguments, as `{code, args}`.
+  `mount_for` is a MATCH on the operation language, and a language no mount
+  serves is a refusal naming what is served, never a fallback. `write_code`
+  makes `language` a required argument — a default would be gravity choosing
+  someone else's mount; no `effector` type remains anywhere in `crates/`.
 - **k10r:** the script store, with gravity as its only client. The node never
   talks to it — the byte path is gravity → control path → node.
-- **prism:** one new piece of work — a mount-registration face. Per (alias ×
-  operation language) a `Remote` type whose source is the runner artifact.
-  `Remote` definitions are not persisted, so this is an idempotent
-  registration per boot, and the dial-in `Frame::Register { node_alias,
-  carriers }` already supplies the alias and the carrier set for the trigger.
-- **aura:** no change. Only existing surfaces are used (`engine.register`,
-  `Body::Remote`).
-- **effector:** no change. The runner is a definition; the skill script is an
-  argument; the frame vocabulary, the codec, and the code reference all stand.
+- **prism:** one new piece of work — a mount-registration face
+  (`prism/src/mounts.rs`: `MountDecl` / `PRISM_MOUNTS` / `register_all`). Per
+  (alias × operation language) a `Remote` type whose source is the runner
+  artifact. `Remote` definitions are not persisted, so this is an idempotent
+  registration replayed at boot, and the dial-in `Frame::Register { node_alias,
+  carriers }` supplies the alias and the carrier set for the trigger.
+- **aura:** no new surface is used (`engine.register`, `Body::Remote`); the one
+  engine fix the surface required is the dial-in reader loop's — it now only
+  correlates and resolution is spawned (`crates/engine/src/effectors.rs`), which
+  is what keeps a ctx call to a sibling mount on the same node from deadlocking
+  to the deadline (§8).
+- **effector:** the protocol is untouched — the runner is a definition, the
+  skill script is an argument, and the frame vocabulary, the codec, and the
+  code reference all stand. The node-side containment half lives here (effector
+  ADR-0001): the jail is built from the node's own `CapabilitySurface`
+  (`fs_scope` as write scope, `deny_read`, `cwd`), `config.sandbox` is the
+  switch the manifest line assumes, and a declaration with no enforcement point
+  fails the startup.
 - **Deployment:** every machine (control plane included) runs a node; one runner
-  artifact per language — or one dispatcher — ships with it; the node manifest
-  declares carriers, sandbox policy, and capacity. "Deployed where, can operate
-  there" (aura ADR-0015) becomes literal: a machine's abilities are its manifest.
+  artifact per language and carrier form — or one dispatcher — ships with it; the
+  node manifest declares carriers, sandbox policy, and capacity. "Deployed where,
+  can operate there" (aura ADR-0015) becomes literal: a machine's abilities are
+  its manifest.
 - **Residency:** one session table, one eviction policy, one sandbox
   configuration — the venue's and the node's, never gravity's.
 - **Foreclosed:** gravity running standalone *with* execution ability; any local
@@ -213,58 +230,17 @@ What the wire already provides (verified against the code, not assumed):
   the deploy layer (ADR-0015: node identity is not user identity); *who may use
   which node* belongs to the application layer (gravity's realms/instance keys
   plus prism's auth gate).
-- **Closed 2026-10-14:** prism's mount declaration names both axes and the
-  dial-in path checks them — the carrier set the frame announces is compared
-  against the set the declaration claims (`prism/src/mounts.rs::dial_in_note`),
-  so the language↔node fact has a home. What is still nowhere a FILE is the
-  *node's* manifest: the mount list is a compiled-in declaration, and the node's
-  own half is its effector config.
-
-## Update (2026-10-14): the surface landed; one piece is owed
-
-The ruling above was written before any of it existed, and the same day carried
-most of it. Landed: prism's mount-registration face (`prism/src/mounts.rs` —
-`MountDecl`/`PRISM_MOUNTS`/`register_all`, replayed at boot because
-`Remote` definitions do not persist), the three runner artifacts
-(`effector/deploy/runners/runner_nu.nu`, `runner_py.py`, `runner_py_guest.py`),
-and ruling 8's resident form for python — `runner_py_guest.py` is an induction
-guest whose residency holds across calls, and the ctx bridge OUT of it is proven
-end to end: a delivered script calls a sibling mount through the host realm and
-gets its value back (`prism/crates/prism/tests/runner_mount.rs`). Three breaks
-were located and fixed on the way, one per layer — the guest's protocol frames
-rode `sys.stdout`, which the delivered-script wrapper redirects into its result
-capture (the wire fds are pinned before the redirect); a resident session kept
-the bridge of its cold-start call, so later calls named a call id nobody waited
-on (the bridge is per-CALL data, re-armed by the dispatch seam); and the dial-in
-reader loop resolved host calls inline, parking on a sibling call whose Result
-frame only that loop can read — a self-deadlock to the deadline in the ordinary
-case where the ctx target lives on the same node. That third break is why aura's
-HEAD (`4992e8e`) touches `crates/engine/src/effectors.rs`.
-
-The node-side containment half landed in the effector (effector ADR-0001): the
-jail is built from the node's own `CapabilitySurface` (`fs_scope` as write scope,
-`deny_read`, `cwd`), `config.sandbox` is the switch the manifest line here
-assumed, and a declaration with no enforcement point fails the startup.
-
-Gravity's own call site, which is the piece this surface is read from:
-
-- **The mount call exists.** `Doors::mount` is `ctx.invoke(type_name, key,
-  "execute", args)` (`crates/booth/src/bin/turn.rs`), the target is resolved from
-  the language → mount table the deployment declares, carried in the turn args
-  (`crates/booth/src/tools.rs`, `mount_for`), and the skill's script rides as
-  `{code, args}` exactly as §2 says. `mount_for` is a MATCH on the operation
-  language; a language no mount serves is a refusal naming what is served, never
-  a fallback.
-- **No `effector` type remains.** `crates/` names it nowhere.
-- **The language default was resolved by declining to have one.** `write_code`
-  makes `language` a required argument of the tool call: a default would be
-  gravity choosing someone else's mount, and the route is a deployment fact.
-
-One plumbing question this raised, still open: the mount table rides the turn
-ARGS, so every caller carries it (the CLI reads it from its venue config). prism
-already holds the same table as `PRISM_MOUNTS`, so a second declaration per client
-is a drift source; whether the venue should inject the table into the turn's args
-when it routes `ui:turn.submit` is not decided.
+- **The mount declaration names both axes**, and the dial-in path checks them:
+  the carrier set the frame announces is compared against the set the
+  declaration claims (`prism/src/mounts.rs::dial_in_note`), so the language↔node
+  fact has a home. What is not a file anywhere is the *node's* own manifest: the
+  mount list is a compiled-in declaration, and the node's own half is its
+  effector config.
+- **Open:** the mount table travels in the turn's args, so every caller carries
+  it (the CLI reads it from its venue config). Prism already holds the same
+  table as `PRISM_MOUNTS`, so each further client is a drift source; whether the
+  venue should inject the table into the turn's args when it routes
+  `ui:turn.submit` is not decided.
 
 ## Related records
 

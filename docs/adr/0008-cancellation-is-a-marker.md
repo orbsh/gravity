@@ -13,7 +13,7 @@ Two obvious answers are wrong here.
 
 **Killing the booth.** It is the hard inverse of the problem being solved: the realm holds the store pointers, the guest holds the tail branches and the reply parts, and a process that disappears mid-turn leaves k10r with an open compression node and no append. "Stop" would mean "lose the trace of what happened".
 
-**Sending a cancel event.** The event plane delivers to an instance one event at a time, and the instance running a turn is exactly that instance: a `view:turn.cancel` emitted while a turn runs is queued behind it and is handled after the end it was meant to cut short. A message cannot cancel work the same mailbox is doing.
+**Sending a cancel event.** The event plane delivers to an instance one event at a time, and the instance running a turn is exactly that instance: a `ui:turn.cancel` emitted while a turn runs is queued behind it and is handled after the end it was meant to cut short. A message cannot cancel work the same mailbox is doing.
 
 ## Decision
 
