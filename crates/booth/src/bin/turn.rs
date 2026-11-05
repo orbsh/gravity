@@ -29,7 +29,7 @@
 //! closing record — its rows stay OPEN, working state the projection skips.
 //!
 //! Args (the envelope's `data`, or the flat call of a direct caller):
-//! `{"channel_id", "member_id", "user_message", "store_url", "endpoint", "model",
+//! `{"channel_id", "user_message", "store_url", "endpoint", "model",
 //! "key_env"}`, plus the output shape — `protocol: "fluxen"` with `slots {rack, text}`,
 //! or `event` naming the event raw deltas are spoken as. The envelope's OWN `channel_id`
 //! is an ADDRESS (a device, text) and is a different fact from the conversation's
@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
 fn storage_schema() -> Value {
     let slots = json!({
         "primary": 0, "dynamic": 1, "dict_id": 2, "dict_name": 3,
-        "declared_index_base": 4096, "declared_reduce_base": 8192, "junction_base": 12288,
+        "declared_index_base": 4096, "declared_reduce_base": 8192,
     });
     // A TYPE OWNS ONE NS (aura ADR-0026): every collection of this type shares it, so the key
     // carries the discriminator — without it two collections with the same `id` are one row.
@@ -301,7 +301,6 @@ fn emit(
 
 
 /// One bubble in the rack whose text child reads the streaming region — so a patch of the
-
 /// The user's own line, so the rack shows the question above the answer.
 /// One bubble, appended to the conversation. The row carries its own identity (`data.id`)
 /// and a `selector` the LAYOUT's item template matches on — appearance is the template's
@@ -386,8 +385,19 @@ fn device_of(envelope: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// WHO is behind this connection, as the venue stamped it. Absent when the socket is anonymous —
+/// the caller decides whether that is an error (the turn says so by name).
+fn sender_user(envelope: &Value) -> Option<String> {
+    envelope
+        .get("sender")
+        .and_then(|sender| sender.get("user"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
+    let user = sender_user(envelope);
     let args = payload(envelope);
     let drawing = args
         .get("protocol")
@@ -401,7 +411,7 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // The store mints the turn id when the log opens; the branch hands it back here so
     // the end frames carry the same one the chunks did.
     let minted: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
-    match turn(ctx, args, device.as_deref(), &minted) {
+    match turn(ctx, args, device.as_deref(), user.as_deref(), &minted) {
         Ok(reply) => {
             if said {
                 // The id rides INSIDE the payload as well as on the envelope: a venue hands a
@@ -447,7 +457,10 @@ struct Turn<'a> {
     /// Already trailing-slash-trimmed.
     store_url: String,
     channel_id: u64,
-    member_id: u64,
+    /// WHO is speaking — the venue's sender envelope, never a form field: a page has no way to
+    /// claim another person (prism ADR-0018, ADR-0017 §7 amendment). k10r's member id is the
+    /// user's uuid as text.
+    member_id: String,
     memory_scope: u64,
     /// The head's representation — the deployment's choice, stored beside the other facts.
     memory_format: String,
@@ -461,6 +474,7 @@ fn turn(
     ctx: &mut Ctx,
     args: &Value,
     device: Option<&str>,
+    user: Option<&str>,
     minted: &std::cell::RefCell<Option<String>>,
 ) -> anyhow::Result<String> {
     // THE DEPLOYMENT FACTS ARE ROWS, NOT ARGUMENTS (ADR-0007): the store, the memory scope, the
@@ -469,14 +483,30 @@ fn turn(
     let settings = read_settings(ctx)?;
     let recipe = read_recipe(ctx, settings.default_model)?;
     let store_url = settings.store_url.trim_end_matches('/').to_string();
-    let channel_id = args
-        .get("channel_id")
-        .and_then(Value::as_u64)
-        .context("turn: missing `channel_id`")?;
-    let member_id = args
-        .get("member_id")
-        .and_then(Value::as_u64)
-        .context("turn: missing `member_id`")?;
+    // WHICH conversation. A caller that knows says so; a page does not, because the channel is
+    // the application's business (prism ADR-0018) and the deployment serves one person. The
+    // fallback is the member's OWN first channel — the same query a chat view makes when it
+    // builds, asked from the side that needs the answer.
+    let channel_id = match args.get("channel_id").and_then(Value::as_u64) {
+        Some(channel_id) => channel_id,
+        None => {
+            let member = user.or_else(|| args.get("member_id").and_then(Value::as_str));
+            let member = member.context("turn: no `channel_id` and no member to look one up for")?;
+            first_channel_of(&store_url, member)?
+        }
+    };
+    // WHO is speaking. A PAGE has no field for it — the venue mounts `sender {device, user}`
+    // into every page event, and k10r's member id IS the user's uuid (k10r ADR-0025), so the
+    // answer comes from the transport, never from a form. A DIRECT caller (the CLI, a sibling
+    // booth, the test seam) has no envelope to stamp, and it names the member itself: that is
+    // the caller declaring its own identity, not a page claiming another's.
+    let member_id = match user {
+        Some(user) => user.to_string(),
+        None => args
+            .get("member_id")
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .context("turn: no `sender.user` on the envelope and no `member_id` in the args —                       a page is identified by the venue, a direct caller names its member")?,
+    };
     let user_message = args
         .get("user_message")
         .and_then(Value::as_str)
@@ -504,7 +534,8 @@ fn turn(
     let format = MemoryFormat::from_config(Some(turn.memory_format.as_str()))
         .context("turn: the configured memory format is unusable")?;
     let url = format!(
-        "{store_url}/channels/{channel_id}/members/{member_id}/session?format={}",
+        "{store_url}/channels/{channel_id}/members/{}/session?format={}",
+        turn.member_id,
         format.name()
     );
     let resp = ureq::get(&url)
@@ -649,7 +680,7 @@ fn turn(
     emit(
         ctx,
         OPENED_EVENT,
-        device.as_deref(),
+        device,
         Some(&turn.id),
         json!({ "turn": turn.id }),
     )?;
@@ -664,7 +695,7 @@ fn turn(
             .map(str::to_string);
         let frames = frames_open(&turn.id, ask.as_deref());
         if !frames.is_empty() {
-            emit(ctx, UI_EVENT, device.as_deref(), Some(&turn.id), json!(frames))?;
+            emit(ctx, UI_EVENT, device, Some(&turn.id), json!(frames))?;
         }
     }
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
@@ -695,7 +726,7 @@ fn turn(
         // Residency for a mount call is the CONVERSATION (ADR-0001 §6 leaves
         // the key to the caller): a step script's own state survives the turns
         // of one conversation and nothing else.
-        let session = format!("channel-{channel_id}-member-{member_id}");
+        let session = format!("channel-{channel_id}-member-{}", turn.member_id);
         // The COLD path (PLAN Phase 2.5), before the round is dispatched: a
         // `human`-nature call touches the outside world and may not answer for
         // minutes, so the transcript stops carrying payloads it has already used.
@@ -1147,7 +1178,32 @@ fn frame_stream() -> Value {
     json!({
         "type": "case",
         "attrs": {"class": ["stage-stream", "main", "shrink", "col"]},
-        "children": [frame_messages()],
+        "children": [frame_messages(), frame_composer()],
+    })
+}
+
+/// THE COMPOSER: the one place a person's words enter. A form like any other — the uplink is
+/// the bare `turn.submit`, which the venue puts on the plane as `ui:turn.submit` — but with
+/// exactly ONE field: what was said. WHO said it and WHICH conversation it lands in are not the
+/// form's to claim (prism stamps the sender; the channel is the application's own fact), so a
+/// page has nothing with which to speak as somebody else or into somebody else's channel.
+fn frame_composer() -> Value {
+    json!({
+        "type": "form",
+        "attrs": {"class": ["nogrow", "horizontal", "gap", "box", "border", "round"]},
+        "bind": {"value": {"kind": "dest", "dest": "turn.submit"}},
+        "children": [
+            {
+                "type": "input",
+                "attrs": {"class": ["main"]},
+                "bind": {"value": {"kind": "field", "field": "user_message", "type": "text", "default": ""}},
+            },
+            {
+                "type": "button",
+                "attrs": {"oneshot": true, "class": ["nogrow"]},
+                "bind": {"value": {"kind": "submit", "default": "发送"}},
+            },
+        ],
     })
 }
 
@@ -1548,6 +1604,27 @@ impl Doors for VenueDoors<'_, '_> {
 /// One POST to k10r, with the door's answer as the tool result and its refusal
 /// as the error text (a 4xx is the caller's mistake to read, not a turn
 /// failure).
+/// THE MEMBER'S FIRST CHANNEL — the answer to "which conversation" when the caller is a page
+/// and the channel is the application's own fact. k10r serves it (`GET /members/{id}/channels`,
+/// one row per membership), and taking the first is the honest default for a deployment that
+/// has not yet built the channel list a person would switch in.
+fn first_channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
+    let url = format!("{store_url}/members/{member}/channels");
+    let resp = ureq::get(&url)
+        .call()
+        .with_context(|| format!("turn: asking the store which channels {member} is in failed"))?;
+    let rows: Value =
+        serde_json::from_reader(resp.into_reader()).context("turn: bad channel list")?;
+    rows.as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find_map(|row| row.get("channel_id").and_then(Value::as_u64))
+        })
+        .with_context(|| {
+            format!("turn: {member} is in no channel — a turn needs a conversation to write into")
+        })
+}
+
 fn post_json(url: &str, body: &Value) -> Result<Value, String> {
     match ureq::post(url).send_json(body.clone()) {
         Ok(resp) => resp

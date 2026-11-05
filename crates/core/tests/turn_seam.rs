@@ -96,7 +96,7 @@ async fn turn_with(
 /// prompt assembly (roles + contents round-trip).
 async fn seam_contract(store: &dyn MemorySurface) {
     let ch = 7;
-    let m = gravity_core::surface::DEFAULT_MEMBER;
+    let m = gravity_core::surface::default_member();
 
     // A failed turn leaves no trace.
     let err = turn_with(
@@ -175,7 +175,7 @@ async fn http_surface_contract() {
 async fn head_is_rendered_by_both_surfaces() {
     // k10r's head reads the channel's MEMBER nodes (`member-<channel>-<member>`),
     // so the corpus hangs the fact there.
-    let member = mem_core::channel::member_node(7, gravity_core::surface::DEFAULT_MEMBER);
+    let member = mem_core::channel::member_node(gravity_core::surface::default_member());
     let tuple = || {
         FactTuple::from_json(&format!(
             r#"["{member}","person",{{}},"PREFERS",{{}},"简洁","style",{{}}]"#
@@ -196,7 +196,7 @@ async fn head_is_rendered_by_both_surfaces() {
         .await
         .unwrap();
     let local = in_process
-        .fetch_session(7, gravity_core::surface::DEFAULT_MEMBER)
+        .fetch_session(7, gravity_core::surface::default_member())
         .await
         .unwrap();
 
@@ -229,7 +229,7 @@ async fn head_is_rendered_by_both_surfaces() {
         .await
         .unwrap();
     let remote = http
-        .fetch_session(7, gravity_core::surface::DEFAULT_MEMBER)
+        .fetch_session(7, gravity_core::surface::default_member())
         .await
         .unwrap();
 
@@ -270,7 +270,7 @@ async fn checkpoint_flows_through_surface() {
         .unwrap();
     let surface = InProcessSurface::wrap(stores);
     let view = surface
-        .fetch_session(3, gravity_core::surface::DEFAULT_MEMBER)
+        .fetch_session(3, gravity_core::surface::default_member())
         .await
         .unwrap();
     assert_eq!(view.coverage_ts, 100);

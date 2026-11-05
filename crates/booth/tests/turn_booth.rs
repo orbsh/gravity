@@ -328,6 +328,10 @@ async fn mem_server_with_compression() -> String {
     format!("http://{addr}")
 }
 
+/// The ONE member this fixture writes as: k10r's default member (its uuid is all zeros with a
+/// trailing 1). Member ids are identities since k10r ADR-0025 — "1" is a uuid, not a counter.
+const TEST_MEMBER: &str = "00000000-0000-0000-0000-000000000001";
+
 /// The caller's payload. `event` is the data protocol's name for its chunks — gravity owns
 /// no event names, so a consumer that wants `{"delta": …}` says what to call it.
 fn turn_args(msg: &str) -> Value {
@@ -335,7 +339,7 @@ fn turn_args(msg: &str) -> Value {
         // What the page knows: the conversation it is in, the text, and the output shape it wants.
         // The deployment facts (store, scope, model recipe) are the application's own rows now.
         "channel_id": 7,
-        "member_id": 1,
+        "member_id": TEST_MEMBER,
         "user_message": msg,
         "event": "turn.delta",
     })
@@ -569,7 +573,7 @@ async fn a_turn_takes_the_next_round_while_it_is_still_running() {
     settle(&seen).await;
 
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
-    let quick = surface.fetch_session(8, 1).await.unwrap();
+    let quick = surface.fetch_session(8, gravity_core::surface::default_member()).await.unwrap();
     assert_eq!(
         quick
             .increment
@@ -644,7 +648,7 @@ async fn the_exchange_lands_after_the_stream_ends() {
     // and the answer are two rows of the same turn, each with the clock it was
     // written on, and the turn is CLOSED — that is what makes them readable.
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
-    let view = surface.fetch_session(7, 1).await.unwrap();
+    let view = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     assert_eq!(view.increment.len(), 2, "question and answer, nothing else");
     assert_eq!(view.increment[0].1.role.as_deref(), Some("user"));
     assert_eq!(view.increment[0].1.content, "hi");
@@ -698,7 +702,7 @@ async fn failed_provider_appends_nothing() {
     );
 
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
-    let view = surface.fetch_session(7, 1).await.unwrap();
+    let view = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     assert!(view.increment.is_empty(), "a failed turn appends nothing");
 }
 
@@ -1051,7 +1055,7 @@ async fn two_calls_in_one_round_reach_the_model_as_one_round() {
     // directly after the assistant's `tool_calls` and would be rejected three
     // turns later. The line is self-describing so a reader is not parsing it.
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
-    let view = surface.fetch_session(7, 1).await.unwrap();
+    let view = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     // The whole KEY, not the sub: since k10r ADR-0024 a row's position is
     // `(turn, ts_ms, sub)`, and each row carries the clock it was written on.
     type Row = ((u64, u64), Option<String>, u8, String);
@@ -1128,7 +1132,7 @@ async fn a_provider_that_never_stops_asking_for_tools_fails_the_turn() {
     // Nothing appended: a turn that never produced content is not an
     // exchange (the oldest rule, through the loop's failure path).
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
-    let view = surface.fetch_session(7, 1).await.unwrap();
+    let view = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     assert!(view.increment.is_empty(), "a failed turn appends nothing");
 }
 
@@ -1163,7 +1167,7 @@ async fn the_compression_branch_lands_the_served_summary() {
         .unwrap();
     assert_eq!(deltas.join(""), "hello world", "the answer still streams");
 
-    let view = surface.fetch_session(7, 1).await.unwrap();
+    let view = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     assert_eq!(
         view.summary.as_deref(),
         Some("compressed span"),
@@ -1203,7 +1207,7 @@ async fn the_cut_the_pass_chooses_lands_beside_the_summary() {
         .unwrap();
 
     let raw: Value = ureq::get(&format!(
-        "{store_url}/channels/7/members/1/session?format=plaintext"
+        "{store_url}/channels/7/members/{TEST_MEMBER}/session?format=plaintext"
     ))
     .call()
     .unwrap()
@@ -1286,7 +1290,7 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
         json!({
             "name": "ui:turn.submit",
             "device": device,
-            "sender": { "device": device },
+            "sender": { "device": device, "user": TEST_MEMBER },
             "data": view_args("hi"),
         }),
     )
@@ -1395,7 +1399,7 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
 
     // And the exchange landed: the stream was live enough to be a turn.
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
-    let view = surface.fetch_session(7, 1).await.unwrap();
+    let view = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     assert_eq!(
         view.increment
             .last()
@@ -1423,7 +1427,7 @@ async fn the_shell_declares_the_conversation() {
         json!({
             "name": "ui:connect",
             "device": device,
-            "sender": { "device": device },
+            "sender": { "device": device, "user": TEST_MEMBER },
             "data": { "device": device },
         }),
     )
@@ -1967,7 +1971,6 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
     // uplink is the request (`gravity-model`). The save forms are the ones with a row behind them.
     // The forms live on the management PAGE now, so the search covers every frame's tree.
     let forms: Vec<Value> = frames.iter().flat_map(|f| forms_in(&f["data"]))
-        .into_iter()
         .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
         .collect();
     assert_eq!(forms.len(), 2, "one form per table: {forms:?}");
@@ -2044,7 +2047,6 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
         "one tree per answer — the rest are the pages and the bar's items: {frames:?}"
     );
     let redrawn: Vec<Value> = frames.iter().flat_map(|f| forms_in(&f["data"]))
-        .into_iter()
         .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
         .collect();
     assert_eq!(redrawn.len(), 2, "the second ask did not stack a second pair: {redrawn:?}");
@@ -2157,7 +2159,7 @@ async fn a_cold_call_compacts_the_rounds_it_already_used() {
 
     // And the history still holds one row per successful call, compaction or not.
     let surface = gravity_core::surface::HttpSurface::new(&store_url);
-    let view = surface.fetch_session(7, 1).await.unwrap();
+    let view = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     let rows: Vec<(Option<String>, String)> = view
         .increment
         .iter()

@@ -16,7 +16,7 @@ use anyhow::Context;
 use mem_core::channel::MessageKey;
 /// mem-core's single-member default, re-exported so drivers need no
 /// mem-core dependency for one constant.
-pub use mem_core::channel::DEFAULT_MEMBER;
+pub use mem_core::channel::{DEFAULT_MEMBER_NAME, default_member};
 
 /// How k10r represents a memory answer (ADR-0010 §5).
 ///
@@ -213,7 +213,8 @@ pub trait MemorySurface: Send + Sync {
     async fn fetch_session(
         &self,
         channel_id: u64,
-        member_id: u64,
+        // k10r's member id is the user's uuid (k10r ADR-0025): an identity, not a counter.
+        member_id: mem_core::Uuid7,
     ) -> anyhow::Result<SessionProjection>;
 
     /// Append one log entry; returns the full key (the delta record).
@@ -277,7 +278,7 @@ impl MemorySurface for InProcessSurface {
     async fn fetch_session(
         &self,
         channel_id: u64,
-        member_id: u64,
+        member_id: mem_core::Uuid7,
     ) -> anyhow::Result<SessionProjection> {
         // ONE lock order (channel, then graph) — the same order the mem-server
         // door takes, so an in-process deployment cannot deadlock where HTTP
@@ -413,7 +414,7 @@ impl MemorySurface for HttpSurface {
     async fn fetch_session(
         &self,
         channel_id: u64,
-        member_id: u64,
+        member_id: mem_core::Uuid7,
     ) -> anyhow::Result<SessionProjection> {
         #[derive(serde::Deserialize)]
         struct KeyDto {

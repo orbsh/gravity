@@ -27,7 +27,7 @@ fn pointer(turn_id: u64, ts_ms: u64, sub: u16) -> mem_core::Pointer {
 /// (channel 7, member 1 — the node k10r names `member-7-1`), so the head
 /// block participates in the byte comparison.
 fn user_fact() -> FactTuple {
-    let member = mem_core::channel::member_node(7, 1);
+    let member = mem_core::channel::member_node(gravity_core::surface::default_member());
     FactTuple::from_json(&format!(
         r#"["{member}","person",{{}},"PREFERS",{{}},"简洁","style",{{}}]"#
     ))
@@ -83,7 +83,7 @@ async fn same_state_assembles_byte_identical_views() {
     stores.graph.ingest(1, &user_fact()).unwrap();
     let surface = InProcessSurface::wrap(stores);
     assert!(
-        !surface.fetch_session(7, 1).await.unwrap().head.is_empty(),
+        !surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap().head.is_empty(),
         "the head is part of the bytes under test"
     );
 
@@ -102,11 +102,11 @@ async fn same_state_assembles_byte_identical_views() {
         .await
         .unwrap();
 
-    let v1 = surface.fetch_session(7, 1).await.unwrap();
+    let v1 = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     let p1 = render(&assemble(&v1, "second question"));
 
     // Fetch + assemble again — NO state change between.
-    let v2 = surface.fetch_session(7, 1).await.unwrap();
+    let v2 = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     let p2 = render(&assemble(&v2, "second question"));
     assert_eq!(p1, p2, "same state must assemble byte-identical prompts");
 
@@ -124,7 +124,7 @@ async fn same_state_assembles_byte_identical_views() {
     let status = reqwest::Client::new()
         .post(format!("http://{addr}/memories/1"))
         .json(&serde_json::json!([[
-            mem_core::channel::member_node(7, 1),
+            mem_core::channel::member_node(gravity_core::surface::default_member()),
             "person",
             {},
             "PREFERS",
@@ -147,7 +147,7 @@ async fn same_state_assembles_byte_identical_views() {
     http.append_message(7, 200, 0, role::TOOL, kind::TEXT, "tool observation")
         .await
         .unwrap();
-    let v3 = http.fetch_session(7, 1).await.unwrap();
+    let v3 = http.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     let p3 = render(&assemble(&v3, "second question"));
     assert_eq!(
         p1, p3,
@@ -167,7 +167,7 @@ async fn appended_history_is_prefix_stable() {
         .append_message(7, 100, 0, role::USER, kind::TEXT, "q1")
         .await
         .unwrap();
-    let v1 = surface.fetch_session(7, 1).await.unwrap();
+    let v1 = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     let p1 = render(&assemble(&v1, "a1"));
 
     // The turn lands: user + assistant appended (one ts, subs 0/1 —
@@ -180,7 +180,7 @@ async fn appended_history_is_prefix_stable() {
         .append_message(7, 150, 1, role::ASSISTANT, kind::TEXT, "r1")
         .await
         .unwrap();
-    let v2 = surface.fetch_session(7, 1).await.unwrap();
+    let v2 = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     let p2 = render(&assemble(&v2, "q2"));
 
     assert!(
@@ -212,7 +212,7 @@ async fn checkpoint_compression_rewrites_the_view_deliberately() {
         .append_message(7, 200, 0, role::USER, kind::TEXT, "new q")
         .await
         .unwrap();
-    let before = surface.fetch_session(7, 1).await.unwrap();
+    let before = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     let p_before = render(&assemble(&before, "next"));
 
     // Now the compression side's write, through a fresh handle on the
@@ -225,7 +225,7 @@ async fn checkpoint_compression_rewrites_the_view_deliberately() {
         .append_checkpoint(7, pointer(1, 100, 0), "compressed summary", &[])
         .unwrap();
     let surface2 = InProcessSurface::wrap(stores);
-    let after = surface2.fetch_session(7, 1).await.unwrap();
+    let after = surface2.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
     let p_after = render(&assemble(&after, "next"));
 
     assert_ne!(p_before, p_after, "the swap is the deliberate rewrite");

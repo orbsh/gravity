@@ -23,7 +23,8 @@ pub mod turn;
 #[derive(Clone, Debug)]
 pub struct TurnInput {
     pub channel_id: u64,
-    pub member_id: u64,
+    /// The speaker: k10r's member id, which IS the user's uuid (k10r ADR-0025).
+    pub member_id: mem_core::Uuid7,
     pub user_message: String,
 }
 
