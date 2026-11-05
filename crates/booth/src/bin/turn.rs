@@ -255,17 +255,32 @@ enum Out<'a> {
     Data(&'a str),
 }
 
-fn out_of(args: &Value) -> anyhow::Result<Out<'_>> {
+/// Whether a turn DRAWS its answer, decided in ONE place for both the frames and the end.
+///
+/// Three inputs, and the order matters. An explicit `protocol` is the caller's word. Failing
+/// that, an `event` is a request for deltas — a program that names the event its chunks are
+/// spoken as has already said which of the two it wants, and the CLI and prism's turn test send
+/// exactly that. With neither marker the turn DRAWS, because a page is the one caller that
+/// cannot say so: a form's uplink carries its fields and nothing else (fluxen builds
+/// `{field: {data, payload}}`), so demanding a protocol of it would mean a hidden field whose
+/// only job is to tell the application what kind of surface is looking at it.
+fn draws(args: &Value) -> bool {
     match args.get("protocol").and_then(Value::as_str) {
-        // `fluxen` says "draw it"; the drawing itself is the application's, so nothing
-        // else is asked of the caller.
-        Some("fluxen") => Ok(Out::View),
-        _ => Ok(Out::Data(
-            args.get("event")
-                .and_then(Value::as_str)
-                .context("turn: a delta consumer must name the `event` its chunks are spoken as")?,
-        )),
+        Some("fluxen") => true,
+        Some("data") => false,
+        _ => args.get("event").and_then(Value::as_str).is_none(),
     }
+}
+
+fn out_of(args: &Value) -> anyhow::Result<Out<'_>> {
+    if draws(args) {
+        return Ok(Out::View);
+    }
+    Ok(Out::Data(
+        args.get("event")
+            .and_then(Value::as_str)
+            .context("turn: a delta consumer must name the `event` its chunks are spoken as")?,
+    ))
 }
 
 /// One venue emit. `name` is the recipient event — a compiled view body is not told which
@@ -374,6 +389,19 @@ fn payload(envelope: &Value) -> &Value {
         .unwrap_or(envelope)
 }
 
+/// ONE field, TWO shapes: a page's form sends every field as `{data, payload}` (fluxen's message
+/// envelope, the same shape `write_row` unwraps for the deployment forms), while a CLI, a sibling
+/// booth or a test sends the bare string. Unwrapping here is what lets the composer's own words
+/// reach a turn that a direct caller reaches by typing them — read this and the settings form's
+/// unwrap as the same rule, not two exceptions.
+fn text_field(args: &Value, name: &str) -> Option<String> {
+    let value = args.get(name)?;
+    match value.get("data").unwrap_or(value) {
+        Value::String(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
 /// WHO asked: the envelope's sender device. It is also the recipient of every frame this
 /// turn draws — one conversation, one device, and no channel in between (prism ADR-0018).
 fn device_of(envelope: &Value) -> Option<String> {
@@ -399,10 +427,7 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
     let user = sender_user(envelope);
     let args = payload(envelope);
-    let drawing = args
-        .get("protocol")
-        .and_then(Value::as_str)
-        .is_some_and(|protocol| protocol == "fluxen");
+    let drawing = draws(args);
     // AN EVENT-ROUTED SUBMIT HAS NO ANSWER IT CAN READ: a delivery discards a return value, so its
     // end is SAID, not returned. A direct caller (iterate/call — no envelope `name`) still reads the
     // terminal value, which is what ADR-0009 states for the data protocol. The drawing caller is
@@ -507,11 +532,8 @@ fn turn(
             .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))
             .context("turn: no `sender.user` on the envelope and no `member_id` in the args —                       a page is identified by the venue, a direct caller names its member")?,
     };
-    let user_message = args
-        .get("user_message")
-        .and_then(Value::as_str)
-        .context("turn: missing `user_message`")?
-        .to_string();
+    let user_message = text_field(args, "user_message")
+        .context("turn: missing `user_message`")?;
     let mut turn = Turn {
         args,
         // Filled in below, the moment the store mints one: a turn that never opens its
@@ -688,11 +710,7 @@ fn turn(
     // bubble that reads it. The question is in `args` from the start, so a renderer that
     // knows nothing but operations can draw the send immediately.
     if matches!(out, Out::View) {
-        let ask = turn
-            .args
-            .get("user_message")
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let ask = text_field(turn.args, "user_message");
         let frames = frames_open(&turn.id, ask.as_deref());
         if !frames.is_empty() {
             emit(ctx, UI_EVENT, device, Some(&turn.id), json!(frames))?;
