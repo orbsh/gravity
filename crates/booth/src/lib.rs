@@ -55,6 +55,11 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 // knows devices and users; a channel is an application's business). One
                 // device, one turn at a time.
                 .on_as("ui:turn.submit", "device", "turn")
+                // THE DECLARATION CARRIES ITS OWN GATE: this event is served only to a sender
+                // with a bound user, and the flag rides the `on_as` that already names the event,
+                // the key and the entry (prism ADR-0017 §2). Written once, here — the guest names
+                // only the entry, so a table in the guest keyed by event would repeat this name.
+                .gated()
                 // WHERE A DEPLOYMENT IS CONFIGURED: the facts are rows in this type's ns, so the
                 // door that writes them is an event too (auth: `ui:gravity-model.save`). A venue
                 // never learns the word — this is the application's own vocabulary, as much as
@@ -66,10 +71,12 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 // so the instance is `unbounded` — no queue, no second process.
                 .unbounded()
                 .on_as("ui:gravity-model.save", "device", "save")
+                .gated()
                 // And the SCREEN (ADR-0007 §4: management is a view). It draws forms whose buttons
                 // emit the save event above, so the vocabulary is discoverable from the venue
                 // itself and an AI drives exactly what a person clicks.
                 .on_as("ui:gravity-model", "device", "screen")
+                .gated()
                 // The shell a renderer connects to: the layout is the application's answer, and
                 // this booth is the application in this stack.
                 .on_as("ui:connect", "device", "shell"),

@@ -51,16 +51,10 @@ fn main() -> anyhow::Result<()> {
         // previous turn is still streaming. The state a round needs is its own
         // stack and its own streams — nothing is shared between rounds.
         .concurrent(true)
-        // The per-handler auth declaration (prism's gate reads it): the turn needs a
-        // bound user — the SAME declaration face the echo plane enforces, no second ACL
-        // table. The key is the EVENT the venue's gate names (ADR-0045: a declaration
-        // binds an entry, so event and entry may differ — `ui:turn.submit` here,
-        // `turn` there).
-        .auth(json!({
-            "ui:turn.submit": true,
-            "ui:gravity-model.save": true,
-            "ui:gravity-model": true,
-        }))
+        // AUTH IS NOT DECLARED HERE: the guest names ENTRY points (`turn`, `save`), and the
+        // event each one serves is bound host-side (`gravity_booth::register`'s `on_as`), which
+        // is where `.gated()` sits. The event name is written once, at the declaration that
+        // knows it — a table here keyed by event would be the same name written twice.
         // ONE HANDLER. The venue's word for "run a turn" reaches this booth as a
         // subscription and the realm names the instance by the same address, so the
         // handler runs the turn to its end. There is no producer binding: a stream this
