@@ -1040,7 +1040,7 @@ fn frame_root(forms: Vec<Value>) -> Vec<Value> {
             "data": {
                 "type": "case",
                 "attrs": {"class": ["maximize", "col"]},
-                "children": [frame_navbar(), frame_pager(), frame_notice()],
+                "children": [frame_navbar(), frame_pager(), frame_auth(), frame_notice()],
             },
         }),
         // The pages, as a dictionary: a row's `id` IS its key, and the bar selects by it.
@@ -1115,6 +1115,18 @@ fn frame_navbar() -> Value {
                     },
                     "options": {"kind": "source", "source": TABS_SLOT},
                 },
+            },
+            // THE PLATFORM'S ONE CONTROL: it says only "open the region" — prism's auth booth draws
+            // whatever goes in it, so the application never holds a login form (ADR-0017 §2).
+            {
+                "type": "form",
+                "attrs": {"class": ["nogrow"]},
+                "bind": {"value": {"kind": "dest", "dest": "auth.request"}},
+                "children": [{
+                    "type": "button",
+                    "attrs": {"oneshot": true},
+                    "bind": {"value": {"kind": "submit", "default": "登录"}},
+                }],
             },
         ],
     })
@@ -1270,6 +1282,28 @@ const TABS_SLOT: &str = "tabs";
 
 /// The menu under the scene: the deployment appends rows, in its own vocabulary.
 const MENU_SLOT: &str = "menu";
+
+/// THE PLATFORM'S ONE RESERVED REGION: whoever proves credentials draws here. prism's auth booth
+/// answers `ui:auth.request` with a `set` into this slot (ADR-0017 §2), so the shell declares the
+/// region — and knows nothing else about login, which is what keeps the form reusable.
+const AUTH_SLOT: &str = "auth";
+
+/// THE PLATFORM'S REGION, AS AN OVERLAY. A `placeholder` is the node that RENDERS a data slot as a
+/// live node (a plain `case` has no such binding), so the auth booth's `set` lands here and the
+/// renderer fades it in. The shell names the slot and nothing else — the form, the fields and the
+/// verb behind them are the platform's.
+fn frame_auth() -> Value {
+    json!({
+        "type": "float",
+        "attrs": {"class": ["auth"]},
+        "children": [{
+            "type": "placeholder",
+            "id": "auth-region",
+            "attrs": {"class": ["--auth"]},
+            "bind": {"value": {"kind": "source", "source": AUTH_SLOT}},
+        }],
+    })
+}
 
 fn frame_notice() -> Value {
     json!({
