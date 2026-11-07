@@ -9,7 +9,7 @@ owed is named under Consequences.
 
 ## Context
 
-Gravity is the turn executor: fetch the session projection → the LLM call and
+Gravity is the turn booth: fetch the session projection → the LLM call and
 its tool-call loop → append the delta. Phase 2 landed the loop. Two questions
 were left open, and the second one has a deadline built into the product.
 

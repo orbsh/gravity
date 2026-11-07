@@ -2,7 +2,9 @@
 
 Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and in this repo's ADRs (`docs/adr/`: 0001 — the execution surface, 0002 — the CLI form, 0003 — the skill execution shape); this file only sequences phases.
 
-## Milestone A — Local turn executor
+RENAMED 2026-11-07: `turn executor` reads `turn booth`, and the test trait `ToolExecutor` reads `ToolDispatch`. The platform's `executor` (one booth instance's live execution unit, on effector/aura) is a different concept and does not appear in this repo.
+
+## Milestone A — Local turn booth
 
 - [x] Phase 0 — Workspace skeleton: `crates/{core,cli,config}`. One happy-path turn: fetch_session (the projection) → LLM call → append delta. No tools yet; plain chat against Krystallizer.
   LANDED 2026-10-10: `MemorySurface` seam (in-process `ChannelStore` wrap / mem-server `HttpSurface` — ADR-0007 as revised: HTTP is the single cross-process form, in-process is a local detail); config takes `store_path` or `store_url` (store_url wins); turn contract tests run the same assertions through BOTH surfaces against a real mem-server (failed turn appends nothing, one-ts-two-subs delta, checkpoint pruning flows through the seam). Turn body copy in the seam test stands in for the LLM stub until LlmClient grows an injectable transport (Phase 1).
@@ -341,7 +343,7 @@ critical path).
   LANDED 2026-10-26: `crates/cli` is a WS client of prism and nothing else — no `gravity-core` dependency, so the local for-loop is gone with it (the turn function's ONE home is the booth; `gravity-core::turn` stays as the reference implementation the booth's contract tests ride). It sends `login` and falls back to `signup` once (a fresh venue has no account; the password is the same secret either way), then `turn.submit` per positional argument (`-` reads stdin as ONE turn), streams `turn.delta`…`turn.done`, and maps the four failure classes to ADR-0002's exit codes: 0 done, 2 usage/config, 3 auth, 4 turn failed, 5 venue unreachable. Ctrl-C and `--cancel-after-ms` both send `turn.cancel` — the venue's own verb — instead of leaving a turn running behind a dead socket. Deployment facts ride a new `venue { url, username, password_env }` config node (the password in the env var that field NAMES); the LLM fields became optional because a client config has no endpoint of its own. Residual, narrowed 2026-10-26: the CLI has been driven against a stub venue (its own test) and prism's `turn_e2e` covers the real server side; the gap between those two — the SHIPPED binary on a SHIPPED gateway — is now `scripts/smoke-venue.sh`, which boots a stub provider, k10r's mem-server, prism and the CLI, then asserts both the reply on stdout and the message pair k10r recorded (`["hi", "hello world"]`, read back over the HTTP door). It closes the "does the built thing work" question; what stays open is running it as a GATE: it needs the three repos built and three fixed ports, which no `cargo test` can assume, so CI wiring is still named-work. Gates: gravity 30/0 (5 new CLI tests: two turns from two arguments, exit 3/4/5, the cancel verb), clippy 0 for the touched crates.
 LANDED 2026-10-29 (the guest half): `protocol` rides the turn's args. Absent or `data` = the
 raw deltas every non-UI consumer reads (unchanged). `fluxen` = Accrete view frames, and the
-CALLER declares the slots (`slots: {rack, text}`) because the executor has no layout and must
+CALLER declares the slots (`slots: {rack, text}`) because the booth has no layout and must
 not invent names for one. Round 0 sends one batch — the user's line, the text region (`set`),
 the answer bubble reading that region, and the first chunk; every later round is one `patch`
 into the region. The envelope's `item` carries `frames` instead of `delta`, so a consumer

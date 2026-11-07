@@ -1,5 +1,5 @@
 //! The tool-call loop's contract (PLAN Phase 2): parse the LLM's tool
-//! calls → dispatch each through the injectable executor → feed the
+//! calls → dispatch each through the injectable dispatcher → feed the
 //! results back as `role: "tool"` messages for the next inference
 //! round. Failure is a value into the next round (a tool failure is
 //! not a turn failure); the delta boundary is the loop's own — the
@@ -9,10 +9,10 @@
 use gravity_core::tool::{parse_tool_calls, ToolDispatch, ToolResultMessage};
 use serde_json::{json, Value};
 
-/// The injectable executor: the loop drives THIS, not a concrete
+/// The injectable dispatcher: the loop drives THIS, not a concrete
 /// transport — the aura `ctx.invoke` face and the test stub are both
 /// just impls.
-trait ToolExecutor {
+trait Dispatcher {
     fn dispatch(&mut self, call: &ToolDispatch) -> anyhow::Result<String>;
 }
 
@@ -20,7 +20,7 @@ trait ToolExecutor {
 /// dispatches and the fed-back result messages.
 fn run_round(
     chunk: &Value,
-    executor: &mut dyn ToolExecutor,
+    dispatcher: &mut dyn Dispatcher,
 ) -> anyhow::Result<Vec<ToolResultMessage>> {
     let calls = parse_tool_calls(chunk)?;
     let mut results = Vec::new();
@@ -33,7 +33,7 @@ fn run_round(
             target: format!("effector:local:{}", call.function.name),
             args: call.function.arguments.clone(),
         };
-        let content = match executor.dispatch(&dispatch) {
+        let content = match dispatcher.dispatch(&dispatch) {
             Ok(out) => out,
             // Failure is a value into the next inference (the tool
             // failed, not the turn — the loop continues).
@@ -47,11 +47,11 @@ fn run_round(
     Ok(results)
 }
 
-struct StubExecutor {
+struct StubDispatcher {
     outcomes: Vec<Result<String, String>>,
 }
 
-impl ToolExecutor for StubExecutor {
+impl Dispatcher for StubDispatcher {
     fn dispatch(&mut self, call: &ToolDispatch) -> anyhow::Result<String> {
         assert_eq!(call.target, format!("effector:local:{}", call.name));
         self.outcomes.remove(0).map_err(|e| anyhow::anyhow!(e))
@@ -101,10 +101,10 @@ fn results_feed_back_with_call_ids() {
             {"id": "c2", "function": {"name": "boom", "arguments": "{}"}},
         ]
     });
-    let mut executor = StubExecutor {
+    let mut dispatcher = StubDispatcher {
         outcomes: vec![Ok("file contents".into()), Err("permission denied".into())],
     };
-    let results = run_round(&chunk, &mut executor).unwrap();
+    let results = run_round(&chunk, &mut dispatcher).unwrap();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].tool_call_id, "c1");
     assert_eq!(results[0].content, "file contents");

@@ -21,7 +21,7 @@ pub use mem_core::channel::{DEFAULT_MEMBER_NAME, default_member};
 /// How k10r represents a memory answer (ADR-0010 §5).
 ///
 /// `struct` is deliberately NOT a variant: it hands back the fact DATA for a
-/// consumer that assembles the graph itself, and the turn executor does no
+/// consumer that assembles the graph itself, and the turn booth does no
 /// such assembly — the renderer is k10r's. A deployment that configures
 /// `struct` is a configuration error, surfaced at once ([`Self::from_config`])
 /// rather than discovered as a decode failure on the first turn.
@@ -38,7 +38,7 @@ pub enum MemoryFormat {
 
 impl MemoryFormat {
     /// Parse a configured value. Absent means the default; `struct` is
-    /// refused BY NAME with the reason, because the executor cannot use it.
+    /// refused BY NAME with the reason, because the booth cannot use it.
     pub fn from_config(raw: Option<&str>) -> anyhow::Result<Self> {
         match raw {
             None => Ok(Self::default()),
@@ -46,7 +46,7 @@ impl MemoryFormat {
             Some("markdown") => Ok(Self::Markdown),
             Some("mermaid") => Ok(Self::Mermaid),
             Some("struct") => anyhow::bail!(
-                "memory format `struct` is not usable by the turn executor: it returns \
+                "memory format `struct` is not usable by the turn booth: it returns \
                  the fact data for a caller that assembles the graph itself, and gravity \
                  injects k10r's rendering"
             ),

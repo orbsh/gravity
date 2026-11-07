@@ -546,7 +546,7 @@ fn turn(
 
     // 1. The session projection (mem-server's SessionDto shape). The head's
     // representation is the deployment's choice, and `struct` is refused
-    // here: it returns the fact DATA, which this executor does not assemble.
+    // here: it returns the fact DATA, which this booth does not assemble.
     let format = MemoryFormat::from_config(Some(turn.memory_format.as_str()))
         .context("turn: the configured memory format is unusable")?;
     let url = format!(
@@ -2314,7 +2314,7 @@ fn file_composition(store_url: &str, scope: u64, walked: &[gravity_booth::tools:
 
 /// The tasks a turn must know about, as one system block. `None` when none are
 /// owed or the store cannot answer: an empty preamble is noise, and a store error
-/// is not this executor's to report.
+/// is not this booth's to report.
 fn fetch_tasks(store_url: &str, scope: u64) -> Option<Vec<Value>> {
     let resp = ureq::get(&format!("{store_url}/tasks/{scope}"))
         .call()

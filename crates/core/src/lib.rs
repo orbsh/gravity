@@ -1,4 +1,4 @@
-//! gravity-core — the turn executor (ADR-0006/0008's stateless loop).
+//! gravity-core — the turn booth's stateless loop (ADR-0006/0008).
 //!
 //! One turn = one execution: fetch the session projection (krystallizer)
 //! → run the LLM + tool-call loop → append the delta. The loop holds NO

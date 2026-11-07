@@ -37,14 +37,14 @@ impl HostOps for Ops {
             // the provider (the realm does the same unwrapping).
             let inner = args.get("args").cloned().unwrap_or_else(|| args.clone());
             let frame = CallFrame::iterate(1, kind, "stream", inner, sid);
-            proc.session
+            proc.link
                 .writer
                 .write_line(&frame.to_line(), std::time::Duration::from_secs(5))
                 .await
                 .then_some(())
                 .ok_or("write stalled".to_string())?;
             let line = proc
-                .session
+                .link
                 .reader
                 .next_line(std::time::Duration::from_secs(5))
                 .await
@@ -81,7 +81,7 @@ async fn wait_result(
     use induction_protocol::parse_guest_line;
     loop {
         let line = turn
-            .session
+            .link
             .reader
             .next_line(std::time::Duration::from_secs(5))
             .await
@@ -98,7 +98,7 @@ async fn wait_result(
                 // A host arm — serve it through the shared dispatcher.
                 let routed = route_line(ops, &line).await;
                 if let induction_host::Routed::Reply(reply) = routed {
-                    turn.session
+                    turn.link
                         .writer
                         .write_line(&reply.to_line(), std::time::Duration::from_secs(5))
                         .await;
@@ -121,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
     let ops_ref = ops.as_ref();
 
     let mut turn = spawn(&Spec::new("t", ["target/debug/gravity-turn".to_string()]))?;
-    turn.session.handshake(Budgets::default().handshake).await;
+    turn.link.handshake(Budgets::default().handshake).await;
     // Start the turn stream with real args.
     let args = json!({
         "round": 0,
@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         args,
         "t1".to_string(),
     );
-    turn.session
+    turn.link
         .writer
         .write_line(&frame.to_line(), Budgets::default().write)
         .await;
@@ -154,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
             json!({}),
             "t1".to_string(),
         );
-        turn.session
+        turn.link
             .writer
             .write_line(&frame.to_line(), Budgets::default().write)
             .await;

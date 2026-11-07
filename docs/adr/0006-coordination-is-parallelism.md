@@ -2,7 +2,7 @@
 
 > **Languages:** [English](0006-coordination-is-parallelism.md) (primary) · [中文](0006-coordination-is-parallelism.zh-CN.md)
 
-**Status:** Accepted (2026-10-28). A standing constraint on the turn executor; no implementation work of its own.
+**Status:** Accepted (2026-10-28). A standing constraint on the turn booth; no implementation work of its own.
 **Date:** 2026-10-28
 
 ## Context

@@ -39,7 +39,7 @@ pub fn render_owed(tasks: &[Value]) -> Option<String> {
             block.push_str(&format!(" - {next}"));
         }
         // A bound task closes ITSELF when its code row runs (ADR-0003 §3). Saying
-        // so here is what keeps the model from moving work the executor is about
+        // so here is what keeps the model from moving work the booth is about
         // to close, and from waiting on a `move_task` nobody needs to make.
         let bound: Vec<String> = task
             .get("finishes_on")

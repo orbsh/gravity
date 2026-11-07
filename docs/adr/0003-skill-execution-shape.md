@@ -42,7 +42,7 @@ history never edits the graph's topology.**
    the caller's code can express does not need a second interpreter: the script
    is delivered as an argument (ADR-0001), it calls the sibling steps through
    ctx, and the composition is visible in one place. A flow engine's ceiling is
-   its own vocabulary, while code is Turing-complete on an executor that already
+   its own vocabulary, while code is Turing-complete on a mount that already
    exists — and the model writes code better than it writes a flow DSL.
 2. **Glue rides a mount whose carrier is `induction`.** The ctx bridge is a
    channel, and the one-shot `exec` carrier has none by contract (one JSON
@@ -65,7 +65,7 @@ history never edits the graph's topology.**
    refused step writes nothing. The tool result reports what it closed
    (`finished_tasks`), because the model must not be surprised by work
    disappearing from its list, and the step's own document rides whole under
-   `result`: the executor does not edit the script's answer.
+   `result`: the booth does not edit the script's answer.
 4. **The pre-dispatch gate is code, and inside a turn it reads memory.** Gravity
    pulls the session's open tasks, with their bindings, as its own read at turn
    start — two doors, not one: the session projection is channel state
@@ -97,7 +97,7 @@ history never edits the graph's topology.**
 
 - **A flow engine.** It buys a visible, pausable, deterministic flow diagram —
   and pays by re-expressing branch, loop and composition in a vocabulary that
-  caps at whatever the engine implements, on top of an executor that runs code.
+  caps at whatever the engine implements, on top of a mount that runs code.
   The one property it genuinely adds (the flow is inspectable) is deliverable by
   the task rows of decision 3, which are checkable data rather than a second
   interpreter.
@@ -122,7 +122,7 @@ history never edits the graph's topology.**
   caller where the skill's language and carrier are already known.
 - **Giving a mount a route/subscription declaration** (so a delivered script
   could `ctx.emit` into the realm's MQ plane and something would consume it).
-  A mount is an executor, not a publisher: it has no consumer set, and inventing
+  A mount runs code; it is not a publisher: it has no consumer set, and inventing
   one makes a deployment artifact a graph participant — the thing ADR-0001 §5
   forecloses — while opening a second, unasked-for progress channel. The
   behavior WITHOUT it is stated and pinned: an emit out of a delivered script is

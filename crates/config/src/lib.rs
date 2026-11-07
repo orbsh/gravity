@@ -1,4 +1,4 @@
-//! gravity-config — turn-executor configuration.
+//! gravity-config — the turn's configuration.
 //!
 //! Phase 0 shape: one OpenAI-compatible endpoint + model id, plus the
 //! krystallizer store path. Secrets ride environment variables
@@ -8,7 +8,7 @@
 //! Deliberately flat: no nested subsystems yet — the config grows when
 //! a second consumer (provider booth, prism transport) needs a node.
 
-/// The turn executor's configuration (Phase 0).
+/// The turn booth's configuration (Phase 0).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct GravityConfig {
     /// OpenAI-compatible chat-completions endpoint
@@ -32,7 +32,7 @@ pub struct GravityConfig {
     /// How k10r should render the memory it hands back (ADR-0010 §5):
     /// `plaintext` (the default), `markdown`, `mermaid`. `struct` is NOT
     /// accepted — it returns the fact data for a caller that assembles the
-    /// graph itself, and this executor injects k10r's rendering instead; a
+    /// graph itself, and this booth injects k10r's rendering instead; a
     /// config carrying it is refused when the turn surface is built
     /// (`MemoryFormat::from_config`, gravity-core).
     pub memory_format: Option<String>,

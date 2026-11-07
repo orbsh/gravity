@@ -9,7 +9,7 @@
 
 A turn needs five facts that belong to no request: the memory store's URL, the LLM endpoint, the model name, the name of the env var holding the key, and the scope k10r's memory doors are addressed in. Today prism assembles all of them (`crates/prism/src/turns.rs`'s `TurnConfig::from_env`) and hands them to the booth as call arguments.
 
-That is the wrong repository. Prism is a generic gateway: it authenticates a connection, parses what the page sent, and puts an event on the plane. Which model answers, at which endpoint, with which credential NAME, is not a gateway fact — it is the executor's own configuration, and a gateway that holds it turns "change the model" into "redeploy the gateway" and puts a second component's business vocabulary inside the component that is supposed to know nothing about it.
+That is the wrong repository. Prism is a generic gateway: it authenticates a connection, parses what the page sent, and puts an event on the plane. Which model answers, at which endpoint, with which credential NAME, is not a gateway fact — it is the booth's own configuration, and a gateway that holds it turns "change the model" into "redeploy the gateway" and puts a second component's business vocabulary inside the component that is supposed to know nothing about it.
 
 So the facts move to gravity. But a fact needs a place, and gravity has none: the turn guest declares no storage. The mechanism is already there — `Engine::register` introspects a script booth, persists the definition (schema included) and allocates the type's ns on the way, and the realm builds that type's `ctx.store` plan from the persisted copy — but nothing in this tree has used it: the shape is exercised by the steel-carrier fixtures, and no induction guest has declared a `storage` block yet. A Rust-body booth can never have one (a compiled handler is not persistable), which is why the test collectors print `no storage ns`. The field is where it belongs, and the field is aura: the realm's embedded store, reached from a guest through the remote-store arm that is already on the ctx (`PutDocument` / `GetDocument` / `PutFields` / `GetFields` / `Scan` / `DeleteDocument`), with rows that outlive every process and are one read away inside the turn.
 
@@ -19,7 +19,7 @@ Custody is unchanged and it constrains the shape: the KEY VALUE never leaves the
 
 **RULING — gravity owns its model configuration, and it is stored as rows in the field (aura, through the remote store), managed through an interface gravity provides. Prism passes only what the page knows.**
 
-1. **Prism keeps no model vocabulary.** No endpoint, no model name, no `key_env`, no memory scope: prism's turn implementation is deleted, and a page's submit carries what the page can know — the conversation it is in, the text, and the output shape it wants back. A deployment fact that only the executor reads belongs in the executor.
+1. **Prism keeps no model vocabulary.** No endpoint, no model name, no `key_env`, no memory scope: prism's turn implementation is deleted, and a page's submit carries what the page can know — the conversation it is in, the text, and the output shape it wants back. A deployment fact that only the booth reads belongs in the booth.
 
 2. **The facts are rows in gravity's own collection, read by the turn at its start.** One settings document (store URL, memory scope, the default model) plus a model table addressed by alias. The read is local and cheap — the store is the engine's, not a network hop — and it happens per turn because a turn is where the choice is applied.
 
@@ -43,10 +43,10 @@ Custody is unchanged and it constrains the shape: the KEY VALUE never leaves the
 
 ## Considered and rejected
 
-- **Prism injects the facts into the envelope when it routes the event** (the version this record replaces). It keeps prism's code thin in line count and wrong in kind: a gateway that carries the executor's endpoint is a gateway redeployed whenever a model changes, and the injection point is the one place where nobody would look for it.
+- **Prism injects the facts into the envelope when it routes the event** (the version this record replaces). It keeps prism's code thin in line count and wrong in kind: a gateway that carries the booth's endpoint is a gateway redeployed whenever a model changes, and the injection point is the one place where nobody would look for it.
 - **Environment variables only.** No interface for the user, no pool, no per-deployment override without a redeploy, and no way to answer "which model is answering right now" other than reading a process's environment.
 - **A configuration file inside gravity's deployment.** A file and a store disagree the first time either is edited; the store is already the mechanism the booth reads and writes as a citizen.
-- **k10r as the home.** k10r is the memory substrate — the session log, the fact graph, tasks. A model recipe is executor deployment state: it is read before a turn has any memory to consult, it is not recalled by similarity, and putting it behind the HTTP hop would make the turn's own start depend on a service the turn is about to call anyway.
+- **k10r as the home.** k10r is the memory substrate — the session log, the fact graph, tasks. A model recipe is booth deployment state: it is read before a turn has any memory to consult, it is not recalled by similarity, and putting it behind the HTTP hop would make the turn's own start depend on a service the turn is about to call anyway.
 - **Letting the page choose the model.** The page is a renderer; a model choice is a capability and a cost decision. If a user must choose per conversation, that is a row plus an affinity rule, not a field in an uplink.
 
 ## Consequences

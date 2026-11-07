@@ -40,7 +40,7 @@ pub fn turn_spec() -> String {
 /// Register the turn booth on an engine. The spawn spec names the guest binary
 /// (a deployment installs it on PATH or beside the engine's cwd — the spec is
 /// argv, resolved by the carrier's spawn; `GRAVITY_TURN_BIN` overrides for
-/// non-PATH installs and tests); the codec is the session's declared one, CBOR
+/// non-PATH installs and tests); the codec is the executor's declared one, CBOR
 /// here (high-frequency small token frames — the self-delimited document form
 /// skips the per-frame JSON quoting overhead).
 pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {

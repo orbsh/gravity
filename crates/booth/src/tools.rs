@@ -863,7 +863,7 @@ fn close_bound(
     // The step's own document is NEVER edited: it is wrapped, so a caller (or a
     // model reading the transcript) finds the script's answer whole under
     // `result`, and what the call closed beside it. Merging keys into the script's
-    // object would be this executor rewriting somebody else's answer.
+    // object would be this booth rewriting somebody else's answer.
     let mut out = json!({ "result": value });
     if let Value::Object(map) = &mut out {
         if !closed.is_empty() {
