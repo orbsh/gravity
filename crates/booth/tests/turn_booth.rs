@@ -712,13 +712,17 @@ async fn a_cancelled_turn_stops_and_closes_no_turn() {
         }
     }
     let done = done.expect("the turn said it ended");
-    // NO CLOCK ASSERTION YET, and the gap is now one link wide: the handle reaches the
-    // carrier and the hook writes the frame (measured: effector arms frame 0, the guest
-    // reads `interrupt` for id 0), yet this handler's token never rises — so the stop still
-    // lands at the chunk boundary, at the provider's own 1.5 s. The next probe is inside
-    // induction's guest: which id the call is registered under when the reader claims the
-    // interrupt. The assertion goes back the moment those two ids are the same one.
-    let _ = clicked;
+    // THE CLOCK IS THE ASSERTION: this provider holds its first byte for 1.5 s, and the
+    // connect alone takes that long (measured) — the longest stretch in a turn with no
+    // boundary in it. The interrupt rides the call into the carrier, the guest's reader
+    // raises the token, and the pump sees it on its next 50 ms tick even while the socket
+    // has not answered. Anything near the provider's own delay means the stop is still
+    // waiting for a read instead of reaching past it.
+    assert!(
+        clicked.elapsed() < Duration::from_millis(1_000),
+        "a stop inside a pull ends the turn on a tick, not after the provider's 1.5 s: {:?}",
+        clicked.elapsed()
+    );
 
     // THE END SAYS WHY, on the event a whole turn ends on: no new vocabulary, and no
     // `cancelled: true` flag a consumer could forget to read (ADR-0008 point 4).

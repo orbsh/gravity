@@ -736,14 +736,12 @@ fn turn(
     }
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
     let mut call_rows: Vec<(u64, u16)> = Vec::new();
-    let mut pump = Pump::spawn(
-        open_stream(&turn, &messages).context("turn: provider stream failed to open")?,
-    );
+    let mut pump = Pump::open(&turn, &messages);
     // A stop can land between the open and the first token: the connect is not a
     // boundary anyone reads, so the wait for it is one.
     // A stop before the first token ends the turn the same way a stop mid-stream does:
     // nothing lands, the log keeps its rows OPEN, and the caller is told `cancelled`.
-    let Some(opened) = pump.next(ctx)? else {
+    let Some(opened) = pump.next(ctx).context("turn: provider stream failed to open")? else {
         return Ok(Turned {
             reply: String::new(),
             cancelled: true,
@@ -865,8 +863,8 @@ fn turn(
                 "content": content,
             }));
         }
-        pump = Pump::spawn(open_stream(&turn, &messages).context("turn: provider re-open failed")?);
-        let Some(reopened) = pump.next(ctx)? else {
+        pump = Pump::open(&turn, &messages);
+        let Some(reopened) = pump.next(ctx).context("turn: provider re-open failed")? else {
             return Ok(Turned {
                 reply: String::new(),
                 cancelled: true,
@@ -982,14 +980,41 @@ impl Pump {
     /// that an idle stream costs nothing.
     const TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
-    fn spawn(mut live: gravity_core::llm::live::Live) -> Self {
+    /// Open the stream ON the worker, not before it. The connect is the longest
+    /// stretch with no boundary in it (measured against a provider that is slow before
+    /// its first byte: 1.5 s), and starting the worker after it left that stretch
+    /// unwatched — an interrupt raised during the open landed on a token nobody read.
+    /// The open's own failure travels the channel like any other, so there is one way
+    /// to learn what went wrong rather than two.
+    fn open(turn: &Turn<'_>, messages: &[Value]) -> Self {
+        let endpoint = turn.endpoint.clone();
+        let model = turn.model.clone();
+        let key_env = turn.key_env.clone();
+        let messages = json!(messages);
+        let tools = gravity_booth::tools::tools_array();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || loop {
-            let out = live.pull();
-            // An error ends the stream: the next pull would answer the same thing.
-            let fatal = out.is_err();
-            if tx.send(out).is_err() || fatal {
-                break;
+        std::thread::spawn(move || {
+            let opened = gravity_core::llm::live::Live::open(&gravity_core::llm::live::Request {
+                endpoint: &endpoint,
+                model: &model,
+                key_env: &key_env,
+                messages: &messages,
+                tools: Some(&tools),
+            });
+            let mut live = match opened {
+                Ok(live) => live,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            loop {
+                let out = live.pull();
+                // An error ends the stream: the next pull would answer the same thing.
+                let fatal = out.is_err();
+                if tx.send(out).is_err() || fatal {
+                    break;
+                }
             }
         });
         Self { rx }
@@ -1074,26 +1099,6 @@ fn stream_answer(
     }
 }
 
-/// Open (or reopen) the provider stream and answer its first envelope. A string reply is
-/// the provider handler's error value crossing the host bridge (errors cross as values,
-/// ADR-0012), so it fails HERE with the caller's own wording rather than at a later pull.
-fn open_stream(
-    turn: &Turn<'_>,
-    messages: &[Value],
-) -> anyhow::Result<gravity_core::llm::live::Live> {
-    // In THIS process, on THIS thread: there is no provider booth to ask, and no
-    // instance to key. A second stream (the compression branch, another device's
-    // turn) is its own thread holding its own reader.
-    gravity_core::llm::live::Live::open(&gravity_core::llm::live::Request {
-        endpoint: &turn.endpoint,
-        model: &turn.model,
-        key_env: &turn.key_env,
-        messages: &json!(messages),
-        // The fixed list (ADR-0004): the same bytes every turn, and the
-        // reason a real model can call anything at all.
-        tools: Some(&gravity_booth::tools::tools_array()),
-    })
-}
 
 /// The mount table the deployment declares: operation language → the mount type serving
 /// it (prism's manifest, carried in the turn args).
