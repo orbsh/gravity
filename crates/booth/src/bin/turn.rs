@@ -65,11 +65,6 @@ fn main() -> anyhow::Result<()> {
         // booth refuses an admin verb, so that door is an event like the turn's, behind the same
         // auth declaration.
         .on("save", |ctx: &mut Ctx, args: Value| save(ctx, &args))
-        // THE CANCEL, AND WHY IT IS AN ENTRY AND NOT A KILL (ADR-0008): instances are unbounded
-        // (ADR-0046), so this activation is served while a turn is mid-stream. It writes the
-        // marker row and returns; the turn reads it at its next chunk boundary. Nothing is
-        // interrupted, and no turn is closed.
-        .on("cancel", |ctx: &mut Ctx, args: Value| cancel(ctx, &args))
         // And the SCREEN that asks for it: ADR-0007 §4 said management is a view, so the same
         // booth that performs a save draws the forms that emit it.
         .on("screen", |ctx: &mut Ctx, args: Value| screen(ctx, &args))
@@ -121,31 +116,6 @@ fn storage_schema() -> Value {
                     "slots": slots.clone(),
                 },
             },
-            // WHERE A CANCEL LIVES (ADR-0008, decided 2026-11-09): one row per cancelled turn,
-            // in THIS type's ns like everything else. The key carries the channel because the
-            // store mints a turn number per channel — turn 7 exists once in every channel, so
-            // `(kind, channel, turn)` is the address and the row's EXISTENCE is the cancellation.
-            "cancellations": {
-                "schema": {
-                    "key_len": 24,
-                    "key_fields": [
-                        {"name": "kind", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
-                        {"name": "channel", "ty": "U64", "width": 8, "offset": 8, "tag": 0},
-                        {"name": "turn", "ty": "U64", "width": 8, "offset": 16, "tag": 0},
-                    ],
-                    "layout_version": 1,
-                    "hot_width": 8,
-                    "payload_header_len": 3,
-                    "hot_fields": [
-                        {"name": "at", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
-                    ],
-                    "cold_fields": [
-                        {"name": "by", "ty": "Str", "width": 0, "offset": 0, "tag": 1},
-                        {"name": "user", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
-                    ],
-                    "slots": slots.clone(),
-                },
-            },
             "models": {
                 "schema": {
                     "key_len": 16,
@@ -173,7 +143,6 @@ fn storage_schema() -> Value {
 /// The key discriminator each collection uses inside the type's ONE ns (see `storage_schema`).
 const KIND_SETTINGS: u64 = 1;
 const KIND_MODELS: u64 = 2;
-const KIND_CANCELLATIONS: u64 = 3;
 
 /// One row of `settings` (id 1) — the deployment facts a turn needs, which used to ride the call
 /// arguments from the gateway (ADR-0007).
@@ -514,66 +483,6 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     }
 }
 
-/// `ui:turn.cancel` — write the marker and return.
-///
-/// THE WRITER IS THIS ACTIVATION, NOT THE TURN'S OWN (ADR-0008): instances are unbounded
-/// (ADR-0046), so the realm serves this entry while a turn is mid-stream, and the running turn
-/// sees the row at its next chunk boundary. Nothing is interrupted; a pull in flight finishes.
-fn cancel(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
-    let args = payload(envelope);
-    let id = args.get("turn").and_then(Value::as_str).context(
-        "cancel: the payload is `{turn: \"<channel>:<turn_id>\"}` — the id the turn's view carries",
-    )?;
-    // WHO MAY ASK: a bound account — the same fact the gate would have read, checked here
-    // because the addressed instance is the singleton (no device, no user to bind).
-    let user = sender_user(envelope).context("cancel: only a bound account may stop a turn")?;
-    let (channel, turn) = turn_numbers(id)
-        .with_context(|| format!("cancel: `{id}` is not `<channel>:<turn_id>`"))?;
-    let at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    ctx.store(json!({
-        "collection": "cancellations",
-        "op": "put_document",
-        "key": { "kind": KIND_CANCELLATIONS, "channel": channel, "turn": turn },
-        "doc": {
-            "at": at,
-            "by": device_of(envelope).unwrap_or_default(),
-            "user": user,
-        },
-    }))?;
-    Ok(json!({ "done": true }))
-}
-
-/// Is this turn cancelled? One point read: the marker is a ROW whose existence is the
-/// cancellation (ADR-0008) — but only the account whose turn it is can stop it, so the row also
-/// carries who asked and a marker from anyone else is not a cancel. The singleton instance that
-/// accepts the event knows the asker, not the turn's owner; the turn knows its owner and can
-/// refuse, which is the half that matters.
-fn cancelled(ctx: &mut Ctx, turn_id: &str, member_id: &str) -> anyhow::Result<bool> {
-    let Some((channel, turn)) = turn_numbers(turn_id) else {
-        // An id that is not `<channel>:<turn>` cannot be named by a cancel either, so "not
-        // cancelled" is the honest answer — and a malformed id must not fail a running turn.
-        return Ok(false);
-    };
-    let row = ctx.store(json!({
-        "collection": "cancellations",
-        "op": "get_document",
-        "key": { "kind": KIND_CANCELLATIONS, "channel": channel, "turn": turn },
-    }))?;
-    if row.is_null() {
-        return Ok(false);
-    }
-    Ok(row.get("user").and_then(Value::as_str) == Some(member_id))
-}
-
-/// `<channel>:<turn_id>` → the two numbers. The store mints a turn number PER CHANNEL (k10r owns
-/// the number), so both halves are part of the row's key.
-fn turn_numbers(turn_id: &str) -> Option<(u64, u64)> {
-    let (channel, turn) = turn_id.rsplit_once(':')?;
-    Some((channel.trim().parse().ok()?, turn.trim().parse().ok()?))
-}
 
 /// The deployment facts one turn holds: what the tail doors and the append need. A LOCAL,
 /// not a static — the whole turn is one call stack, so nothing has to survive a call
@@ -965,7 +874,11 @@ fn turn(
         .to_string();
 
     // 5. The answer, one emit per chunk, with a live side branch advanced between pulls.
-    let reply = match stream_answer(ctx, &out, device, &mut live, delta, &turn, &mut tails) {
+    let streamed = stream_answer(ctx, &out, device, &mut live, delta, &turn, &mut tails);
+    // The bit is this ACTIVATION's and it is spent either way — finished, stopped, or failed.
+    // Clearing here is what keeps a stop from ending the next turn of the same instance.
+    ctx.stop_clear()?;
+    let reply = match streamed {
         Ok(Ending::Done(reply)) => reply,
         // A CANCELLED TURN CLOSES NO TURN (ADR-0008 point 4): the summary's tail is maintenance
         // for a turn that will not be recorded, so the branches are dropped rather than drained,
@@ -1063,11 +976,12 @@ fn stream_answer(
         // The side branch advances one pull per round, on the same face: the summary is
         // produced alongside the answer, never in front of it.
         step_tail(tails, turn);
-        // THE CANCEL BOUNDARY (ADR-0008 point 2): one read per chunk, the streaming default. The
-        // marker is written by the concurrent `cancel` activation (instances are unbounded,
-        // ADR-0046), so this is the first place this turn can see it — and it is a boundary the
-        // loop already had, not an interruption bolted onto a pull.
-        if cancelled(ctx, &turn.id, &turn.member_id)? {
+        // THE STOP BOUNDARY (ADR-0008 as revised; ADR-0047 stage one): one BIT read per chunk —
+        // a boundary this loop already had, not an interruption bolted onto a pull. The bit
+        // belongs to this activation and is set by whoever holds authority over the connection
+        // (the venue), never delivered as an event: a delivery to a busy instance queues behind
+        // the very work it means to stop.
+        if ctx.stop_poll()? {
             return Ok(Ending::Cancelled);
         }
         let env = live.pull().context("turn: provider pull failed")?;

@@ -677,23 +677,17 @@ async fn a_cancelled_turn_stops_and_closes_no_turn() {
     let minted = minted.expect("the store minted a turn id before the stream opened");
     assert!(minted.ends_with(":1"), "the store's id is `<channel>:<turn>`: {minted}");
 
-    // THE CANCEL IS AN EVENT ON THE VENUE ROUTE, like the submit: a delivery to the instance
-    // that is running the turn would wait behind it, so the event is keyed to the type's
-    // SINGLETON — an instance that is never busy, which is what makes the write possible while
-    // the turn streams (ADR-0008).
-    Realm::emit(
-        &engine.realm,
-        None,
-        "ui:turn.cancel",
-        json!({
-            "name": "ui:turn.cancel",
-            "device": device,
-            "sender": { "device": device, "user": TEST_MEMBER },
-            "data": { "turn": minted },
-        }),
-    )
-    .await
-    .unwrap();
+    // THE STOP IS A BIT, NOT AN EVENT (ADR-0008 as revised, ADR-0047 stage one): the venue holds
+    // authority over the connection, so it sets the bit on the instance it is addressing. An
+    // event would be the wrong shape here — a delivery to the instance that is running the turn
+    // waits behind it (measured), which is exactly why the first shape failed.
+    {
+        let realm = engine.realm.lock().await;
+        realm.stop_set(&InstanceId {
+            booth_type: TURN_TYPE.into(),
+            key: InstanceKey::Named(device.into()),
+        });
+    }
 
     let mut done = None;
     for _ in 0..300 {
