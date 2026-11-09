@@ -681,12 +681,26 @@ async fn a_cancelled_turn_stops_and_closes_no_turn() {
     // authority over the connection, so it sets the bit on the instance it is addressing. An
     // event would be the wrong shape here — a delivery to the instance that is running the turn
     // waits behind it (measured), which is exactly why the first shape failed.
+    // The clock is part of the assertion: this provider holds its first byte for 1.5 s,
+    // so a turn that stops only at its next CHUNK BOUNDARY would take that whole 1.5 s.
+    // Stopping inside the pull is the difference the pump buys (turn.rs), and a tick is
+    // 50 ms — anything near the provider's own delay means the stop is still waiting for
+    // the read to come back.
+    let clicked = std::time::Instant::now();
     {
         let realm = engine.realm.lock().await;
-        realm.stop_set(&InstanceId {
+        let target = InstanceId {
             booth_type: TURN_TYPE.into(),
             key: InstanceKey::Named(device.into()),
-        });
+        };
+        // Both actions, exactly as the venue sends them for a click (prism's cancel arm):
+        // the bit is what the guest can read, the interrupt is what reaches a turn parked
+        // inside one pull — and the clock below tells them apart.
+        realm.stop_set(&target);
+        assert!(
+            realm.stop_interrupt(&target),
+            "the turn's call is in flight, so there is a wait to interrupt"
+        );
     }
 
     let mut done = None;
@@ -698,6 +712,13 @@ async fn a_cancelled_turn_stops_and_closes_no_turn() {
         }
     }
     let done = done.expect("the turn said it ended");
+    // NO CLOCK ASSERTION YET, and the reason is a missing link rather than a doubt: a turn
+    // served in-process by aura's engine reaches its guest through effector's executor API,
+    // and only the WIRE path (effector's `remote.rs`) arms a call's interrupt. So today this
+    // stop lands at the chunk boundary — 1.5 s, the provider's own pace — even though the
+    // turn is parked in a pull that a tick could reach. The gate belongs here the moment
+    // `crates/engine/src/effectors.rs` arms a control and keeps it addressable per call.
+    let _ = clicked;
 
     // THE END SAYS WHY, on the event a whole turn ends on: no new vocabulary, and no
     // `cancelled: true` flag a consumer could forget to read (ADR-0008 point 4).
