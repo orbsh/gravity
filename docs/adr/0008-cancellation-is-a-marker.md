@@ -2,7 +2,7 @@
 
 > **Languages:** [English](0008-cancellation-is-a-marker.md) (primary) · [中文](0008-cancellation-is-a-marker.zh-CN.md)
 
-**Status:** Accepted (2026-10-30). The principle and the boundary rule are decided; where the marker lives so a BUSY turn can still see it is named as owed.
+**Status:** Accepted (2026-10-30). The principle and the boundary rule are decided; where the marker lives so a BUSY turn can still see it was owed then and is DECIDED (2026-11-09): a row in the turn type's own storage, keyed by the turn id.
 **Date:** 2026-10-30
 
 ## Context
@@ -13,7 +13,7 @@ Two obvious answers are wrong here.
 
 **Killing the booth.** It is the hard inverse of the problem being solved: the realm holds the store pointers, the guest holds the tail branches and the reply parts, and a process that disappears mid-turn leaves k10r with an open compression node and no append. "Stop" would mean "lose the trace of what happened".
 
-**Sending a cancel event.** The event plane delivers to an instance one event at a time, and the instance running a turn is exactly that instance: a `ui:turn.cancel` emitted while a turn runs is queued behind it and is handled after the end it was meant to cut short. A message cannot cancel work the same mailbox is doing.
+**Sending a cancel event as the whole mechanism.** The premise this paragraph carried on 2026-10-30 — one event at a time per instance, so a `ui:turn.cancel` queues behind the turn it means to cut short — no longer holds: the turn type registers `.unbounded()` (ADR-0046, `crates/booth/src/lib.rs:57-82`), so a cancel is served as a second activation while the first is mid-stream. The conclusion survives in a sharper form: an activation cannot reach into another activation's stack, so the event can only WRITE something the turn will read. A cancel event is the writer of the marker, never the cancellation itself.
 
 ## Decision
 
@@ -29,14 +29,17 @@ Two obvious answers are wrong here.
 
 5. **The marker is per turn and cleared with it.** A stale marker that survives its turn cancels the next one; a marker that a caller forgets to clear is a turn that never answers.
 
-## The owed part
+## Where the marker lives (decided 2026-11-09)
 
-**Where the marker lives so a turn that is BUSY can still see it** — and who may write it. Two carriers are compatible with the ruling:
+**RULING — a row in the turn type's own storage, keyed by the turn id.**
 
-- **A row in the field store** (the application's own ns, beside the settings of ADR-0007). The turn reads it at each boundary. The writer cannot be the turn's own type — its instance is busy — so the write must come from a component that can reach that namespace while the instance works (the venue executing a store operation against the type's plan, or a second booth type that shares it). That is a capability question, not a vocabulary one: whoever writes must be authorized, and the authorization must not be the turn's own queue.
-- **A pending-event count on the turn's own queue** (`ctx.queue_depth("view:…")`): the marker IS an event that waits, and the turn reads how many are waiting without consuming them. No write path, no shared namespace — but it makes "cancel" a queued message again, just one that is read as a level rather than delivered as an edge, and it ties cancellation to the event plane's naming.
+1. **The table is the type's own**, a `cancellations` collection in the ns every instance of that type already shares (ADR-0026 §1: one ns per type, all instances in it). One row per cancelled turn: key = the turn id, payload `{at, by}`, and the row's EXISTENCE is the cancellation.
+2. **The writer is an activation of the same type, not a second booth and not the venue.** The premise that made this look hard — "the writer cannot be the turn's own type, its instance is busy" — was true only while instances were serialized; ADR-0046 registers the turn type `.unbounded()`, so `ui:turn.cancel` opens a second activation on the same instance and writes the row while the turn streams. Nothing is queued behind the turn, and no capability question is left: the writer is authorized as the type is.
+3. **The key is the turn id, because the caller always has it.** A turn lands its submission and answers with a view carrying `turn_id`, and the cancel control on that view is bound to it. The id is also the only nameable thing: rounds overlap per device (ADR-0046), so "the current turn of this device" names several.
+4. **No clearing duty.** Keying by turn id means a marker can never cancel a later turn — the hazard the "marker is per turn and cleared with it" rule existed to prevent. The row may be deleted when the turn ends or kept as the record that the turn was cancelled.
+5. **Reads stay at the boundaries** of point 2 of the Decision: per chunk (the streaming default) or per round, and never inside a call.
 
-Both are legitimate; the choice is the implementation's, and this record keeps the requirement that whichever is chosen is readable from inside a running turn and writable from outside it.
+**Rejected: `ctx.queue_depth` on the turn's own queue.** It needs no write path and no shared table, but it makes cancel a queued message again — read as a level instead of delivered as an edge: depth is a count with no identity (two cancels are indistinguishable, and any other event on the same name inflates it), a queue that lives in memory cannot carry a cancel across a cold re-entry, and it binds cancellation to the event plane's naming.
 
 ## Considered and rejected
 
