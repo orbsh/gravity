@@ -736,8 +736,20 @@ fn turn(
     }
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
     let mut call_rows: Vec<(u64, u16)> = Vec::new();
-    let mut live = open_stream(&turn, &messages).context("turn: provider stream failed to open")?;
-    let mut first = live.pull().context("turn: provider stream failed to open")?;
+    let mut pump = Pump::spawn(
+        open_stream(&turn, &messages).context("turn: provider stream failed to open")?,
+    );
+    // A stop can land between the open and the first token: the connect is not a
+    // boundary anyone reads, so the wait for it is one.
+    // A stop before the first token ends the turn the same way a stop mid-stream does:
+    // nothing lands, the log keeps its rows OPEN, and the caller is told `cancelled`.
+    let Some(opened) = pump.next(ctx)? else {
+        return Ok(Turned {
+            reply: String::new(),
+            cancelled: true,
+        });
+    };
+    let mut first = opened;
     for _round in 0..8 {
         if first.get("done").and_then(Value::as_bool) == Some(true) {
             return Err(stream_failure(
@@ -853,8 +865,14 @@ fn turn(
                 "content": content,
             }));
         }
-        live = open_stream(&turn, &messages).context("turn: provider re-open failed")?;
-        first = live.pull().context("turn: provider re-open failed")?;
+        pump = Pump::spawn(open_stream(&turn, &messages).context("turn: provider re-open failed")?);
+        let Some(reopened) = pump.next(ctx)? else {
+            return Ok(Turned {
+                reply: String::new(),
+                cancelled: true,
+            });
+        };
+        first = reopened;
     }
     // The loop must have ENDED on a content stream: the cap is the runaway
     // stop, and a provider still asking for tools after it is a failed turn —
@@ -874,7 +892,7 @@ fn turn(
         .to_string();
 
     // 5. The answer, one emit per chunk, with a live side branch advanced between pulls.
-    let streamed = stream_answer(ctx, &out, device, &mut live, delta, &turn, &mut tails);
+    let streamed = stream_answer(ctx, &out, device, &pump, delta, &turn, &mut tails);
     // The bit is this ACTIVATION's and it is spent either way — finished, stopped, or failed.
     // Clearing here is what keeps a stop from ending the next turn of the same instance.
     ctx.stop_clear()?;
@@ -942,13 +960,68 @@ fn turn(
     })
 }
 
+/// The provider stream, off this thread (ADR-0047 stage two, for a blocking client).
+///
+/// `Live::pull` is a blocking `read` on the provider's socket. On this thread it is the
+/// one thing a stop cannot reach: a boundary BETWEEN chunks is no help while you sit
+/// inside one, and a provider that goes quiet holds the turn hostage for as long as it
+/// likes. So the stream moves to a worker and the turn waits with a deadline — a parked
+/// turn becomes one that is parked for at most a tick.
+///
+/// The worker owns `Live`; the turn keeps only the receiving end. Dropping the turn's
+/// end is what tells the worker nobody is listening any more — it exits at its next
+/// send, which happens when the blocking read returns. Nothing waits for that: an
+/// abandoned read costs one thread, and the process that owns it is the one being
+/// stopped.
+struct Pump {
+    rx: std::sync::mpsc::Receiver<anyhow::Result<Value>>,
+}
+
+impl Pump {
+    /// One tick of the wait: short enough that a click feels like a click, long enough
+    /// that an idle stream costs nothing.
+    const TICK: std::time::Duration = std::time::Duration::from_millis(50);
+
+    fn spawn(mut live: gravity_core::llm::live::Live) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || loop {
+            let out = live.pull();
+            // An error ends the stream: the next pull would answer the same thing.
+            let fatal = out.is_err();
+            if tx.send(out).is_err() || fatal {
+                break;
+            }
+        });
+        Self { rx }
+    }
+
+    /// One envelope. `Ok(None)` = this turn was stopped while waiting, which the caller
+    /// turns into `Ending::Cancelled` — the same ending the per-chunk bit produces, from
+    /// the one place the bit could not reach before.
+    fn next(&self, ctx: &Ctx) -> anyhow::Result<Option<Value>> {
+        loop {
+            match self.rx.recv_timeout(Self::TICK) {
+                Ok(out) => return out.map(Some),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if ctx.is_cancelled() {
+                        return Ok(None);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!(
+                    "turn: provider stream ended without an envelope"
+                ),
+            }
+        }
+    }
+}
+
 /// One pull round of the answer stream: emit the chunk, advance a live side branch, pull
 /// the next envelope. Returns the assembled reply at the provider's `done`.
 fn stream_answer(
     ctx: &mut Ctx,
     out: &Out<'_>,
     device: Option<&str>,
-    live: &mut gravity_core::llm::live::Live,
+    pump: &Pump,
     mut delta: String,
     turn: &Turn<'_>,
     tails: &mut Vec<Tail>,
@@ -984,7 +1057,11 @@ fn stream_answer(
         if ctx.stop_poll()? {
             return Ok(Ending::Cancelled);
         }
-        let env = live.pull().context("turn: provider pull failed")?;
+        // The pull itself is the boundary now: it returns when the provider sends, or
+        // as soon as the stop is raised — a blocking `read` on this thread could not.
+        let Some(env) = pump.next(ctx).context("turn: provider pull failed")? else {
+            return Ok(Ending::Cancelled);
+        };
         if env.get("done").and_then(Value::as_bool) == Some(true) {
             return Ok(Ending::Done(reply));
         }
