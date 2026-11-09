@@ -72,6 +72,16 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 .unbounded()
                 .on_as("ui:gravity-model.save", "device", "save")
                 .gated()
+                // THE CANCEL (ADR-0008): keyed by NOTHING — the singleton instance of this same
+                // type. That is the whole point: a delivery to an instance that is running a turn
+                // waits behind it, while the singleton is never busy, so it writes the marker and
+                // returns. The turn (device-keyed) reads the marker at its next chunk boundary.
+                // NOT gated at the route, and that is deliberate: a gate is a binding on the
+                // ADDRESSED instance, and the singleton has no device and no user to bind. The
+                // two halves move into code: the handler refuses a sender with no bound user, and
+                // the TURN honours the marker only when it names its own member (so a stranger's
+                // row can be written and still cannot stop anything).
+                .on_as("ui:turn.cancel", "", "cancel")
                 // And the SCREEN (ADR-0007 §4: management is a view). It draws forms whose buttons
                 // emit the save event above, so the vocabulary is discoverable from the venue
                 // itself and an AI drives exactly what a person clicks.

@@ -65,6 +65,11 @@ fn main() -> anyhow::Result<()> {
         // booth refuses an admin verb, so that door is an event like the turn's, behind the same
         // auth declaration.
         .on("save", |ctx: &mut Ctx, args: Value| save(ctx, &args))
+        // THE CANCEL, AND WHY IT IS AN ENTRY AND NOT A KILL (ADR-0008): instances are unbounded
+        // (ADR-0046), so this activation is served while a turn is mid-stream. It writes the
+        // marker row and returns; the turn reads it at its next chunk boundary. Nothing is
+        // interrupted, and no turn is closed.
+        .on("cancel", |ctx: &mut Ctx, args: Value| cancel(ctx, &args))
         // And the SCREEN that asks for it: ADR-0007 §4 said management is a view, so the same
         // booth that performs a save draws the forms that emit it.
         .on("screen", |ctx: &mut Ctx, args: Value| screen(ctx, &args))
@@ -116,6 +121,31 @@ fn storage_schema() -> Value {
                     "slots": slots.clone(),
                 },
             },
+            // WHERE A CANCEL LIVES (ADR-0008, decided 2026-11-09): one row per cancelled turn,
+            // in THIS type's ns like everything else. The key carries the channel because the
+            // store mints a turn number per channel — turn 7 exists once in every channel, so
+            // `(kind, channel, turn)` is the address and the row's EXISTENCE is the cancellation.
+            "cancellations": {
+                "schema": {
+                    "key_len": 24,
+                    "key_fields": [
+                        {"name": "kind", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
+                        {"name": "channel", "ty": "U64", "width": 8, "offset": 8, "tag": 0},
+                        {"name": "turn", "ty": "U64", "width": 8, "offset": 16, "tag": 0},
+                    ],
+                    "layout_version": 1,
+                    "hot_width": 8,
+                    "payload_header_len": 3,
+                    "hot_fields": [
+                        {"name": "at", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
+                    ],
+                    "cold_fields": [
+                        {"name": "by", "ty": "Str", "width": 0, "offset": 0, "tag": 1},
+                        {"name": "user", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
+                    ],
+                    "slots": slots.clone(),
+                },
+            },
             "models": {
                 "schema": {
                     "key_len": 16,
@@ -143,6 +173,7 @@ fn storage_schema() -> Value {
 /// The key discriminator each collection uses inside the type's ONE ns (see `storage_schema`).
 const KIND_SETTINGS: u64 = 1;
 const KIND_MODELS: u64 = 2;
+const KIND_CANCELLATIONS: u64 = 3;
 
 /// One row of `settings` (id 1) — the deployment facts a turn needs, which used to ride the call
 /// arguments from the gateway (ADR-0007).
@@ -417,6 +448,24 @@ fn sender_user(envelope: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What one turn produced.
+struct Turned {
+    /// The answer that streamed. A cancelled turn's partial reply goes back to a DIRECT caller
+    /// and lands nowhere: the log is never closed, so the projection never sees it.
+    reply: String,
+    /// The turn stopped on the cancel marker (ADR-0008). The caller is told why on the same wire
+    /// it was drawing on.
+    cancelled: bool,
+}
+
+/// How a streamed answer ended.
+enum Ending {
+    /// The provider said `done`: the answer is whole and the turn closes its log.
+    Done(String),
+    /// The cancel marker was seen at a chunk boundary. Nothing closes.
+    Cancelled,
+}
+
 fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
     let user = sender_user(envelope);
@@ -431,7 +480,7 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // the end frames carry the same one the chunks did.
     let minted: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
     match turn(ctx, args, device.as_deref(), user.as_deref(), &minted) {
-        Ok(reply) => {
+        Ok(turned) => {
             if said {
                 // The id rides INSIDE the payload as well as on the envelope: a venue hands a
                 // client the payload (`{ev, args}`), so an id written only beside it never
@@ -441,9 +490,14 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
                 if let Some(id) = &id {
                     data["turn"] = json!(id);
                 }
+                // THE REASON RIDES THE SAME EVENT (ADR-0008 point 4): a `done` that says why it
+                // ended — no new vocabulary, and no `cancelled: true` flag for a consumer to forget.
+                if turned.cancelled {
+                    data["reason"] = json!("cancelled");
+                }
                 emit(ctx, DONE_EVENT, device.as_deref(), id.as_deref(), data)?;
             }
-            Ok(json!({ "done": true, "value": { "reply": reply } }))
+            Ok(json!({ "done": true, "value": { "reply": turned.reply } }))
         }
         Err(error) => {
             if said {
@@ -458,6 +512,67 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
             Err(error)
         }
     }
+}
+
+/// `ui:turn.cancel` — write the marker and return.
+///
+/// THE WRITER IS THIS ACTIVATION, NOT THE TURN'S OWN (ADR-0008): instances are unbounded
+/// (ADR-0046), so the realm serves this entry while a turn is mid-stream, and the running turn
+/// sees the row at its next chunk boundary. Nothing is interrupted; a pull in flight finishes.
+fn cancel(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
+    let args = payload(envelope);
+    let id = args.get("turn").and_then(Value::as_str).context(
+        "cancel: the payload is `{turn: \"<channel>:<turn_id>\"}` — the id the turn's view carries",
+    )?;
+    // WHO MAY ASK: a bound account — the same fact the gate would have read, checked here
+    // because the addressed instance is the singleton (no device, no user to bind).
+    let user = sender_user(envelope).context("cancel: only a bound account may stop a turn")?;
+    let (channel, turn) = turn_numbers(id)
+        .with_context(|| format!("cancel: `{id}` is not `<channel>:<turn_id>`"))?;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    ctx.store(json!({
+        "collection": "cancellations",
+        "op": "put_document",
+        "key": { "kind": KIND_CANCELLATIONS, "channel": channel, "turn": turn },
+        "doc": {
+            "at": at,
+            "by": device_of(envelope).unwrap_or_default(),
+            "user": user,
+        },
+    }))?;
+    Ok(json!({ "done": true }))
+}
+
+/// Is this turn cancelled? One point read: the marker is a ROW whose existence is the
+/// cancellation (ADR-0008) — but only the account whose turn it is can stop it, so the row also
+/// carries who asked and a marker from anyone else is not a cancel. The singleton instance that
+/// accepts the event knows the asker, not the turn's owner; the turn knows its owner and can
+/// refuse, which is the half that matters.
+fn cancelled(ctx: &mut Ctx, turn_id: &str, member_id: &str) -> anyhow::Result<bool> {
+    let Some((channel, turn)) = turn_numbers(turn_id) else {
+        // An id that is not `<channel>:<turn>` cannot be named by a cancel either, so "not
+        // cancelled" is the honest answer — and a malformed id must not fail a running turn.
+        return Ok(false);
+    };
+    let row = ctx.store(json!({
+        "collection": "cancellations",
+        "op": "get_document",
+        "key": { "kind": KIND_CANCELLATIONS, "channel": channel, "turn": turn },
+    }))?;
+    if row.is_null() {
+        return Ok(false);
+    }
+    Ok(row.get("user").and_then(Value::as_str) == Some(member_id))
+}
+
+/// `<channel>:<turn_id>` → the two numbers. The store mints a turn number PER CHANNEL (k10r owns
+/// the number), so both halves are part of the row's key.
+fn turn_numbers(turn_id: &str) -> Option<(u64, u64)> {
+    let (channel, turn) = turn_id.rsplit_once(':')?;
+    Some((channel.trim().parse().ok()?, turn.trim().parse().ok()?))
 }
 
 /// The deployment facts one turn holds: what the tail doors and the append need. A LOCAL,
@@ -495,7 +610,7 @@ fn turn(
     device: Option<&str>,
     user: Option<&str>,
     minted: &std::cell::RefCell<Option<String>>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Turned> {
     // THE DEPLOYMENT FACTS ARE ROWS, NOT ARGUMENTS (ADR-0007): the store, the memory scope, the
     // representation and the model recipe live in this type's own namespace, so a gateway never
     // carries them and a caller cannot forget one.
@@ -850,9 +965,18 @@ fn turn(
         .to_string();
 
     // 5. The answer, one emit per chunk, with a live side branch advanced between pulls.
-    let answer = stream_answer(ctx, &out, device, &mut live, delta, &turn, &mut tails);
-    let reply = match answer {
-        Ok(reply) => reply,
+    let reply = match stream_answer(ctx, &out, device, &mut live, delta, &turn, &mut tails) {
+        Ok(Ending::Done(reply)) => reply,
+        // A CANCELLED TURN CLOSES NO TURN (ADR-0008 point 4): the summary's tail is maintenance
+        // for a turn that will not be recorded, so the branches are dropped rather than drained,
+        // and the log keeps its rows OPEN — k10r's projection skips them (ADR-0024).
+        Ok(Ending::Cancelled) => {
+            tails.clear();
+            return Ok(Turned {
+                reply: String::new(),
+                cancelled: true,
+            });
+        }
         Err(error) => {
             // Nothing lands and nothing appends: the branches were maintenance. Their
             // threads own their own streams; dropping the receivers is the whole cleanup.
@@ -899,7 +1023,10 @@ fn turn(
             json!([{ "action": "set", "slot": SCENE_SLOT, "data": { "nodes": nodes, "links": links } }]),
         )?;
     }
-    Ok(reply)
+    Ok(Turned {
+        reply,
+        cancelled: false,
+    })
 }
 
 /// One pull round of the answer stream: emit the chunk, advance a live side branch, pull
@@ -912,7 +1039,7 @@ fn stream_answer(
     mut delta: String,
     turn: &Turn<'_>,
     tails: &mut Vec<Tail>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Ending> {
     let mut reply = String::new();
     let mut first = true;
     loop {
@@ -936,9 +1063,16 @@ fn stream_answer(
         // The side branch advances one pull per round, on the same face: the summary is
         // produced alongside the answer, never in front of it.
         step_tail(tails, turn);
+        // THE CANCEL BOUNDARY (ADR-0008 point 2): one read per chunk, the streaming default. The
+        // marker is written by the concurrent `cancel` activation (instances are unbounded,
+        // ADR-0046), so this is the first place this turn can see it — and it is a boundary the
+        // loop already had, not an interruption bolted onto a pull.
+        if cancelled(ctx, &turn.id, &turn.member_id)? {
+            return Ok(Ending::Cancelled);
+        }
         let env = live.pull().context("turn: provider pull failed")?;
         if env.get("done").and_then(Value::as_bool) == Some(true) {
-            return Ok(reply);
+            return Ok(Ending::Done(reply));
         }
         delta = env
             .get("item")

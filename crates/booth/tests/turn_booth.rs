@@ -207,7 +207,10 @@ async fn boot_bare() -> (Engine, Seen) {
                 // The configuration door, exactly as `register` declares it.
                 .on_as("ui:gravity-model.save", "device", "save")
                 .on_as("ui:gravity-model", "device", "screen")
-                .on_as("ui:connect", "device", "shell"),
+                .on_as("ui:connect", "device", "shell")
+                // The cancel, exactly as `register` declares it: key-less, so it lands on the
+                // type's singleton instance — the one that is never busy while a turn runs.
+                .on_as("ui:turn.cancel", "", "cancel"),
         )
         .await
         .unwrap();
@@ -399,12 +402,24 @@ async fn start_turn(engine: &Engine, args: Value) -> Result<(), String> {
 /// return its failure text if it refused — the same seam `start_turn` uses, without the terminal
 /// shape a turn answers.
 async fn drive(engine: &Engine, handler: &str, args: Value) -> Result<(), String> {
+    drive_on(engine, "s-door", handler, args).await
+}
+
+/// The same seam with the caller choosing the instance: a cancel must reach the SAME instance
+/// that is running the turn, or the test proves nothing about a busy instance serving a second
+/// activation (ADR-0046).
+async fn drive_on(
+    engine: &Engine,
+    key: &str,
+    handler: &str,
+    args: Value,
+) -> Result<(), String> {
     let slot = Realm::iterate(
         &engine.realm,
         IterateOp::Start {
             target: InstanceId {
                 booth_type: TURN_TYPE.into(),
-                key: InstanceKey::Named("s-door".into()),
+                key: InstanceKey::Named(key.into()),
             },
             handler: handler.into(),
             args,
@@ -617,6 +632,98 @@ async fn a_turn_takes_the_next_round_while_it_is_still_running() {
     let mut ids: Vec<&str> = by_turn.keys().map(String::as_str).collect();
     ids.sort_unstable();
     assert_eq!(ids, vec!["7:1", "8:1"], "one id per turn, named by its log key");
+}
+
+
+#[tokio::test]
+async fn a_cancelled_turn_stops_and_closes_no_turn() {
+    // One turn, deliberately slow before its first byte — the window in which a person changes
+    // their mind. The cancel rides the VENUE route (an event, like the submit), so it is served
+    // by the same instance that is running the turn: the type is `unbounded` (ADR-0046), which
+    // is what makes "cancel" writable while the turn is mid-stream (ADR-0008).
+    let endpoint = sse_server_delayed(vec![("slow", vec!["one ", "two ", "three "], 1_500)]).await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+    let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
+
+    Realm::emit(
+        &engine.realm,
+        None,
+        "ui:turn.submit",
+        json!({
+            "name": "ui:turn.submit",
+            "device": device,
+            "sender": { "device": device, "user": TEST_MEMBER },
+            "data": view_args("slow"),
+        }),
+    )
+    .await
+    .unwrap();
+
+    // The id the store minted arrives on its own receipt — the id a page binds its cancel
+    // control to, and the only name a person's second thought can carry.
+    let mut minted: Option<String> = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        minted = seen
+            .all("ui:turn.opened")
+            .into_iter()
+            .next()
+            .and_then(|event| event.get("data").and_then(|d| d.get("turn")).and_then(Value::as_str).map(str::to_string));
+        if minted.is_some() {
+            break;
+        }
+    }
+    let minted = minted.expect("the store minted a turn id before the stream opened");
+    assert!(minted.ends_with(":1"), "the store's id is `<channel>:<turn>`: {minted}");
+
+    // THE CANCEL IS AN EVENT ON THE VENUE ROUTE, like the submit: a delivery to the instance
+    // that is running the turn would wait behind it, so the event is keyed to the type's
+    // SINGLETON — an instance that is never busy, which is what makes the write possible while
+    // the turn streams (ADR-0008).
+    Realm::emit(
+        &engine.realm,
+        None,
+        "ui:turn.cancel",
+        json!({
+            "name": "ui:turn.cancel",
+            "device": device,
+            "sender": { "device": device, "user": TEST_MEMBER },
+            "data": { "turn": minted },
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut done = None;
+    for _ in 0..300 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        done = seen.all("ui:turn.done").into_iter().next();
+        if done.is_some() {
+            break;
+        }
+    }
+    let done = done.expect("the turn said it ended");
+
+    // THE END SAYS WHY, on the event a whole turn ends on: no new vocabulary, and no
+    // `cancelled: true` flag a consumer could forget to read (ADR-0008 point 4).
+    assert_eq!(
+        done["data"]["reason"], "cancelled",
+        "a cancelled turn says so on `ui:turn.done`: {done}"
+    );
+
+    // AND IT CLOSED NOTHING. The question row stays OPEN, so the projection has no exchange to
+    // show: that is the difference between "stopped" and "forgotten" (k10r ADR-0024).
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    let session = surface
+        .fetch_session(7, gravity_core::surface::default_member())
+        .await
+        .unwrap();
+    assert!(
+        session.increment.is_empty(),
+        "a cancelled turn appends nothing: {:?}",
+        session.increment
+    );
 }
 
 #[tokio::test]
