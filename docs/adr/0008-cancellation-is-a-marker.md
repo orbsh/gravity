@@ -2,7 +2,7 @@
 
 > **Languages:** [English](0008-cancellation-is-a-marker.md) (primary) · [中文](0008-cancellation-is-a-marker.zh-CN.md)
 
-**Status:** Accepted (2026-10-30). The principle and the boundary rule are decided; where the marker lives so a BUSY turn can still see it was owed then and is DECIDED (2026-11-09): a row in the turn type's own storage, keyed by the turn id.
+**Status:** Accepted (2026-10-30). Revised 2026-11-09: cancellation is an INTERRUPT in two stages, and neither stage is storage — stage one is gravity's own boundary logic over a control bit in the realm's memory, stage two is the realm lifting an operation through the execution layer. What this record first called a marker survives as the boundary rule and the terminal error value; its storage carrier does not.
 **Date:** 2026-10-30
 
 ## Context
@@ -29,18 +29,18 @@ Two obvious answers are wrong here.
 
 5. **The marker is per turn and cleared with it.** A stale marker that survives its turn cancels the next one; a marker that a caller forgets to clear is a turn that never answers.
 
-## Where the marker lives (decided 2026-11-09)
+## Where the stop lives (decided 2026-11-09)
 
-**RULING — a row in the turn type's own storage, keyed by the turn id.**
+**RULING — cancellation is an interrupt in two stages, and neither stage is storage.**
 
-1. **The table is the type's own**, a `cancellations` collection in the ns every instance of that type already shares (ADR-0026 §1: one ns per type, all instances in it). One row per cancelled turn: key = the turn id, payload `{at, by}`, and the row's EXISTENCE is the cancellation.
-2. **The writer is the type's SINGLETON instance — same type, a different instance, never busy.** A delivery addressed to an instance that is running a turn waits behind that turn: measured 2026-11-09, an event keyed by `device` took effect only after the turn ended, while the same entry CALLED on that instance overlapped with it (calls overlap, deliveries queue; ADR-0046 is what makes the call half true). The cancel is therefore declared key-less — `ui:turn.cancel` with an empty key field — which lands it on the type's singleton: that instance is never mid-turn, so it writes the row and returns while the turn streams. No second booth, no venue write, and no new ns: every instance of a type already shares one.
-3. **The route is not gated; the two checks move into code.** A gate binds the ADDRESSED instance, and the singleton has no device and no user to bind. So the handler refuses a sender with no bound account, and the TURN honours the marker only when the row names its own member: a stranger's row can be written and still stops nothing. That split is what keeps the cancel both writable during a turn and unusable against someone else's.
-4. **The key is the turn id, because the caller always has it.** A turn lands its submission and answers with a view carrying `turn_id`, and the cancel control on that view is bound to it. The id is also the only nameable thing: rounds overlap per device (ADR-0046), so "the current turn of this device" names several.
-5. **No clearing duty.** Keying by turn means a marker can never cancel a later turn — the hazard the "marker is per turn and cleared with it" rule existed to prevent. The row may be deleted when the turn ends or kept as the record that the turn was cancelled. The address is `(kind, channel, turn)` and the channel is part of it: the store mints a turn number per channel, so turn 7 exists once in every one.
-6. **Reads stay at the boundaries** of point 2 of the Decision: per chunk (the streaming default) or per round, and never inside a call.
+1. **Stage one is gravity's own logic, and it needs a bit rather than a carrier.** At a boundary the turn already has — between chunks, between calls — it reads a control bit and stops issuing work. That is the streaming loop of `stream_answer`, which is why this half is cheap: the boundary existed before the feature.
+2. **The bit lives in the REALM, in memory, keyed by instance and call** — beside the watchdog, which is the same family: cancellation is resource control, not application state. A dead process owes nothing, and the trace that matters is the store's (the rows the turn wrote, left OPEN).
+3. **The door is a framework primitive with two actions: SET (stage one) and LIFT (stage two — abandon the operation in flight).** It is not an application event, because an event addressed to a busy instance queues behind the very turn it means to stop: measured 2026-11-09, a device-keyed cancel took effect only after the turn ended, while the same entry CALLED on that instance overlapped with it.
+4. **Stage two exists for the one case stage one cannot reach**: the turn is inside an operation — an LLM stream, a mount call, a script — with no boundary at which to see the bit. Then the realm lifts the operation through the execution layer, and the call returns an INTERRUPTED error value (ADR-0012). That value is TERMINAL: the turn must not retry it and must not route around it, or a forced stop is quietly eaten by a retry loop.
+5. **The execution layer needs ONE primitive, at the finest granularity its carrier allows** — kill the script child, drop the in-flight request, or, where an embedded language cannot be reached at all, terminate the node process (the watchdog's coarse family). It does not need two stages: soft is gravity's, hard is this one.
+6. **What the caller sees does not change.** The turn ends on the wire it was drawing on with a reason, closes no turn, and its rows stay OPEN for the projection to skip (krystallizer ADR-0024).
 
-**Rejected: `ctx.queue_depth` on the turn's own queue.** It needs no write path and no shared table, but it makes cancel a queued message again — read as a level instead of delivered as an edge: depth is a count with no identity (two cancels are indistinguishable, and any other event on the same name inflates it), a queue that lives in memory cannot carry a cancel across a cold re-entry, and it binds cancellation to the event plane's naming.
+**INTERIM (landed 2026-11-09, this repo).** Until the realm primitive and the induction frame exist, the bit is a `cancellations` row in the turn type's own ns, written by the type's singleton instance — the only instance that is never mid-turn, which is why the route is key-less — and read by the turn at its chunk boundary. `a_cancelled_turn_stops_and_closes_no_turn` locks the behaviour end to end. The table and that route RETIRE with the primitive; the boundary, the two stages, the terminal error value and the end-of-turn shape do not change when they do.
 
 ## Considered and rejected
 
