@@ -40,7 +40,7 @@
 5. **执行层只需要一种原语，按载体给到它能给的最细粒度**——杀脚本子进程、drop 在途请求，嵌入语言完全够不到时就终止节点进程（watchdog 那一族的粗粒度）。它不需要两级：软的是 gravity 的，硬的是这一种。
 6. **调用方看到的没变。** turn 在它正在画的那条线上带原因结束，不关任何 turn，它写下的行保持 OPEN 被投影跳过（krystallizer ADR-0024）。
 
-**过渡态（2026-11-09 已落地于本仓）。** 在 realm 原语与 induction 帧存在之前，位是 turn 类型自己 ns 里的一行 `cancellations`，由该类型的 singleton 实例写——唯一永远不在 turn 中间的实例，路由 key-less 就是为了这个——turn 在自己的 chunk 边界读。`a_cancelled_turn_stops_and_closes_no_turn` 端到端锁住这个行为。原语到位后，那张表与那条路由**退役**；边界、两级、终局错误值、结束形状都不变。
+**已落地（2026-11-09，横跨它下游的三个仓）。** 一级是真的：`Realm::stop_set` 置位（aura ADR-0047），guest 通过 `ctx.stop.poll` 读（induction 的臂，effector 桥到 host fn 表），本摊位的流循环在自己的 chunk 边界读、在 turn 结束时清（无论跑完还是被停）。过渡形态的 `cancellations` 表与 key-less 的 `ui:turn.cancel` 路由在**同一波里删除**——现在没有任何关于停止的东西是一行数据。场馆对它正在寻址的那个实例置位，因为它握有连接权限；这是不是他的活仍由应用判定，而这里现在是归属问题唯一存在的地方。二级（掀操作）仍缺：它要执行层那一种原语，在原语落地前，卡在单次长 pull 里的 turn 只能等那次 pull 返回后才停得下来。
 
 ## 已考虑并否决
 
