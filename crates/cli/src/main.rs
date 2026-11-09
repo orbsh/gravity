@@ -394,13 +394,23 @@ async fn submit(
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or(seen);
+                let reason = frame
+                    .get("args")
+                    .and_then(|args| args.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 if !cli.json {
                     let mut out = std::io::stdout();
                     out.write_all(b"\n").ok();
                     out.flush().ok();
-                    if cancelled {
-                        eprintln!("gravity> turn cancelled");
-                    }
+                }
+                // A CANCELLED TURN IS NOT A COMPLETED ONE (ADR-0008 point 4): the reply
+                // that streamed never landed anywhere, so the exit status must not say it
+                // did. The turn says why on the frame it ends on — the client's own
+                // request is not the source of truth here, the venue's answer is.
+                if cancelled || reason == "cancelled" {
+                    return Err(Failure::Turn("turn cancelled".into()));
                 }
                 return Ok(reply);
             }
@@ -432,9 +442,13 @@ async fn submit(
 }
 
 async fn cancel(ws: &mut Ws) -> Result<(), Failure> {
-    // The marker on cancel is gravity ADR-0008's OWED PART: the event travels like any other,
-    // and nothing reads it yet, so an operator sees the client stop rather than a cancelled turn.
-    send(ws, &json!({ "ev": "ui:turn.cancel", "args": {} })).await
+    // The venue's uplink shape, because that is what the venue reads: `dest` names the verb
+    // and `data` is the payload. A cancel is NOT an event and gets NO ANSWER — the venue
+    // holds authority over this connection, so it sets the turn's stop bit and interrupts
+    // the call; the only thing this client can observe is the turn ending (`turn.done` with
+    // `reason: "cancelled"`). Asking for a receipt is what made the old shape look like it
+    // worked while the venue never saw it.
+    send(ws, &json!({ "dest": "turn.cancel", "data": {} })).await
 }
 
 async fn send(ws: &mut Ws, frame: &Value) -> Result<(), Failure> {

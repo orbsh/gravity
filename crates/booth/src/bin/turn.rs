@@ -686,7 +686,7 @@ fn turn(
     }
     branch_prefix.extend(numbered);
     let mut tails: Vec<Tail> = Vec::new();
-    start_tails(&turn, &view, &branch_prefix, &keys, &mut tails);
+    start_tails(&turn, &view, &branch_prefix, &keys, &mut tails, ctx.cancel());
 
     // 4. The provider: open, run the tool rounds, and land on a CONTENT stream. A
     //    `tool_calls`-first reply = the model wants tools BEFORE any prose: dispatch them,
@@ -1861,6 +1861,7 @@ fn start_tails(
     prefix: &[Value],
     keys: &[Pointer],
     tails: &mut Vec<Tail>,
+    cancel: &induction_guest::CancelToken,
 ) {
     let wanted = view
         .get("tails")
@@ -1875,7 +1876,7 @@ fn start_tails(
             eprintln!("[gravity-turn] tail operation `{name}` is not known to this guest");
             continue;
         }
-        open_branch(turn, &tail, name, prefix, keys, tails);
+        open_branch(turn, &tail, name, prefix, keys, tails, cancel.clone());
     }
 }
 
@@ -1895,6 +1896,7 @@ fn open_branch(
     prefix: &[Value],
     keys: &[Pointer],
     tails: &mut Vec<Tail>,
+    cancel: induction_guest::CancelToken,
 ) {
     let Some(prompt) = tail.get("prompt").and_then(Value::as_str) else {
         return;
@@ -1926,6 +1928,13 @@ fn open_branch(
         };
         let mut parts = String::new();
         loop {
+            // THE BRANCH IS MAINTENANCE, AND MAINTENANCE STOPS TOO: a cancelled turn
+            // drops these receivers, so a branch that keeps pulling writes a summary
+            // nobody will ever read — and pays the provider for it. The token is the
+            // same call's, so the check costs one flag read per chunk.
+            if cancel.is_cancelled() {
+                return;
+            }
             match live.pull() {
                 Ok(env) => {
                     if env.get("done").and_then(Value::as_bool) == Some(true) {

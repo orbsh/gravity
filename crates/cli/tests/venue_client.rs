@@ -67,6 +67,19 @@ async fn serve(
         };
         let frame: Value = serde_json::from_str(text.as_str())?;
         seen.lock().unwrap().push(frame.clone());
+        // A cancel is served by the VENUE itself (it holds authority over this
+        // connection) and gets NO RECEIPT: what a client can read is the turn ENDING,
+        // and a cancelled turn ends with `turn.done` carrying `reason: "cancelled"`
+        // (ADR-0008 point 4). The old arm answered `turn.cancel.result`, a frame no
+        // venue sends — which is how this stub came to describe a layer that is gone.
+        if frame["dest"] == "turn.cancel" {
+            send(
+                &mut ws,
+                json!({ "ev": "turn.done", "args": { "reason": "cancelled", "reply": "partial" } }),
+            )
+            .await?;
+            continue;
+        }
         let ev = frame["ev"].as_str().unwrap_or_default().to_string();
         match ev.as_str() {
             // A fresh venue: no account yet. The CLI's fallback is signup.
@@ -115,20 +128,6 @@ async fn serve(
                     .await?;
                 }
             },
-            "ui:turn.cancel" => {
-                send(
-                    &mut ws,
-                    json!({ "ev": "turn.cancel.result", "args": { "ok": true } }),
-                )
-                .await?;
-                // What the venue's pump reports when the stream it was
-                // reading dies under it.
-                send(
-                    &mut ws,
-                    json!({ "ev": "turn.error", "args": { "message": "turn cancelled" } }),
-                )
-                .await?;
-            }
             _ => {}
         }
     }
@@ -267,7 +266,7 @@ fn cancel_sends_the_venue_verb_and_ends_the_turn() {
     assert_eq!(out.status.code(), Some(4));
     let frames = seen.lock().unwrap().clone();
     assert_eq!(
-        frames.iter().filter(|f| f["ev"] == "ui:turn.cancel").count(),
+        frames.iter().filter(|f| f["dest"] == "turn.cancel").count(),
         1,
         "the client cancelled through the protocol, not by dropping the socket"
     );
