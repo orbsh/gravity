@@ -712,12 +712,12 @@ async fn a_cancelled_turn_stops_and_closes_no_turn() {
         }
     }
     let done = done.expect("the turn said it ended");
-    // NO CLOCK ASSERTION YET, and the reason is a missing link rather than a doubt: a turn
-    // served in-process by aura's engine reaches its guest through effector's executor API,
-    // and only the WIRE path (effector's `remote.rs`) arms a call's interrupt. So today this
-    // stop lands at the chunk boundary — 1.5 s, the provider's own pace — even though the
-    // turn is parked in a pull that a tick could reach. The gate belongs here the moment
-    // `crates/engine/src/effectors.rs` arms a control and keeps it addressable per call.
+    // NO CLOCK ASSERTION YET, and the gap is now one link wide: the handle reaches the
+    // carrier and the hook writes the frame (measured: effector arms frame 0, the guest
+    // reads `interrupt` for id 0), yet this handler's token never rises — so the stop still
+    // lands at the chunk boundary, at the provider's own 1.5 s. The next probe is inside
+    // induction's guest: which id the call is registered under when the reader claims the
+    // interrupt. The assertion goes back the moment those two ids are the same one.
     let _ = clicked;
 
     // THE END SAYS WHY, on the event a whole turn ends on: no new vocabulary, and no
