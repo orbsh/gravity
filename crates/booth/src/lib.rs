@@ -29,6 +29,23 @@ pub mod tools;
 /// The turn booth's type name.
 pub const TURN_TYPE: &str = "gravity_turn";
 
+/// The event a page's cancel control sends (ADR-0008 as revised).
+///
+/// It is NOT a booth route any more: the venue holds authority over the connection, so it
+/// serves this by setting the realm's stop bit on the sender's own instance (aura ADR-0047).
+/// The name survives because it is what a page and its renderer already send — what changed is
+/// who serves it and how.
+pub const CANCEL_EVENT: &str = "ui:turn.cancel";
+
+/// The instance a stop request addresses: the sender's own turn instance (the device is the
+/// key — one device, one turn at a time).
+pub fn turn_instance(device: &str) -> aura_booth::InstanceId {
+    aura_booth::InstanceId {
+        booth_type: TURN_TYPE.to_string(),
+        key: aura_booth::InstanceKey::Named(device.to_string()),
+    }
+}
+
 /// The turn booth's default spawn spec.
 const TURN_SPEC: &str = "gravity-turn";
 
