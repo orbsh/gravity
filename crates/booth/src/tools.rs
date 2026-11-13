@@ -1,9 +1,10 @@
 //! The fixed tool list (ADR-0004): hardcoded, grouped, and carrying the names
 //! k10r's tool face already has (`docs/SEAM.md` §2).
 //!
-//! Four entries today, because four doors answer: `recall_memory`,
-//! `commit_memory` and `resolve_skills` (k10r's HTTP surface — data access) and
-//! `invoke_skill` (a node mount — code execution, ADR-0001). The list is fixed
+//! Ten entries, because ten doors answer: k10r's HTTP surface (data access — the
+//! memory, skill and task verbs) and the node mounts (code execution, ADR-0001 —
+//! `invoke_skill` runs a skill's step, `run` runs a row no skill names). The list
+//! is fixed
 //! because gravity is the top of the stack and a pure glue: its memory and
 //! skills ARE k10r's and its execution surface IS the node's, so there is
 //! nothing per-deployment to discover here. Names are k10r's; the ADR fixed
@@ -143,6 +144,34 @@ static SPECS: &[ToolSpec] = &[
                     }
                 },
                 "required": ["skill_id"]
+            })
+        },
+        // It runs code: outside the process, on a node, with whatever effects
+        // that code has (ADR-0004 §6).
+        nature: Nature::Human,
+    },
+    ToolSpec {
+        name: "run",
+        description: "Run a script by its id, with no skill in the way. This is the door for a \
+                      code row YOU wrote with `write_code`, or one somebody handed you: exactly \
+                      what `invoke_skill` does with a step, minus the skill. The row states its \
+                      own language, and the mount that serves that language runs it; what you \
+                      pass in `arguments` is what the script receives. Use `read_code` first if \
+                      you need to see what it takes.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "code_id": {
+                        "type": "integer",
+                        "description": "The code row to run."
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": "What the script receives as its arguments."
+                    }
+                },
+                "required": ["code_id"]
             })
         },
         // It runs code: outside the process, on a node, with whatever effects
@@ -558,6 +587,7 @@ pub fn call(
         "read_code" => read_code(doors, args, facts, store_url),
         "write_code" => write_code(doors, args, facts, store_url),
         "invoke_skill" => invoke(doors, args, facts, store_url, walked),
+        "run" => run_code(doors, args, facts, store_url, walked),
         other => Err(format!(
             "unknown tool `{other}`; this deployment serves: {}",
             names().join(", ")
@@ -748,44 +778,11 @@ fn invoke(
     // A code row is scoped since k10r ADR-0023 (it is a vertex of that corpus's
     // graph), so the door carries the same scope the skill did.
     let code = doors.get(&format!("{store_url}/code/{scope}/{code_id}"))?;
-    let language = code
-        .get("language")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("invoke_skill: code row {code_id} answered no `language`"))?;
-    let source = code
-        .get("source")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("invoke_skill: code row {code_id} answered no `source`"))?;
-
-    // Language → mount is a MATCH against the deployment's declaration, not a
-    // default: a language no mount serves cannot be called (ADR-0001 §7), and
-    // the error names what this deployment does declare.
-    let mount = facts.mount_for(language).ok_or_else(|| {
-        let served: Vec<&str> = facts.mounts.iter().map(|(l, _)| l.as_str()).collect();
-        format!(
-            "invoke_skill: no mount serves `{language}` here (this deployment declares: {})",
-            if served.is_empty() {
-                "no mounts".to_string()
-            } else {
-                served.join(", ")
-            }
-        )
-    })?;
-
     // The script rides the call as an ARGUMENT: the mount's own source is a
     // fixed runner, and nothing about it varies per skill or version (ADR-0001
     // §2 — skills are data, never types).
     let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-
-    // The code row states what the script takes. Checking here — before a node
-    // is asked to run anything — is the difference between a model that learns
-    // the contract from one error and a node that fails on a missing key three
-    // layers down.
-    let parameters = code
-        .get("parameters")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    check_arguments(parameters, &arguments).map_err(|e| format!("invoke_skill: {e}"))?;
+    let (mount, source) = prepare(facts, &code, &arguments, "invoke_skill", code_id)?;
 
     // The ATTEMPT is counted before the node is asked to run anything (k10r
     // ADR-0018), on BOTH rows: the skill (this procedure was tried) and the script
@@ -797,7 +794,7 @@ fn invoke(
     touch(doors, store_url, "code", scope, code_id, "attempt");
 
     let value = doors.mount(
-        mount,
+        &mount,
         facts.session,
         json!({ "code": source, "args": arguments }),
     );
@@ -822,6 +819,112 @@ fn invoke(
     // The call site closes what this code row finishes (ADR-0003 §3): the model
     // dispatched the step, the binding did the rest. A FAILED run closes nothing
     // — work is only done when the thing that does it succeeded.
+    Ok(close_bound(doors, facts, store_url, scope, code_id, value))
+}
+
+/// What a code row needs before a node is asked to run it: the mount that serves
+/// its language, its source, and its arguments checked against the row's own
+/// declaration.
+///
+/// Split out because BOTH doors that run code need exactly this — `invoke_skill`
+/// for a skill's step, `run` for a row no skill names — and two doors that
+/// disagree about what "ready to run" means is how a script runs with arguments
+/// nobody checked, or a language no node serves.
+fn prepare(
+    facts: &Facts<'_>,
+    code: &Value,
+    arguments: &Value,
+    who: &str,
+    code_id: u64,
+) -> Result<(String, String), String> {
+    let language = code
+        .get("language")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{who}: code row {code_id} answered no `language`"))?;
+    let source = code
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{who}: code row {code_id} answered no `source`"))?;
+
+    // Language → mount is a MATCH against the deployment's declaration, not a
+    // default: a language no mount serves cannot be called (ADR-0001 §7), and
+    // the error names what this deployment does declare.
+    let mount = facts.mount_for(language).ok_or_else(|| {
+        let served: Vec<&str> = facts.mounts.iter().map(|(l, _)| l.as_str()).collect();
+        format!(
+            "{who}: no mount serves `{language}` here (this deployment declares: {})",
+            if served.is_empty() {
+                "no mounts".to_string()
+            } else {
+                served.join(", ")
+            }
+        )
+    })?;
+
+    // The code row states what the script takes. Checking here — before a node
+    // is asked to run anything — is the difference between a model that learns
+    // the contract from one error and a node that fails on a missing key three
+    // layers down.
+    let parameters = code
+        .get("parameters")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    check_arguments(parameters, arguments).map_err(|e| format!("{who}: {e}"))?;
+
+    Ok((mount.to_string(), source.to_string()))
+}
+
+/// `run`: a code row, on this deployment's node, with no skill in the way.
+///
+/// `invoke_skill` reaches a script THROUGH a skill's step, which means a row that
+/// no skill names has no door at all — and a script the model itself wrote with
+/// `write_code` is exactly such a row. Everything else is the same work: the row
+/// states its language, the language picks the mount, the script rides the call
+/// as an argument, and the row's own `parameters` are enforced before a node is
+/// asked to run anything.
+///
+/// The counters differ on purpose: there is no skill row to count, so only the
+/// code row records the attempt. Closing bound tasks and the walk stay the same —
+/// neither is about which door was used.
+fn run_code(
+    doors: &mut impl Doors,
+    args: &Value,
+    facts: &Facts<'_>,
+    store_url: &str,
+    walked: &mut Vec<Walked>,
+) -> Result<Value, String> {
+    let code_id = args
+        .get("code_id")
+        .and_then(Value::as_u64)
+        .ok_or("run: `code_id` is required (the row to run — `read_code` names it)")?;
+    let scope = facts.scope("run")?;
+    let code = doors.get(&format!("{store_url}/code/{scope}/{code_id}"))?;
+    let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let (mount, source) = prepare(facts, &code, &arguments, "run", code_id)?;
+
+    // A call that never comes back must still be visible (k10r ADR-0018): the
+    // attempt is counted before the node is asked to run anything, and the
+    // success is the second record — so `calls > ok` is what a reader looks for.
+    touch(doors, store_url, "code", scope, code_id, "attempt");
+    let value = doors.mount(
+        &mount,
+        facts.session,
+        json!({ "code": source, "args": arguments }),
+    );
+    if value.is_ok() {
+        touch(doors, store_url, "code", scope, code_id, "success");
+    }
+    let value = value?;
+    // Recorded like any other step: "this turn ran this row" is the same fact
+    // whichever door reached it, and the composition rule filters singletons.
+    walked.push(Walked {
+        code_id,
+        description: code
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    });
     Ok(close_bound(doors, facts, store_url, scope, code_id, value))
 }
 
@@ -1155,6 +1258,7 @@ mod tests {
                 "commit_memory",
                 "resolve_skills",
                 "invoke_skill",
+                "run",
                 "create_skill",
                 "read_code",
                 "write_code",
@@ -1768,6 +1872,114 @@ mod tests {
             doors.posts.is_empty(),
             "nothing reaches the store when the declaration cannot be made"
         );
+    }
+
+    /// The door that was missing: a script no skill names. `write_code` could put a
+    /// row in the store and nothing could run it, so a model could write a tool it
+    /// could never use.
+    #[test]
+    fn run_reaches_the_mount_without_a_skill_in_the_way() {
+        let mut doors = Recorder::default().answering(
+            "/code/37/4",
+            json!({
+                "language": "python",
+                "description": "adds",
+                "parameters": r#"{"type":"object","properties":{"n":{"type":"array"}}}"#,
+                "source": "print(sum(args['n']))",
+            }),
+        );
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+
+        call(
+            &mut doors,
+            "run",
+            &json!({ "code_id": 4, "arguments": { "n": [1, 2, 3] } }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect("the mount answered");
+
+        assert_eq!(
+            doors.gets,
+            vec!["http://mem.test/code/37/4".to_string()],
+            "the row is read directly — no skill, no step"
+        );
+        let (type_name, key, args) = &doors.mounts[0];
+        assert_eq!(type_name, "runner_py", "the row's own language chose the mount");
+        assert_eq!(key, "channel-7");
+        assert_eq!(args["code"], "print(sum(args['n']))");
+        assert_eq!(args["args"]["n"], json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn run_counts_the_row_once_and_no_skill() {
+        let mut doors = Recorder::default().answering(
+            "/code/37/4",
+            json!({ "language": "python", "parameters": "{}", "source": "print(1)" }),
+        );
+        let mounts = python_mount();
+        let facts = facts(&mounts, "channel-7");
+
+        call(
+            &mut doors,
+            "run",
+            &json!({ "code_id": 4 }),
+            &facts,
+            &mut Vec::new(),
+        )
+        .expect("the row runs");
+
+        let touches: Vec<&(String, Value)> = doors
+            .posts
+            .iter()
+            .filter(|(url, _)| url.ends_with("/touch"))
+            .collect();
+        assert_eq!(touches.len(), 2, "one row, one attempt and one success");
+        assert_eq!(touches[0].0, "http://mem.test/code/37/4/touch");
+        assert_eq!(touches[0].1["event"], "attempt");
+        assert_eq!(touches[1].1["event"], "success");
+    }
+
+    #[test]
+    fn run_refuses_a_language_no_mount_serves() {
+        let mut doors = Recorder::default().answering(
+            "/code/37/4",
+            json!({ "language": "steel", "parameters": "{}", "source": "(code)" }),
+        );
+        let mounts = python_mount();
+        let err = call(
+            &mut doors,
+            "run",
+            &json!({ "code_id": 4 }),
+            &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
+        )
+        .expect_err("nothing serves steel here");
+        assert!(err.contains("no mount serves `steel`"), "{err}");
+        assert!(err.contains("python"), "the error names what IS declared: {err}");
+        assert!(doors.mounts.is_empty(), "no node was asked to run anything");
+    }
+
+    #[test]
+    fn run_enforces_the_rows_own_parameters() {
+        let schema = r#"{"type":"object","required":["n"],"properties":{"n":{"type":"array"}}}"#;
+        let mut doors = Recorder::default().answering(
+            "/code/37/4",
+            json!({ "language": "python", "parameters": schema, "source": "print(sum(args['n']))" }),
+        );
+        let mounts = python_mount();
+        let err = call(
+            &mut doors,
+            "run",
+            &json!({ "code_id": 4, "arguments": {} }),
+            &facts(&mounts, "channel-7"),
+            &mut Vec::new(),
+        )
+        .expect_err("the row says `n` is required");
+        assert!(err.starts_with("run: "), "{err}");
+        assert!(err.contains('n'), "{err}");
+        assert!(doors.mounts.is_empty(), "the refusal happens before the node");
     }
 
     #[test]
