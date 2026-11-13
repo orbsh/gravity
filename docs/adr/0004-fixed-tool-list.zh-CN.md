@@ -61,6 +61,7 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
    | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}`——图谱的 ingest | 已入清单 |
    | `resolve_skills` | `{query}`、`{limit}` | **可选 skill 清单**——模型自己完不成时去查的东西；k10r 按意图答候选 | 已入清单（2026-10-26）：k10r ADR-0015 落地了 skill 节点与 `POST /skills/{memory_scope}/resolve`——skill 与事实同图，所以图的 scope 就地址到它 |
    | `invoke_skill` | `{skill_id, step?, arguments?}` | 读 skill、选一步、`GET /code/{id}` 取脚本，然后受治理的调用 `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` 在 effector 节点 mount 上跑它（SEAM.md §3） | 已入清单（2026-10-26）：**一次调用一步**，顺序归模型（见 §3） |
+   | `run` | `{code_id, arguments?}` | `GET /code/{memory_scope}/{code_id}`，然后做 `invoke_skill` 做的那次受治理调用——没有 skill，没有步骤，被点名的就是那一行 | 2026-11-09 列入：给「不属于任何 skill 的 code 行」的那道门。没有它，`write_code` 能交付一个谁都跑不了的脚本——基底提供了脚本，却没提供它的用法，这和列一个没有门应答的工具是同一种撒谎 |
 
    task 组（`task_open` / `task_done` / `task_list`）已声明但**不入清单**：它的写面还没有
    路由，读侧骑在会话投影上（SEAM.md §2 的「Task progress」；ADR-0003 §3、PLAN Phase
