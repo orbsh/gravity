@@ -291,7 +291,15 @@ fn material(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
         _ => None,
     };
     let minted = resource.material(write, credential.as_deref())?;
-    Ok(json!({ "url": minted.url, "credential": minted.credential }))
+    // The type IS the transport today (`git` is delivered by git); a second transport arrives with
+    // its own row and its own code, at which point this becomes a column rather than an identity.
+    Ok(json!({
+        "url": minted.url,
+        "credential": minted.credential,
+        "transport": field("rtype")?,
+        "mode": if matches!(resource.mode, gravity_booth::resources::Mode::ReadWrite) { "rw" } else { "ro" },
+        "ref": row.get("git_ref").and_then(Value::as_str),
+    }))
 }
 
 /// A published version: write the row, then advance the pointer on the resource. The node reports
