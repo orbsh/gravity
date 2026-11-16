@@ -1833,10 +1833,12 @@ dependencies = [
  "induction-protocol",
  "mem-core",
  "mem-server",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "ureq",
+ "uuid",
 ]
 
 [[package]]

@@ -14,6 +14,8 @@ aura-engine = { path = "../../../aura/crates/engine", default-features = false }
 gravity-core = { path = "../core" }
 induction-guest = { path = "../../../induction/crates/induction-guest" }
 anyhow.workspace = true
+serde.workspace = true
+uuid.workspace = true
 serde_json.workspace = true
 ureq = { version = "2", features = ["json"] }
 

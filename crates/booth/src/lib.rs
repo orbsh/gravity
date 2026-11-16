@@ -23,6 +23,7 @@
 
 /// The fixed tool list (ADR-0004) — the affordances the turn offers, their
 /// schemas, and the door each one reaches.
+pub mod resources;
 pub mod tasks;
 pub mod tools;
 
