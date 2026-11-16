@@ -65,6 +65,12 @@ fn main() -> anyhow::Result<()> {
         // booth refuses an admin verb, so that door is an event like the turn's, behind the same
         // auth declaration.
         .on("save", |ctx: &mut Ctx, args: Value| save(ctx, &args))
+        // THE RESOURCE DOOR (ADR-0003 §7): the Effector asks by (owner, type, sequence) and gets
+        // material for ONE transfer; after it publishes, it reports the reference it produced and
+        // this booth writes the version row and advances the pointer. The node never holds a
+        // credential of its own and never names a location — it names a resource.
+        .on("material", |ctx: &mut Ctx, args: Value| material(ctx, &args))
+        .on("published", |ctx: &mut Ctx, args: Value| published(ctx, &args))
         // And the SCREEN that asks for it: ADR-0007 §4 said management is a view, so the same
         // booth that performs a save draws the forms that emit it.
         .on("screen", |ctx: &mut Ctx, args: Value| screen(ctx, &args))
@@ -116,6 +122,55 @@ fn storage_schema() -> Value {
                     "slots": slots.clone(),
                 },
             },
+            // ADR-0003 §7: the resource table. Owner and type are DOCUMENT fields, not key
+            // fields, because a key here is (discriminator, u64) — so the handler checks ownership
+            // when it reads, which is the check that has to happen anyway before minting anything.
+            "resources": {
+                "schema": {
+                    "key_len": 16,
+                    "key_fields": key,
+                    "layout_version": 1,
+                    "hot_width": 16,
+                    "payload_header_len": 3,
+                    "hot_fields": [
+                        {"name": "mode", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
+                        {"name": "current", "ty": "U64", "width": 8, "offset": 8, "tag": 0},
+                    ],
+                    "cold_fields": [
+                        {"name": "owner", "ty": "Str", "width": 0, "offset": 0, "tag": 1},
+                        {"name": "rtype", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
+                        {"name": "desc", "ty": "Str", "width": 0, "offset": 0, "tag": 3},
+                        {"name": "source", "ty": "Str", "width": 0, "offset": 0, "tag": 4},
+                        {"name": "git_ref", "ty": "Str", "width": 0, "offset": 0, "tag": 5},
+                        {"name": "credential_env", "ty": "Str", "width": 0, "offset": 0, "tag": 6},
+                        {"name": "reference", "ty": "Str", "width": 0, "offset": 0, "tag": 7},
+                    ],
+                    "slots": slots.clone(),
+                },
+            },
+            // One row per published version, and its `previous` is the version it replaced: undo
+            // is one read, and the history needs no index over "versions of this resource".
+            "resource_versions": {
+                "schema": {
+                    "key_len": 16,
+                    "key_fields": key,
+                    "layout_version": 1,
+                    "hot_width": 24,
+                    "payload_header_len": 3,
+                    "hot_fields": [
+                        {"name": "seq", "ty": "U64", "width": 8, "offset": 0, "tag": 0},
+                        {"name": "previous", "ty": "U64", "width": 8, "offset": 8, "tag": 0},
+                        {"name": "created_at", "ty": "U64", "width": 8, "offset": 16, "tag": 0},
+                    ],
+                    "cold_fields": [
+                        {"name": "owner", "ty": "Str", "width": 0, "offset": 0, "tag": 1},
+                        {"name": "rtype", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
+                        {"name": "reference", "ty": "Str", "width": 0, "offset": 0, "tag": 3},
+                        {"name": "call_id", "ty": "Str", "width": 0, "offset": 0, "tag": 4},
+                    ],
+                    "slots": slots.clone(),
+                },
+            },
             "models": {
                 "schema": {
                     "key_len": 16,
@@ -143,6 +198,9 @@ fn storage_schema() -> Value {
 /// The key discriminator each collection uses inside the type's ONE ns (see `storage_schema`).
 const KIND_SETTINGS: u64 = 1;
 const KIND_MODELS: u64 = 2;
+/// The resource table's row (ADR-0003 §7), and one row per published version.
+const KIND_RESOURCES: u64 = 3;
+const KIND_VERSIONS: u64 = 4;
 
 /// One row of `settings` (id 1) — the deployment facts a turn needs, which used to ride the call
 /// arguments from the gateway (ADR-0007).
@@ -156,6 +214,130 @@ struct Settings {
 /// Read the settings row. A fresh deployment has none, and that is a NAMED error: the turn says
 /// which document and which keys are missing rather than falling back to an environment variable
 /// (a fallback is a second home by another name, ADR-0007 §5).
+/// One resource row, checked against the caller before anything is minted. Ownership is a DOCUMENT
+/// field because the store's key is (discriminator, u64) — so this comparison is the authorization,
+/// not an optimisation, and nothing may be minted before it passes.
+fn resource_row(
+    ctx: &mut Ctx,
+    owner: &str,
+    rtype: &str,
+    seq: u64,
+) -> anyhow::Result<Value> {
+    let row = ctx.store(json!({
+        "collection": "resources",
+        "op": "get_document",
+        "key": { "kind": KIND_RESOURCES, "id": seq },
+    }))?;
+    if row.is_null() {
+        anyhow::bail!("no resource {seq} is declared");
+    }
+    let text = |name: &str| -> anyhow::Result<String> {
+        row.get(name)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("resource {seq} has no `{name}`"))
+    };
+    if text("owner")? != owner {
+        anyhow::bail!("resource {seq} belongs to another owner");
+    }
+    if text("rtype")? != rtype {
+        anyhow::bail!("resource {seq} is not a `{rtype}`");
+    }
+    Ok(row)
+}
+
+/// Material for one transfer of one resource (ADR-0003 §7). The credential is read from the env var
+/// the row NAMES (`credential_env`), never from the row: the table can be dumped without handing
+/// anyone a key, and the booth's own pattern for secrets is the same one the model key uses.
+fn material(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
+    let field = |name: &str| -> anyhow::Result<&str> {
+        args.get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("material: no `{name}`"))
+    };
+    let seq = args
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("material: no numeric `seq`"))?;
+    let write = args.get("write").and_then(Value::as_bool).unwrap_or(false);
+    let row = resource_row(ctx, field("owner")?, field("rtype")?, seq)?;
+
+    let mut spec = std::collections::BTreeMap::new();
+    for (key, name) in [("source", "source"), ("ref", "git_ref")] {
+        if let Some(value) = row.get(name).and_then(Value::as_str) {
+            if !value.is_empty() {
+                spec.insert(key.to_string(), value.to_string());
+            }
+        }
+    }
+    let mode = match row.get("mode").and_then(Value::as_u64) {
+        Some(1) => gravity_booth::resources::Mode::ReadWrite,
+        _ => gravity_booth::resources::Mode::ReadOnly,
+    };
+    let resource = gravity_booth::resources::Resource {
+        desc: row
+            .get("desc")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        mode,
+        created_at: 0,
+        spec,
+    };
+    let credential = match row.get("credential_env").and_then(Value::as_str) {
+        Some(name) if !name.is_empty() => Some(std::env::var(name).map_err(|_| {
+            anyhow::anyhow!("resource {seq}: `{name}` is not set in this booth's environment")
+        })?),
+        _ => None,
+    };
+    let minted = resource.material(write, credential.as_deref())?;
+    Ok(json!({ "url": minted.url, "credential": minted.credential }))
+}
+
+/// A published version: write the row, then advance the pointer on the resource. The node reports
+/// what it produced; it never says which version that is — that is the plane's to name.
+fn published(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
+    let field = |name: &str| -> anyhow::Result<&str> {
+        args.get(name)
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("published: no `{name}`"))
+    };
+    let seq = args
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("published: no numeric `seq`"))?;
+    let now_ms = args.get("now_ms").and_then(Value::as_u64).unwrap_or_else(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default()
+    });
+    let owner = field("owner")?;
+    let rtype = field("rtype")?;
+    let row = resource_row(ctx, owner, rtype, seq)?;
+    let previous = row.get("current").and_then(Value::as_u64).unwrap_or(0);
+    let version = gravity_booth::resources::next_version(previous, now_ms);
+    ctx.store(json!({
+        "collection": "resource_versions",
+        "op": "put_document",
+        "key": { "kind": KIND_VERSIONS, "id": version },
+        "doc": {
+            "seq": seq, "previous": previous, "created_at": now_ms,
+            "owner": owner, "rtype": rtype,
+            "reference": field("reference")?, "call_id": field("call_id")?,
+        },
+    }))?;
+    // The pointer advance comes second on purpose: a crash between the two leaves a version row
+    // nobody points at (harmless) rather than a pointer to a version that was never recorded.
+    ctx.store(json!({
+        "collection": "resources",
+        "op": "put_fields",
+        "key": { "kind": KIND_RESOURCES, "id": seq },
+        "fields": { "current": version, "reference": field("reference")? },
+    }))?;
+    Ok(json!({ "version": version, "previous": previous }))
+}
+
 fn read_settings(ctx: &mut Ctx) -> anyhow::Result<Settings> {
     let row = ctx.store(json!({
         "collection": "settings", "op": "get_document", "key": { "kind": KIND_SETTINGS, "id": 1 },
