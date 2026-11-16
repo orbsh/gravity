@@ -2,12 +2,7 @@
 
 > **Languages:** [English](0005-skill-body-is-code.md) (primary) · [中文](0005-skill-body-is-code.zh-CN.md)
 
-**Status:** Accepted (2026-10-26). Ruling: composition inside a skill is written
-in an EXISTING language — steel or python — and never in a format this project
-invents. One part of the execution path is unverified (§4: steel's ability to
-evaluate a delivered string); that is a check, not an objection to the ruling, and
-it is DEFERRED: python alone is enough to implement against, so nobody is to spend
-time on the steel path until the priority rises on its own.
+**Status:** **Superseded by [ADR-0011](0011-composition-is-a-graph.md)** (2026-11-16). This record's two rejections stand — an invented DSL, and a JSON list as the composition form; what ADR-0011 replaces is the conclusion: composition is a graph held in the skill node, and each step's code is a leaf that receives no ctx. §4's steel check still governs how a step executes, and is still unverified.
 **Date:** 2026-10-26
 
 ## Context

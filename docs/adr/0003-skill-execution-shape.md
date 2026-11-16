@@ -2,9 +2,7 @@
 
 > **Languages:** [English](0003-skill-execution-shape.md) (primary) · [中文](0003-skill-execution-shape.zh-CN.md)
 
-**Status:** Accepted (2026-10-14). Design ruling: the pieces it names are landed
-— the ctx bridge out of a resident guest, the turn-start task listing with its
-`finishes_on` bindings, and the pre-dispatch gate.
+**Status:** Accepted (2026-10-14), **amended 2026-11-16 by [ADR-0011](0011-composition-is-a-graph.md)**: §1's criterion and §2's carrier rule are replaced — composition is a graph and code is a leaf. §3 (progress is data) and §5 (execution history never edits topology) stand unchanged and are load-bearing for the run document. Design ruling: the pieces it names are landed — the ctx bridge out of a resident guest, the turn-start task listing with its `finishes_on` bindings, and the pre-dispatch gate.
 **Date:** 2026-10-14
 
 ## Context
@@ -35,20 +33,10 @@ performs at turn start.
 
 ## Decision
 
-**RULING — code is the composition primitive, progress is data, and execution
-history never edits the graph's topology.**
+**RULING — composition is a graph whose code is a leaf, progress is data, and execution history never edits the graph's topology.**
 
-1. **Branch and step logic is a glue script, not a flow engine.** A branch that
-   the caller's code can express does not need a second interpreter: the script
-   is delivered as an argument (ADR-0001), it calls the sibling steps through
-   ctx, and the composition is visible in one place. A flow engine's ceiling is
-   its own vocabulary, while code is Turing-complete on a mount that already
-   exists — and the model writes code better than it writes a flow DSL.
-2. **Glue rides a mount whose carrier is `induction`.** The ctx bridge is a
-   channel, and the one-shot `exec` carrier has none by contract (one JSON
-   document in, one out; no frames, no residency, no ctx bridge). The manifest's
-   `carrier` axis (ADR-0001 §7) therefore STATES which mounts can host a
-   composed operation — "can this mount run glue" is a declaration, not a guess.
+1. **Composition is a graph, and the criterion is protocol vs language — not expressiveness.** This section originally ruled the opposite (a glue script, not a flow engine) on the argument that code is Turing-complete and the model writes code better than it writes a flow DSL. ADR-0011 reversed it: unbounded expressiveness is a defect in an executor that must be audited, cost-bounded, rendered and statically checked, and a form whose programs cannot express unbounded computation is a protocol rather than a language. A step's script is a leaf that receives no ctx.
+2. **A step rides a mount, and no script reads the run document.** The one-shot `exec` carrier carries one JSON document in and one out (no frames, no residency, no ctx bridge); the resident `induction` carrier has one, but under ADR-0011 a step's inputs arrive as arguments and its answer is the return value, so composition no longer constrains the carrier at all — a step can ride the one-shot carrier. The manifest's `carrier` axis (ADR-0001 §7) still states which mounts a call can ride.
 3. **Progress is data: one task row per step, bound to the call that completes
    it.** The binding is `task --finishes_on--> code`, an ordinary edge in the
    same graph as the facts (k10r ADR-0023 made a code row a VERTEX, which is what
@@ -78,8 +66,7 @@ history never edits the graph's topology.**
    and a change from elsewhere arrives with the next projection.
 5. **Execution history writes numbers, never topology.** Counters and weights
    are additive and reversible data (the `tool_invoke_count` write-back is the
-   counter's home, Phase 5); a glue script is a session-scoped artifact (a data
-   row, not a new parent). Moving a node under another parent is a DEFINITION
+   counter's home, Phase 5); a run is a row, never a new parent. Moving a node under another parent is a DEFINITION
    change, so a recurring composition is PROPOSED for promotion and applied by
    an audited act — never self-applied. The graph's boundaries emerge from usage
    statistics (clustering over what was called and how it went); rewriting edges
@@ -95,15 +82,10 @@ history never edits the graph's topology.**
 
 ## Considered and rejected
 
-- **A flow engine.** It buys a visible, pausable, deterministic flow diagram —
-  and pays by re-expressing branch, loop and composition in a vocabulary that
-  caps at whatever the engine implements, on top of a mount that runs code.
-  The one property it genuinely adds (the flow is inspectable) is deliverable by
-  the task rows of decision 3, which are checkable data rather than a second
-  interpreter.
-- **Auto re-parenting on repeat ("the glue ran three times, hang these steps
+- **A flow engine.** It buys a visible, pausable, deterministic flow diagram — and pays by re-expressing branch, loop and composition in a vocabulary that caps at whatever the engine implements, on top of a mount that runs code. The one property it genuinely adds (the flow is inspectable) is deliverable by the task rows of decision 3, which are checkable data rather than a second interpreter. **ADR-0011 reopened this**: the cap is the thing being bought (a bounded vocabulary is what makes a plan enumerable, auditable and cost-bounded), and code is demoted to a leaf inside each step.
+- **Auto re-parenting on repeat ("this composition ran three times, hang these steps
   under it").** This is execution history rewriting shared topology: the graph's
-  structure is curated and emergent-by-statistics, a glue node is per-session,
+  structure is curated and emergent-by-statistics, a run is per-session,
   and the first session that invented a composition would silently re-define
   every later reader's graph. Same rejection as "emergent data never mints a
   type", applied to edges.
@@ -136,8 +118,7 @@ history never edits the graph's topology.**
 
 - **PLAN Phase 2.6** is this ruling's implementation site: the task rows, their
   call bindings, and the pre-dispatch gate.
-- **PLAN Phase 4.6** gains the carrier constraint: a composed operation needs an
-  `induction` mount, and the manifest says which those are.
+- **PLAN Phase 4.6 loses a constraint** (ADR-0011): a step is one call — arguments in, return value out — so composition does not need an `induction` mount. The manifest's carrier axis still states what each mount can host.
 - **PLAN Phase 5**'s weight write-back is a counter write, not a topology edit.
 - **okm side:** a re-parent is an explicit `unlink` + `link` pair — nothing
   sweeps edges when a node row is deleted, by design (okm's PLAN records the
@@ -160,6 +141,6 @@ history never edits the graph's topology.**
 ADR-0001 (the execution surface, the carrier axis, the ctx bridge),
 ADR-0002 (the client form), `docs/PLAN.md` Phases 2.5 / 2.6 / 4.6 / 5, okm
 ADR-0015 §B and `okm/docs/PLAN.md` (relations: `link`/`unlink`, no implicit
-cleanup), aura ADR-0043 (the ctx surface a glue script calls through), and the
+cleanup), aura ADR-0043 (the ctx surface a mount call rides), and the
 memory records on emergent skill boundaries (usage statistics, not edge
 rewrites).
