@@ -317,7 +317,10 @@ impl MemorySurface for InProcessSurface {
             // head, not a re-computation of it). k10r retired the separate
             // verdict record — the checkpoint IS the record, and the head ids are
             // what it carries; a decision that is not written down is not one.
-            let head_ids: Vec<u64> = projection.head.iter().map(|fact| fact.edge_id).collect();
+            // A fact's identity is its key's WIRE BYTES now (okm ADR-0067: no numbers to
+            // allocate, preserve and look up). The checkpoint carries exactly those bytes.
+            let head_ids: Vec<mem_core::channel::HeadKey> =
+                projection.head.iter().map(|fact| fact.key.wire()).collect();
             channels
                 .open_checkpoint(channel_id, v.checkpoint, &head_ids)
                 .map_err(anyhow::Error::msg)?;
