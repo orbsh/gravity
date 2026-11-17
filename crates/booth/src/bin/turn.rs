@@ -492,21 +492,36 @@ fn request_forms(awaiting: &Value) -> Vec<Value> {
                 // from a list slot and writes a destination, not a form field), so it
                 // falls back to text rather than drawing something that cannot answer.
                 let declared = field.get("type").and_then(Value::as_str).unwrap_or("string");
-                let widget = match declared {
-                    "integer" | "number" => "number",
-                    "bool" => "bool",
-                    _ => "text",
-                };
-                children.push(json!({
-                    "type": "input",
-                    "id": name,
-                    "bind": { "value": {
-                        "kind": "field",
-                        "field": name,
-                        "payload": field.clone(),
-                        "type": widget,
-                    }},
-                }));
+                // A choice is a SELECT, and its options are the plan's: fluxen reads
+                // them out of the field's own declaration (`payload.options`) when the
+                // binding is a form `field`, and writes the picked name into the form.
+                children.push(if declared == "choice" {
+                    json!({
+                        "type": "select",
+                        "id": name,
+                        "bind": { "value": {
+                            "kind": "field",
+                            "field": name,
+                            "payload": field.clone(),
+                        }},
+                    })
+                } else {
+                    let widget = match declared {
+                        "integer" | "number" => "number",
+                        "bool" => "bool",
+                        _ => "text",
+                    };
+                    json!({
+                        "type": "input",
+                        "id": name,
+                        "bind": { "value": {
+                            "kind": "field",
+                            "field": name,
+                            "payload": field.clone(),
+                            "type": widget,
+                        }},
+                    })
+                });
             }
             children.push(json!({
                 "type": "button",
@@ -2925,6 +2940,7 @@ mod tests {
                     { "name": "branch", "type": "string" },
                     { "name": "count", "type": "integer" },
                     { "name": "sure", "type": "bool" },
+                    { "name": "side", "type": "choice", "options": ["left", "right"] },
                 ]},
             }],
         });
@@ -2939,6 +2955,13 @@ mod tests {
         assert_eq!(form["attrs"]["selector"], "assistant");
         assert_eq!(form["bind"]["value"]["dest"], "run.answer");
         // The widget follows the DECLARED kind, in accrete's smaller vocabulary.
+        let kinds: Vec<&str> = form["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|child| child["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(kinds, vec!["input", "input", "input", "select", "button"], "{form}");
         let widgets: Vec<&str> = form["children"]
             .as_array()
             .unwrap()
@@ -2946,6 +2969,11 @@ mod tests {
             .filter_map(|child| child["bind"]["value"]["type"].as_str())
             .collect();
         assert_eq!(widgets, vec!["text", "number", "bool"], "{form}");
+        assert_eq!(
+            form["children"][3]["bind"]["value"]["payload"]["options"][0],
+            "left",
+            "the choice carries its options to the widget: {form}"
+        );
         assert_eq!(
             form["children"][0]["bind"]["value"]["payload"]["type"],
             "string",
