@@ -781,6 +781,15 @@ fn touch(
 /// second meaning of "invoke" inside the same tool would make the model's
 /// control over the sequence invisible. A multi-step skill is a loop the MODEL
 /// drives — it saw the steps in the resolve answer.
+/// The subjects this deployment can DELIVER, and which k10r door each belongs to.
+///
+/// A `send` step names a subject; a deployment that cannot deliver it must leave
+/// the step ready rather than drop the message — a send that silently vanished is
+/// the one failure mode a message cannot report. `memory/fact` is the ingest door
+/// (k10r's `POST /memories/{scope}`), which is the only subject the memory core
+/// itself can receive.
+const SUBJECTS: &[(&str, &str)] = &[("memory/fact", "memories")];
+
 /// How many drive rounds one `start` may take. A conforming plan converges in a
 /// handful; the bound exists so a defect spins in the caller's hands, not here.
 const MAX_ROUNDS: usize = 32;
@@ -823,8 +832,30 @@ fn drive(
                                        "terminal": true }));
                     value
                 }
-                // A call by ADDRESS, a request, a send: not the engine's to
-                // dispatch here. They stay ready and the caller decides.
+                // A send leaves the run: the subject picks the door, and a
+                // subject nobody here serves leaves the step READY — parked, not
+                // dropped, because a message that vanished cannot report itself.
+                schematic::Kind::Send { subject, payload } => {
+                    let Some((_, area)) = SUBJECTS
+                        .iter()
+                        .find(|(served, _)| served == subject)
+                    else {
+                        continue;
+                    };
+                    let body = payload.clone().unwrap_or_else(|| json!(activation.inputs));
+                    let scope = facts.scope("start")?;
+                    let answer = doors.post(
+                        &format!("{store_url}/{area}/{scope}"),
+                        &body,
+                    )?;
+                    trace.push(json!({ "step": activation.step, "pass": activation.pass,
+                                       "attempt": activation.attempt, "subject": subject,
+                                       "output": answer }));
+                    answer
+                }
+                // A call by ADDRESS and a request are not the engine's: one is a
+                // route this deployment may not mount, the other waits for a
+                // person. Both stay ready and the caller decides.
                 _ => continue,
             };
             schematic::advance(
@@ -1893,6 +1924,66 @@ mod tests {
         .expect("a refusal is an answer");
         assert_eq!(value["ok"], false, "{value}");
         assert_eq!(doors.posts.len(), before, "nothing reached the store");
+    }
+
+    /// A `send` leaves the run through the door its subject names, and a subject
+    /// no deployment here serves leaves the step READY — a message that vanished
+    /// cannot report that it vanished.
+    #[test]
+    fn a_send_is_delivered_by_subject_or_left_ready() {
+        let mounts = python_mount();
+        let delivered = r#"{
+          "schema_version": 1,
+          "steps": [
+            { "id": "tell", "kind": "send", "subject": "memory/fact",
+              "payload": [["alice", "person", {}, "likes", {}, "tea", "drink", {}]],
+              "out_edges": [{ "to": "done" }] },
+            { "id": "done", "kind": "end" }
+          ]
+        }"#;
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": delivered }))
+            .answering("/memories/37", json!({ "landed": 1 }));
+        let value = call(
+            &mut doors,
+            "start",
+            &json!({ "skill_id": 9 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(
+            doors.posts[0].0, "http://mem.test/memories/37",
+            "the subject picked the ingest door"
+        );
+        assert_eq!(doors.posts[0].1[0][0], "alice", "the payload was the body");
+        assert_eq!(value["complete"], true, "the path closed: {value}");
+
+        // A subject with no deliverer: the step stays ready, nothing is posted.
+        let undelivered = r#"{
+          "schema_version": 1,
+          "steps": [
+            { "id": "tell", "kind": "send", "subject": "mail/out", "payload": {"x": 1},
+              "out_edges": [{ "to": "done" }] },
+            { "id": "done", "kind": "end" }
+          ]
+        }"#;
+        let mut doors = Recorder::default().answering("/skills/37/9", json!({ "steps": undelivered }));
+        let value = call(
+            &mut doors,
+            "start",
+            &json!({ "skill_id": 9 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+        assert!(doors.posts.is_empty(), "nothing was delivered");
+        assert_eq!(value["ok"], true, "{value}");
+        let ready = value["ready"].as_array().unwrap_or_else(|| panic!("{value}"));
+        assert_eq!(ready.len(), 1, "the send is parked, not dropped: {value}");
+        assert_eq!(ready[0]["step"], "tell");
     }
 
     #[test]
