@@ -486,7 +486,17 @@ fn request_forms(awaiting: &Value) -> Vec<Value> {
             {
                 let name = field.get("name").and_then(Value::as_str).unwrap_or("");
                 // The declared kind and its options ride `payload`: the field widget
-                // draws what the FORM said, not what gravity guesses.
+                // draws what the FORM said, not what gravity guesses. `type` is the
+                // WIDGET's (accrete's `JsType`), which is a smaller vocabulary than the
+                // plan's — `choice` has no form widget yet (a `select` reads its options
+                // from a list slot and writes a destination, not a form field), so it
+                // falls back to text rather than drawing something that cannot answer.
+                let declared = field.get("type").and_then(Value::as_str).unwrap_or("string");
+                let widget = match declared {
+                    "integer" | "number" => "number",
+                    "bool" => "bool",
+                    _ => "text",
+                };
                 children.push(json!({
                     "type": "input",
                     "id": name,
@@ -494,13 +504,14 @@ fn request_forms(awaiting: &Value) -> Vec<Value> {
                         "kind": "field",
                         "field": name,
                         "payload": field.clone(),
+                        "type": widget,
                     }},
                 }));
             }
             children.push(json!({
                 "type": "button",
                 "attrs": { "oneshot": true },
-                "bind": { "value": { "kind": "submit", "default": "submit" } },
+                "bind": { "value": { "kind": "submit", "default": "Send" } },
             }));
             json!({
                 // THE STREAM, not a region of our own: a form a person must answer is
@@ -2910,8 +2921,10 @@ mod tests {
             "run_id": 17,
             "requests": [{
                 "step": "ask", "pass": 0, "attempt": 0,
-                "form": { "title": "Which way?", "fields": [
-                    { "name": "branch", "type": "choice", "options": ["left", "right"] },
+                "form": { "title": "How many?", "fields": [
+                    { "name": "branch", "type": "string" },
+                    { "name": "count", "type": "integer" },
+                    { "name": "sure", "type": "bool" },
                 ]},
             }],
         });
@@ -2921,15 +2934,28 @@ mod tests {
         assert_eq!(frame["action"], "append");
         assert_eq!(frame["slot"], MESSAGES_SLOT, "the form is a message, not a region");
         let form = &frame["data"];
+        assert_eq!(form["type"], "form", "accrete's own Form, not ours");
         assert_eq!(form["id"], "17/ask/0/0", "the address the answer comes back on");
+        assert_eq!(form["attrs"]["selector"], "assistant");
         assert_eq!(form["bind"]["value"]["dest"], "run.answer");
-        assert_eq!(form["children"][0]["id"], "branch");
+        // The widget follows the DECLARED kind, in accrete's smaller vocabulary.
+        let widgets: Vec<&str> = form["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|child| child["bind"]["value"]["type"].as_str())
+            .collect();
+        assert_eq!(widgets, vec!["text", "number", "bool"], "{form}");
         assert_eq!(
-            form["children"][0]["bind"]["value"]["payload"]["options"][1],
-            "right",
-            "the field's own declaration rides with it"
+            form["children"][0]["bind"]["value"]["payload"]["type"],
+            "string",
+            "the plan's own declaration rides with the field"
         );
-        assert_eq!(form["children"][1]["bind"]["value"]["kind"], "submit");
+        let button = form["children"].as_array().unwrap().last().unwrap();
+        assert_eq!(button["bind"]["value"]["kind"], "submit");
+        assert_eq!(button["bind"]["value"]["default"], "Send", "a label, not a type");
+        assert_eq!(button["attrs"]["oneshot"], true);
+
         assert_eq!(parse_address("17/ask/0/0").unwrap(), (17, "ask".into(), 0, 0));
         assert!(parse_address("17/ask").is_err(), "an address is four parts");
     }
