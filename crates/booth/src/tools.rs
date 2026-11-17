@@ -1020,7 +1020,11 @@ fn start(
     }
 
     let hash = plan_hash(text);
-    let mut run = schematic::Run::new(hash.clone());
+    // The run remembers WHERE it came from, not just which plan it is: a run can
+    // outlive the turn that started it by days, and whoever picks it up again is
+    // not holding the skill id the model had in hand. `plan_hash` says "same
+    // definition", the origin says "which one".
+    let mut run = schematic::Run::new(hash.clone()).with_origin(format!("skill:{scope}/{skill_id}"));
     if let Some(params) = args.get("params").and_then(Value::as_object) {
         for (name, value) in params {
             run.params.insert(name.clone(), value.clone());
@@ -1061,6 +1065,15 @@ fn start(
     }))
 }
 
+/// The `(scope, skill)` a run's origin spells — `skill:{scope}/{id}`, the one form
+/// this booth writes. A run started by an older build carries none, which is why
+/// `advance` still accepts an explicit `skill_id`.
+fn origin_of(run: &schematic::Run) -> Option<(u64, u64)> {
+    let rest = run.origin.as_deref()?.strip_prefix("skill:")?;
+    let (scope, skill) = rest.split_once('/')?;
+    Some((scope.parse().ok()?, skill.parse().ok()?))
+}
+
 /// `advance`: one completion into a run, then the next ready set (ADR-0011 §7).
 ///
 /// The PLAN is re-read rather than trusted from the run: `plan_hash` is the
@@ -1073,10 +1086,6 @@ fn advance_run(
     facts: &Facts<'_>,
     store_url: &str,
 ) -> Result<Value, String> {
-    let skill_id = args
-        .get("skill_id")
-        .and_then(Value::as_u64)
-        .ok_or("advance: `skill_id` is required")?;
     let run_id = args
         .get("run_id")
         .and_then(Value::as_u64)
@@ -1091,7 +1100,27 @@ fn advance_run(
     let pass = args.get("pass").and_then(Value::as_u64).unwrap_or(0) as u32;
     let attempt = args.get("attempt").and_then(Value::as_u64).unwrap_or(0) as u32;
     let output = args.get("output").cloned().unwrap_or(Value::Null);
-    let scope = facts.scope("advance")?;
+
+    // WHICH skill: the caller may name it (a page that already knows), or the run
+    // may say — it carries the address it started from. A run whose origin is
+    // missing and whose caller says nothing is refused rather than guessed at.
+    let (scope, skill_id) = match args.get("skill_id").and_then(Value::as_u64) {
+        Some(skill_id) => (facts.scope("advance")?, skill_id),
+        None => {
+            let read_scope = facts.scope("advance")?;
+            let stored = doors.get(&format!("{store_url}/runs/{read_scope}/{run_id}"))?;
+            let doc = stored
+                .get("doc")
+                .and_then(Value::as_str)
+                .ok_or("advance: the run answer carried no document")?;
+            let run = schematic::run_from_json(doc)
+                .map_err(|e| format!("advance: the stored run is not a run: {e}"))?;
+            origin_of(&run).ok_or(
+                "advance: no `skill_id` in the args, and the run names no origin — pass the \
+                 skill the run belongs to",
+            )?
+        }
+    };
 
     let skill = doors.get(&format!("{store_url}/skills/{scope}/{skill_id}"))?;
     let text = skill
@@ -1772,6 +1801,11 @@ mod tests {
             true,
             "the run records the plan it started from"
         );
+        let doc = body["doc"].as_str().unwrap();
+        assert!(
+            doc.contains("\"skill:37/9\""),
+            "the run is rooted where it started: {doc}"
+        );
     }
 
     /// A plan that cannot run is refused WITH its problems, and nothing is
@@ -2206,6 +2240,51 @@ mod tests {
         assert_eq!(value["ok"], true, "{value}");
         assert_eq!(value["written"], true, "the completion landed on the retry");
         assert_eq!(doors.puts.len(), 2, "one refused write, one taken");
+    }
+
+    /// A run says where it came from, so whoever picks it up later does not need
+    /// the skill id the starting model had in hand — and a run that names no
+    /// origin is refused rather than guessed at.
+    #[test]
+    fn advance_finds_its_skill_in_the_run_it_reads() {
+        let mounts = python_mount();
+        let rooted = schematic::Run::new(plan_hash(PLAN)).with_origin("skill:37/9");
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": PLAN }))
+            .answering(
+                "/runs/37/",
+                json!({ "doc": schematic::run_to_json(&rooted), "revision": 1 }),
+            );
+        let value = call(
+            &mut doors,
+            "advance",
+            &json!({ "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+        assert_eq!(value["ok"], true, "{value}");
+        assert!(
+            doors.gets.iter().any(|url| url.ends_with("/skills/37/9")),
+            "the origin named the skill: {:?}",
+            doors.gets
+        );
+
+        // A run with no origin, and no skill in the args: an answer, not a guess.
+        let bare = schematic::Run::new(plan_hash(PLAN));
+        let mut doors = Recorder::default().answering(
+            "/runs/37/",
+            json!({ "doc": schematic::run_to_json(&bare), "revision": 1 }),
+        );
+        let error = call(
+            &mut doors,
+            "advance",
+            &json!({ "run_id": 5, "step": "fetch" }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect_err("nothing names the skill");
+        assert!(error.contains("names no origin"), "{error}");
     }
 
     #[test]
