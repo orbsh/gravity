@@ -1954,6 +1954,10 @@ impl Doors for VenueDoors<'_, '_> {
         post_json(url, body)
     }
 
+    fn put(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+        put_json(url, body)
+    }
+
     fn get(&mut self, url: &str) -> Result<Value, String> {
         get_json(url)
     }
@@ -1993,6 +1997,20 @@ fn first_channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
 
 fn post_json(url: &str, body: &Value) -> Result<Value, String> {
     match ureq::post(url).send_json(body.clone()) {
+        Ok(resp) => resp
+            .into_json::<Value>()
+            .map_err(|e| format!("{url}: unreadable answer: {e}")),
+        Err(ureq::Error::Status(code, resp)) => {
+            let text = resp.into_string().unwrap_or_default();
+            Err(format!("{url}: HTTP {code}: {text}"))
+        }
+        Err(e) => Err(format!("{url}: {e}")),
+    }
+}
+
+/// One PUT to k10r — the run snapshot, replaced whole.
+fn put_json(url: &str, body: &Value) -> Result<Value, String> {
+    match ureq::put(url).send_json(body.clone()) {
         Ok(resp) => resp
             .into_json::<Value>()
             .map_err(|e| format!("{url}: unreadable answer: {e}")),

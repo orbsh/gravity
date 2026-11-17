@@ -9,6 +9,11 @@ name = "gravity-turn"
 path = "src/bin/turn.rs"
 
 [dependencies]
+# The run engine (gravity ADR-0011): a plan is a graph and a run is a log, and
+# the fold lives in its own crate so nothing here re-implements "what is ready".
+# A path dependency while both repos are local; it becomes a git dependency the
+# day schematic is pushed (the rule for every ~/world library).
+schematic = { path = "../../../schematic/crates/schematic" }
 aura-booth = { path = "../../../aura/crates/booth" }
 aura-engine = { path = "../../../aura/crates/engine", default-features = false }
 gravity-core = { path = "../core" }

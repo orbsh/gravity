@@ -151,6 +151,57 @@ static SPECS: &[ToolSpec] = &[
         nature: Nature::Human,
     },
     ToolSpec {
+        name: "start",
+        description: "Start a skill as a RUN. A skill whose `steps` is a plan (a graph of steps \
+                      with control edges, gravity ADR-0011) is validated first, and what you get \
+                      back is a `run_id` plus the steps that may run now. Call `advance` with the \
+                      run's id and one step's result; it answers the next ready set. A plan that \
+                      cannot run is refused with its problems — nothing is left half-started.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "integer",
+                        "description": "The `node_id` that `resolve_skills` answered."
+                    },
+                    "params": {
+                        "type": "object",
+                        "description": "Values the plan's steps read by name (the run's parameters)."
+                    }
+                },
+                "required": ["skill_id"]
+            })
+        },
+        nature: Nature::Fast,
+    },
+    ToolSpec {
+        name: "advance",
+        description: "Record one step's result in a run and get the next ready set. Pass the \
+                      `step` you ran, its `output`, and (for a loop) the `pass` and `attempt` it \
+                      was. Redelivering the same (step, pass, attempt) writes nothing twice — \
+                      at-least-once delivery is expected. The answer carries the same shape as \
+                      `start`: ready / complete / stalled.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "integer",
+                        "description": "The skill the run belongs to (its plan is re-read and must still match)."
+                    },
+                    "run_id": { "type": "integer", "description": "The id `start` answered." },
+                    "step": { "type": "string", "description": "The step id that finished." },
+                    "output": { "description": "What the step produced; the run keeps it whole." },
+                    "pass": { "type": "integer", "description": "Loop pass (default 0 — the first)." },
+                    "attempt": { "type": "integer", "description": "Attempt within the pass (default 0)." }
+                },
+                "required": ["skill_id", "run_id", "step"]
+            })
+        },
+        nature: Nature::Fast,
+    },
+    ToolSpec {
         name: "run",
         description: "Run a script by its id, with no skill in the way. This is the door for a \
                       code row YOU wrote with `write_code`, or one somebody handed you: exactly \
@@ -444,6 +495,10 @@ pub fn tools_array() -> Value {
 /// only the turn holds the ctx.
 pub trait Doors {
     fn post(&mut self, url: &str, body: &Value) -> Result<Value, String>;
+    /// A REPLACEMENT: the body is the whole value at that address from now on.
+    /// Separate from `post` because the store's run door means exactly that —
+    /// a snapshot replaces the previous one, it does not append to it.
+    fn put(&mut self, url: &str, body: &Value) -> Result<Value, String>;
     fn get(&mut self, url: &str) -> Result<Value, String>;
     /// `ctx.invoke(type_name, key, "execute", args)` — `execute` is the entry
     /// CONVENTION every runner serves (ADR-0001 §1), never a lookup.
@@ -586,6 +641,8 @@ pub fn call(
         "create_skill" => create_skill(doors, args, facts, store_url),
         "read_code" => read_code(doors, args, facts, store_url),
         "write_code" => write_code(doors, args, facts, store_url),
+        "start" => start(doors, args, facts, store_url),
+        "advance" => advance_run(doors, args, facts, store_url),
         "invoke_skill" => invoke(doors, args, facts, store_url, walked),
         "run" => run_code(doors, args, facts, store_url, walked),
         other => Err(format!(
@@ -738,6 +795,199 @@ fn touch(
 /// second meaning of "invoke" inside the same tool would make the model's
 /// control over the sequence invisible. A multi-step skill is a loop the MODEL
 /// drives — it saw the steps in the resolve answer.
+/// The plan hash a run is stamped with: FNV-1a over the plan's JSON.
+///
+/// An IDENTITY, not a checksum to defend anything with — the run records which
+/// plan it started from, so a skill edited mid-run is visible rather than
+/// silently re-interpreted. Deliberately not a cryptographic hash: nothing bets
+/// security on it, and a dependency for a label would be the wrong trade.
+fn plan_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// `start`: a skill's plan becomes a run (gravity ADR-0011 §7).
+///
+/// The plan is VALIDATED before a run exists, and a plan with problems is refused
+/// whole — `ok: false` plus the problem list, nothing written. A run that started
+/// from a plan the engine already knows is broken would be a half-task the model
+/// then has to reason its way out of.
+///
+/// The snapshot goes to k10r's run table, which stores the engine's document and
+/// never reads it: the run's shape belongs to this side.
+fn start(
+    doors: &mut impl Doors,
+    args: &Value,
+    facts: &Facts<'_>,
+    store_url: &str,
+) -> Result<Value, String> {
+    let skill_id = args
+        .get("skill_id")
+        .and_then(Value::as_u64)
+        .ok_or("start: `skill_id` is required (the `node_id` resolve_skills answered)")?;
+    let scope = facts.scope("start")?;
+    let skill = doors.get(&format!("{store_url}/skills/{scope}/{skill_id}"))?;
+    let text = skill
+        .get("steps")
+        .and_then(Value::as_str)
+        .ok_or("start: the skill answered no `steps`")?;
+    let plan = schedule_plan(text)?;
+
+    let problems = schematic::validate(&plan);
+    if !problems.is_empty() {
+        return Ok(json!({
+            "ok": false,
+            "problems": problems.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>(),
+        }));
+    }
+
+    let hash = plan_hash(text);
+    let mut run = schematic::Run::new(hash.clone());
+    if let Some(params) = args.get("params").and_then(Value::as_object) {
+        for (name, value) in params {
+            run.params.insert(name.clone(), value.clone());
+        }
+    }
+    let readiness = schematic::ready(&plan, &run);
+
+    // The engine issues the run's id: k10r stores what it is handed and never
+    // allocates one, because a run is the engine's object, not the corpus's.
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let revision = doors.put(
+        &format!("{store_url}/runs/{scope}/{run_id}"),
+        &json!({ "doc": schematic::run_to_json(&run), "ts_ms": run_id }),
+    )?;
+    Ok(json!({
+        "ok": true,
+        "run_id": run_id,
+        "plan_hash": hash,
+        "revision": revision.get("revision").cloned().unwrap_or(Value::Null),
+        "ready": readiness.ready.iter().map(|a| json!({
+            "step": a.step,
+            "pass": a.pass,
+            "attempt": a.attempt,
+            "inputs": a.inputs,
+        })).collect::<Vec<_>>(),
+        "complete": readiness.complete,
+        "stalled": readiness.stalled,
+    }))
+}
+
+/// `advance`: one completion into a run, then the next ready set (ADR-0011 §7).
+///
+/// The PLAN is re-read rather than trusted from the run: `plan_hash` is the
+/// identity, and a skill edited mid-run is refused instead of being re-interpreted
+/// under the old run's entries — the definition changed, so the run is over as
+/// an instance of it.
+fn advance_run(
+    doors: &mut impl Doors,
+    args: &Value,
+    facts: &Facts<'_>,
+    store_url: &str,
+) -> Result<Value, String> {
+    let skill_id = args
+        .get("skill_id")
+        .and_then(Value::as_u64)
+        .ok_or("advance: `skill_id` is required")?;
+    let run_id = args
+        .get("run_id")
+        .and_then(Value::as_u64)
+        .ok_or("advance: `run_id` is required (the id `start` answered)")?;
+    let step = args
+        .get("step")
+        .and_then(Value::as_str)
+        .ok_or("advance: `step` is required (the step id that finished)")?
+        .to_string();
+    // Passes and attempts are ZERO-based in the fold (`ready` starts a step at
+    // pass 0, attempt 0), so the default is the first pass's first attempt.
+    let pass = args.get("pass").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let attempt = args.get("attempt").and_then(Value::as_u64).unwrap_or(0) as u32;
+    let output = args.get("output").cloned().unwrap_or(Value::Null);
+    let scope = facts.scope("advance")?;
+
+    let skill = doors.get(&format!("{store_url}/skills/{scope}/{skill_id}"))?;
+    let text = skill
+        .get("steps")
+        .and_then(Value::as_str)
+        .ok_or("advance: the skill answered no `steps`")?;
+    let plan = schedule_plan(text)?;
+    let hash = plan_hash(text);
+
+    let stored = doors.get(&format!("{store_url}/runs/{scope}/{run_id}"))?;
+    let doc = stored
+        .get("doc")
+        .and_then(Value::as_str)
+        .ok_or("advance: the run answer carried no document")?;
+    let mut run = schematic::run_from_json(doc)
+        .map_err(|e| format!("advance: the stored run is not a run: {e}"))?;
+    if run.plan_hash != hash {
+        return Ok(json!({
+            "ok": false,
+            "stale": true,
+            "why": format!(
+                "the run started from plan {} and the skill is now {hash}: the definition moved, \
+                 so this run cannot be advanced under it",
+                run.plan_hash
+            ),
+        }));
+    }
+
+    let entry = schematic::Entry {
+        step,
+        pass,
+        attempt,
+        output,
+    };
+    let written = match schematic::advance(&plan, &mut run, entry) {
+        Ok(schematic::Advanced::Appended) => true,
+        Ok(schematic::Advanced::Duplicate) => false,
+        Err(reject) => return Err(format!("advance: {reject}")),
+    };
+    if written {
+        doors.put(
+            &format!("{store_url}/runs/{scope}/{run_id}"),
+            &json!({ "doc": schematic::run_to_json(&run) }),
+        )?;
+    }
+    let readiness = schematic::ready(&plan, &run);
+    Ok(json!({
+        "ok": true,
+        "written": written,
+        "ready": readiness.ready.iter().map(|a| json!({
+            "step": a.step,
+            "pass": a.pass,
+            "attempt": a.attempt,
+            "inputs": a.inputs,
+        })).collect::<Vec<_>>(),
+        "blocked": readiness.blocked.iter().map(|b| format!("{b:?}")).collect::<Vec<_>>(),
+        "complete": readiness.complete,
+        "stalled": readiness.stalled,
+    }))
+}
+
+/// A skill's `steps` as a plan. A skill written before plans existed carries an
+/// ORDERED ARRAY of steps, and saying so is better than guessing at one: the two
+/// shapes mean different things (an array says "next", a plan says "when the
+/// inputs resolve"), so the refusal names the migration instead of performing it.
+fn schedule_plan(text: &str) -> Result<schematic::Plan, String> {
+    if text.trim_start().starts_with('[') {
+        return Err(
+            "start: this skill's `steps` is the old ordered list, not a plan. Re-declare it as \
+             a graph (schematic's plan form: steps + control edges) — an array says \"next\" and \
+             a plan says \"when its inputs resolve\", and only the second can be a run."
+                .to_string(),
+        );
+    }
+    schematic::plan_from_json(text).map_err(|e| format!("start: the skill's `steps` is not a plan: {e}"))
+}
+
 fn invoke(
     doors: &mut impl Doors,
     args: &Value,
@@ -1172,6 +1422,7 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         posts: Vec<(String, Value)>,
+        puts: Vec<(String, Value)>,
         gets: Vec<String>,
         mounts: Vec<(String, String, Value)>,
         answers: Vec<(String, Value)>,
@@ -1196,6 +1447,11 @@ mod tests {
         fn post(&mut self, url: &str, body: &Value) -> Result<Value, String> {
             self.posts.push((url.to_string(), body.clone()));
             Ok(json!({ "posted": true }))
+        }
+
+        fn put(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+            self.puts.push((url.to_string(), body.clone()));
+            Ok(json!({ "revision": 1 }))
         }
 
         fn get(&mut self, url: &str) -> Result<Value, String> {
@@ -1258,6 +1514,8 @@ mod tests {
                 "commit_memory",
                 "resolve_skills",
                 "invoke_skill",
+                "start",
+                "advance",
                 "run",
                 "create_skill",
                 "read_code",
@@ -1301,6 +1559,167 @@ mod tests {
         };
         assert!(error.contains("unknown tool `task_open`"), "{error}");
         assert!(error.contains("recall_memory"), "{error}");
+    }
+
+
+    /// The plan k10r hands back as the skill's `steps`: two steps, one control
+    /// edge, an exit.
+    const PLAN: &str = r#"{
+      "schema_version": 1,
+      "steps": [
+        { "id": "fetch", "kind": "call", "code": 7,
+          "inputs": { "url": "https://example.invalid/a" },
+          "out_edges": [{ "to": "done" }] },
+        { "id": "done", "kind": "end", "inputs": { "body": "$.fetch.body" } }
+      ]
+    }"#;
+
+    /// `start` writes ONE snapshot and answers the ready set: the plan's entry
+    /// step may run, the exit may not.
+    #[test]
+    fn start_writes_the_snapshot_and_answers_the_ready_set() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default().answering(
+            "/skills/37/9",
+            json!({ "steps": PLAN }),
+        );
+        let value = call(
+            &mut doors,
+            "start",
+            &json!({ "skill_id": 9, "params": { "who": "me" } }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+
+        assert_eq!(value["ok"], true, "{value}");
+        let ready = value["ready"].as_array().expect("a ready set");
+        assert_eq!(ready.len(), 1, "only the entry step can run: {value}");
+        assert_eq!(ready[0]["step"], "fetch");
+        assert_eq!(value["complete"], false);
+
+        // One PUT, to the run's own address, carrying a run document whose
+        // plan identity is the one that was validated.
+        let (url, body) = doors
+            .puts
+            .first()
+            .expect("the snapshot was written rather than posted");
+        assert!(url.contains("/runs/37/"), "{url}");
+        assert_eq!(body["doc"].as_str().unwrap().contains("\"plan_hash\""), true);
+        assert_eq!(
+            body["doc"].as_str().unwrap().contains(&value["plan_hash"].as_str().unwrap().to_string()),
+            true,
+            "the run records the plan it started from"
+        );
+    }
+
+    /// A plan that cannot run is refused WITH its problems, and nothing is
+    /// written: a half-started run is a task the model would then have to reason
+    /// its way out of.
+    #[test]
+    fn start_refuses_a_plan_that_cannot_run_and_writes_nothing() {
+        let mounts = python_mount();
+        // Two exits, one of them with an out-edge — `TerminalWithEdges`.
+        let broken = r#"{
+          "schema_version": 1,
+          "steps": [
+            { "id": "a", "kind": "call", "code": 7, "out_edges": [{ "to": "done" }] },
+            { "id": "done", "kind": "end", "out_edges": [{ "to": "a" }] }
+          ]
+        }"#;
+        let mut doors = Recorder::default().answering("/skills/37/9", json!({ "steps": broken }));
+        let value = call(
+            &mut doors,
+            "start",
+            &json!({ "skill_id": 9 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("a refusal is an answer, not a turn failure");
+
+        assert_eq!(value["ok"], false, "{value}");
+        assert!(
+            !value["problems"].as_array().unwrap().is_empty(),
+            "the refusal names what is wrong"
+        );
+        assert!(doors.puts.is_empty(), "nothing was written");
+    }
+
+
+    /// `advance` appends one completion, writes the run back, and answers the
+    /// next ready set — and a redelivered completion writes nothing twice.
+    #[test]
+    fn advance_appends_once_and_answers_the_next_ready_set() {
+        let mounts = python_mount();
+        let run_doc = schematic::run_to_json(&schematic::Run::new(plan_hash(PLAN)));
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": PLAN }))
+            .answering("/runs/37/", json!({ "doc": run_doc, "revision": 1 }));
+        let value = call(
+            &mut doors,
+            "advance",
+            &json!({ "skill_id": 9, "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["written"], true);
+        let ready = value["ready"].as_array().expect("a ready set");
+        assert_eq!(ready.len(), 1, "{value}");
+        assert_eq!(ready[0]["step"], "done", "the exit is ready now");
+        let (url, body) = doors.puts.first().expect("the run was written back");
+        assert!(url.contains("/runs/37/5"), "{url}");
+        let stored_doc = body["doc"].as_str().unwrap();
+        assert!(
+            stored_doc.contains("\"fetch\""),
+            "the completed step is in the stored document: {stored_doc}"
+        );
+    }
+
+    /// A run is an instance of ONE plan: a skill edited after the run started
+    /// refuses the advance instead of re-interpreting the old entries under a
+    /// new definition.
+    #[test]
+    fn advance_refuses_a_run_whose_plan_moved() {
+        let mounts = python_mount();
+        let run_doc = schematic::run_to_json(&schematic::Run::new("0000000000000000"));
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": PLAN }))
+            .answering("/runs/37/", json!({ "doc": run_doc, "revision": 1 }));
+        let value = call(
+            &mut doors,
+            "advance",
+            &json!({ "skill_id": 9, "run_id": 5, "step": "fetch" }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("a stale run is an answer");
+        assert_eq!(value["ok"], false, "{value}");
+        assert_eq!(value["stale"], true);
+        assert!(doors.puts.is_empty(), "nothing was written");
+    }
+
+    /// A skill written before plans existed says so instead of being guessed at:
+    /// an ordered array means "next", a plan means "when the inputs resolve".
+    #[test]
+    fn start_refuses_the_old_ordered_list_with_the_migration() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default().answering(
+            "/skills/37/9",
+            json!({ "steps": r#"[{"code_id": 4}]"# }),
+        );
+        let error = call(
+            &mut doors,
+            "start",
+            &json!({ "skill_id": 9 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect_err("an ordered list is not a plan");
+        assert!(error.contains("old ordered list"), "{error}");
+        assert!(doors.puts.is_empty());
     }
 
     #[test]
@@ -2041,6 +2460,9 @@ mod tests {
         impl Doors for Broken {
             fn post(&mut self, url: &str, body: &Value) -> Result<Value, String> {
                 self.0.post(url, body)
+            }
+            fn put(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+                self.0.put(url, body)
             }
             fn get(&mut self, url: &str) -> Result<Value, String> {
                 self.0.get(url)
