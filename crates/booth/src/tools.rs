@@ -790,6 +790,35 @@ fn touch(
 /// itself can receive.
 const SUBJECTS: &[(&str, &str)] = &[("memory/fact", "memories")];
 
+/// The last run id this process issued, so two `start` calls in the same
+/// millisecond cannot land on one address (the second would REPLACE the first:
+/// k10r's run door takes the id it is handed, and the revision would show a single
+/// run where two exist).
+static LAST_RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A run id: the clock in milliseconds, pushed forward if the clock has not moved
+/// since the last one this process issued.
+///
+/// A clock alone is not enough — `SystemTime` has millisecond resolution and a plan
+/// that validates in microseconds starts faster than that — and a bare counter is
+/// not enough either, because it reads as a number with no meaning. This keeps the
+/// clock's meaning and adds the one guarantee that matters: strictly increasing.
+fn next_run_id() -> u64 {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut last = LAST_RUN_ID.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match LAST_RUN_ID.compare_exchange_weak(last, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(current) => last = current,
+        }
+    }
+}
+
 /// How many drive rounds one `start` may take. A conforming plan converges in a
 /// handful; the bound exists so a defect spins in the caller's hands, not here.
 const MAX_ROUNDS: usize = 32;
@@ -818,11 +847,29 @@ fn drive(
                 // values, not the plan's paths).
                 schematic::Kind::Call { code: Some(code_id), .. } => {
                     let inputs = json!(activation.inputs);
-                    let (value, answer) =
-                        run_one(doors, facts, store_url, *code_id, &inputs, "start", walked)?;
-                    trace.push(json!({ "step": activation.step, "pass": activation.pass,
-                                       "attempt": activation.attempt, "output": answer }));
-                    value
+                    match run_one(doors, facts, store_url, *code_id, &inputs, "start", walked) {
+                        Ok((value, answer)) => {
+                            trace.push(json!({ "step": activation.step, "pass": activation.pass,
+                                               "attempt": activation.attempt, "output": answer }));
+                            value
+                        }
+                        // A failed ATTEMPT is still an attempt. It goes into the log
+                        // — so the plan's budget edges can count it, and a resumed
+                        // run knows which step failed and why — and the pass carries
+                        // on: a failure that aborted the drive would leave no run at
+                        // all, which is the one outcome that loses information.
+                        //
+                        // The step therefore completes with `{failed: true, reason}`,
+                        // and the fold's next move is the plan's own: a fallback edge
+                        // fires, and a plan that wants to retry wires a budgeted back
+                        // edge as its fallback.
+                        Err(reason) => {
+                            trace.push(json!({ "step": activation.step, "pass": activation.pass,
+                                               "attempt": activation.attempt, "failed": true,
+                                               "reason": reason }));
+                            json!({ "failed": true, "reason": reason })
+                        }
+                    }
                 }
                 // An end dispatches nothing: its inputs ARE the run's result.
                 schematic::Kind::End {} => {
@@ -988,10 +1035,7 @@ fn start(
 
     // The engine issues the run's id: k10r stores what it is handed and never
     // allocates one, because a run is the engine's object, not the corpus's.
-    let run_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let run_id = next_run_id();
     let revision = doors.put(
         &format!("{store_url}/runs/{scope}/{run_id}"),
         &json!({ "doc": schematic::run_to_json(&run), "ts_ms": run_id }),
@@ -2053,6 +2097,55 @@ mod tests {
         assert_eq!(waiting[0]["form"]["fields"][0]["name"], "branch");
         assert_eq!(waiting[0]["form"]["title"], "Pick a branch");
         assert_eq!(value["complete"], false, "nothing ran: a person has to answer");
+    }
+
+    /// A step that fails leaves a RECORD: the run is written with the failure in
+    /// its log (so a budget edge can count it and a resumed run knows where it
+    /// stopped), and the drive carries on to whatever the plan's fallback says.
+    #[test]
+    fn a_failed_step_is_recorded_in_the_run_instead_of_aborting_it() {
+        let mounts = python_mount();
+        let mut doors = Broken(Recorder::default().answering(
+            "/skills/37/9",
+            json!({ "steps": PLAN }),
+        ).answering(
+            "/code/37/7",
+            json!({ "language": "python", "source": "boom()" }),
+        ));
+        let value = call(
+            &mut doors,
+            "start",
+            &json!({ "skill_id": 9 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("a failed step is an answer, not a turn failure");
+
+        assert_eq!(value["ok"], true, "{value}");
+        let ran = value["ran"].as_array().expect("a trace");
+        assert_eq!(ran.len(), 1, "{value}");
+        assert_eq!(ran[0]["failed"], true, "the trace names the failure");
+        assert!(
+            ran[0]["reason"].as_str().unwrap().contains("did not answer"),
+            "with the reason the node gave: {value}"
+        );
+        // Written anyway: the snapshot is the one thing a failure must not lose.
+        let (url, body) = doors.0.puts.first().expect("the run was written");
+        assert!(url.contains("/runs/37/"), "{url}");
+        let doc = body["doc"].as_str().unwrap();
+        assert!(doc.contains("\"failed\""), "the failure is in the log: {doc}");
+        assert!(doc.contains("did not answer"), "and so is its reason: {doc}");
+    }
+
+    /// Two runs started in the same millisecond are two runs: the id is pushed
+    /// forward rather than shared, because k10r's door takes the id it is handed
+    /// and the second write would REPLACE the first.
+    #[test]
+    fn run_ids_are_strictly_increasing() {
+        let first = next_run_id();
+        let second = next_run_id();
+        let third = next_run_id();
+        assert!(first < second && second < third, "{first} {second} {third}");
     }
 
     #[test]
