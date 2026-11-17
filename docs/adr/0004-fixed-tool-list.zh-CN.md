@@ -2,7 +2,8 @@
 
 > **语言：** [English](0004-fixed-tool-list.md)（主文档） · [中文](0004-fixed-tool-list.zh-CN.md)
 
-**状态：** Accepted（2026-10-26）。同日落地：turn 在每一轮推理都发送固定的 `tools` 数组，
+**状态：** Accepted（2026-10-26）；2026-11-16 修订：ADR-0011 取代了「一次一步」的走法，
+`invoke_skill` **撤下**，改列 `start` / `advance`——skill 的步骤是一张图，走它的是 run。同日落地：turn 在每一轮推理都发送固定的 `tools` 数组，
 四个名字**全部**端到端接上——`recall_memory`、`commit_memory`、`resolve_skills`（k10r
 ADR-0015 的 skill 节点与它的门），以及 `invoke_skill`（把一步走到它的 code 行、对到服务该
 语言的 mount、在节点上把脚本跑起来）。真实栈由 prism 的 `tests/turn_invoke_skill.rs` 证明。
@@ -10,8 +11,8 @@ ADR-0015 的 skill 节点与它的门），以及 `invoke_skill`（把一步走�
 
 同日再补三条**任务**工具（2026-10-27，k10r ADR-0021）：
 
-   | `read_code` | `{code_id, rev?}` | `GET /code/{memory_scope}/{code_id}` —— **当前版本**（`invoke_skill` 会跑的就是它）；带 `rev` 则 `GET /code/{memory_scope}/{code_id}/{rev}`——指定版本 | 2026-10-31 列入：这一对里的「读」半。带 `code_id` 的 `write_code` 改的是脚本的**含义**，而模型明天不再是同一个上下文——蒙着改，就是把一个能跑的步骤改成不能跑 |
-   | `write_code` | `{language, source, description?, parameters?, code_id?}` | `POST /code/{memory_scope}` —— k10r 的 code 门（ADR-0023）：不给 `code_id` 就是**新脚本**（id 由仓分配），给了 `code_id` 就是给那个脚本追加**下一版**，回答 `{code_id, rev}` | 2026-10-31 列入：执行的一半。在它出现之前，skill 的步骤只是散文，部署跑不起来——`invoke_skill` 只能跑别人绕过工具面投递过的 `code_id` |
+   | `read_code` | `{code_id, rev?}` | `GET /code/{memory_scope}/{code_id}` —— **当前版本**（`start` 会跑的就是它）；带 `rev` 则 `GET /code/{memory_scope}/{code_id}/{rev}`——指定版本 | 2026-10-31 列入：这一对里的「读」半。带 `code_id` 的 `write_code` 改的是脚本的**含义**，而模型明天不再是同一个上下文——蒙着改，就是把一个能跑的步骤改成不能跑 |
+   | `write_code` | `{language, source, description?, parameters?, code_id?}` | `POST /code/{memory_scope}` —— k10r 的 code 门（ADR-0023）：不给 `code_id` 就是**新脚本**（id 由仓分配），给了 `code_id` 就是给那个脚本追加**下一版**，回答 `{code_id, rev}` | 2026-10-31 列入：执行的一半。在它出现之前，skill 的步骤只是散文，部署跑不起来——`start` 只能跑别人绕过工具面投递过的 `code_id` |
    | `open_task` | `{name, next?, state?}` | `POST /tasks/{memory_scope}` —— k10r 的任务门：任务是事实图里**普通**的顶点，任务单在 ns 44，所以依赖、标签都是 `commit_memory` 的事实，不需要工具 | 2026-10-27 列入 |
    | `move_task` | `{task_id, state?, next?}` | `POST /tasks/{memory_scope}/{task_id}/move` —— 缺席的字段**不动**；状态是闭集，打错在门口就拒，因为一个活在没人查的状态名下的任务就是没人找得到的任务 | 2026-10-27 列入 |
    | `list_tasks` | `{state?}` | `GET /tasks/{memory_scope}?state=` —— 给状态走任务单的 `by_state` 面，不给就 kind 扫描 | 2026-10-27 列入；turn 也调它来以「还欠着什么」开头 |从没被写下来的做法，下一轮对话要重新琢磨一遍。
@@ -39,7 +40,7 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
 - **动态：每轮检索 top-k skill，逐个注入成工具定义。** 模型的可见能力变成检索质量的函数；
   没进候选的 skill 等于不存在；工具块每轮都变，也就意味着被缓存的 prefix 每轮都变。
 - **固定：一小份写死的工具清单，由它们去够到基底。** 模型永远看到同一组能力；skill 是通过
-  这些工具**够到**的（先 `resolve_skills`，再 `invoke_skill`），而不是被摊平进工具清单。
+  这些工具**够到**的（先 `resolve_skills`，再 `start`），而不是被摊平进工具清单。
 - **运行模式：预设几个 profile，k10r 只是其中一种基底。** 同一个二进制，参数化到不同的
   memory / skill 后端上。
 
@@ -60,8 +61,10 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
    | `recall_memory` | `{query}` | `POST /memories/{memory_scope}/recall`——landing 加它所在的 community，由 k10r 渲染，读取预算也是 k10r 自己的 | 已入清单（gravity `crates/booth/src/tools.rs`） |
    | `commit_memory` | `{facts:[…]}` | `POST /memories/{memory_scope}`——图谱的 ingest | 已入清单 |
    | `resolve_skills` | `{query}`、`{limit}` | **可选 skill 清单**——模型自己完不成时去查的东西；k10r 按意图答候选 | 已入清单（2026-10-26）：k10r ADR-0015 落地了 skill 节点与 `POST /skills/{memory_scope}/resolve`——skill 与事实同图，所以图的 scope 就地址到它 |
-   | `invoke_skill` | `{skill_id, step?, arguments?}` | 读 skill、选一步、`GET /code/{id}` 取脚本，然后受治理的调用 `invoke(mount_type, session_key, "execute", {"code": …, "args": …})` 在 effector 节点 mount 上跑它（SEAM.md §3） | 已入清单（2026-10-26）：**一次调用一步**，顺序归模型（见 §3） |
-   | `run` | `{code_id, arguments?}` | `GET /code/{memory_scope}/{code_id}`，然后做 `invoke_skill` 做的那次受治理调用——没有 skill，没有步骤，被点名的就是那一行 | 2026-11-09 列入：给「不属于任何 skill 的 code 行」的那道门。没有它，`write_code` 能交付一个谁都跑不了的脚本——基底提供了脚本，却没提供它的用法，这和列一个没有门应答的工具是同一种撒谎 |
+   | `start` | `{skill_id, params?}` | 读 skill，把 `steps` 按 **plan** 解析，整体 `validate`（有问题的 plan 连同问题一起拒，一个字都不写），按 plan 的 hash 建 run，然后驱动它：每个就绪的 `call` 走的是当初走步的那次受治理调用（`invoke(mount_type, session_key, "execute", {"code": …, "args": …})`），每个 `end` 收束一条路径；快照写进 k10r 的 run 表（`PUT /runs/{scope}/{id}`） | 2026-11-16 列入（按 ADR-0011 取代 `invoke_skill`）：走的是 run，不是一步——`request` 与 `send` 留在就绪集里，一个等人、一个等投递主题 |
+   | `advance` | `{skill_id, run_id, step, output?, pass?, attempt?}` | 重读 plan（skill 被改过就让 run 变成 **stale**，而不是按旧 log 重新解释）、`GET /runs/{scope}/{id}`、追加这条完成（按 `(step, pass, attempt)` 幂等）、`PUT` 回去、回答下一组就绪 | 2026-11-16 列入：给「引擎跑不了的那一步」的门——人回答的 request、循环的下一轮 |
+   | `invoke_skill` | — | 2026-11-16 **撤下**（ADR-0011）：它走的是一张有序数组、一次一步；plan 说的是「输入解析了就绪」，只有 run 装得下 | |
+   | `run` | `{code_id, arguments?}` | `GET /code/{memory_scope}/{code_id}`，然后做 `start` 为一步做的那次受治理调用——没有 skill，没有步骤，被点名的就是那一行 | 2026-11-09 列入：给「不属于任何 skill 的 code 行」的那道门。没有它，`write_code` 能交付一个谁都跑不了的脚本——基底提供了脚本，却没提供它的用法，这和列一个没有门应答的工具是同一种撒谎 |
 
    task 组（`task_open` / `task_done` / `task_list`）已声明但**不入清单**：它的写面还没有
    路由，读侧骑在会话投影上（SEAM.md §2 的「Task progress」；ADR-0003 §3、PLAN Phase
@@ -76,7 +79,9 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
    自己的第二次检索，而且是能拿第一次答案没说到的东西去瞄准的那一次。工具表里没有它，
    等于一个只读一遍的读者。
 
-   **一次调用走一步。** `invoke_skill` 只跑 skill 的其中一步，**顺序是模型的**：它看见了
+   **一次调用走一步。——2026-11-16 被 ADR-0011 取代。** 现在 `start` 建 run 并驱动它就绪的
+   步骤，`advance` 记一条完成；顺序不再由模型记着，而是由 plan 的控制边与输入解析决定。
+   下面这段是当时的理由，保留作决策记录：`invoke_skill` 只跑 skill 的其中一步，**顺序是模型的**：它看见了
    各步，它把下一步需要的东西放进 `arguments`，它决定要不要继续。排序、重试、把一步的结果
    喂给下一步，仍是 Phase 5 的事——同一个工具里长出第二个「invoke 的含义」，会把这份控制权
    藏起来。多步 skill 的长期形态不是 N 次调用，而是**一份自己编排各步的脚本**；这一点已在

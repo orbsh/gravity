@@ -3,7 +3,7 @@
 //!
 //! Ten entries, because ten doors answer: k10r's HTTP surface (data access — the
 //! memory, skill and task verbs) and the node mounts (code execution, ADR-0001 —
-//! `invoke_skill` runs a skill's step, `run` runs a row no skill names). The list
+//! `start` runs a skill as a run, `run` runs a row no skill names). The list
 //! is fixed
 //! because gravity is the top of the stack and a pure glue: its memory and
 //! skills ARE k10r's and its execution surface IS the node's, so there is
@@ -98,7 +98,7 @@ static SPECS: &[ToolSpec] = &[
                       capability the conversation did not hand you: k10r answers candidates by \
                       intent — each with a name, what it does, its steps and a score. A \
                       candidate is not a tool by itself; the call that runs one is \
-                      `invoke_skill`, which takes the id you pick here.",
+                      `start`, which takes the id you pick here.",
         parameters: || {
             json!({
                 "type": "object",
@@ -116,39 +116,6 @@ static SPECS: &[ToolSpec] = &[
             })
         },
         nature: Nature::Fast,
-    },
-    ToolSpec {
-        name: "invoke_skill",
-        description: "Run ONE step of a skill you got from `resolve_skills`. It reads the skill, \
-                      takes the step you name (0 when you name none), fetches that step's script \
-                      and runs it on this deployment's node in the script's own language, \
-                      returning what the script returned. A skill with several steps is a \
-                      sequence YOU drive: call again with the next `step`, passing along whatever \
-                      it needs in `arguments`. Nothing else is kept between calls except what the \
-                      script itself remembers, so pass what it needs.",
-        parameters: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "skill_id": {
-                        "type": "integer",
-                        "description": "The `node_id` that `resolve_skills` answered."
-                    },
-                    "step": {
-                        "type": "integer",
-                        "description": "Which step to run (0-based; default 0)."
-                    },
-                    "arguments": {
-                        "type": "object",
-                        "description": "What the step's script receives as its arguments."
-                    }
-                },
-                "required": ["skill_id"]
-            })
-        },
-        // It runs code: outside the process, on a node, with whatever effects
-        // that code has (ADR-0004 §6).
-        nature: Nature::Human,
     },
     ToolSpec {
         name: "start",
@@ -205,7 +172,7 @@ static SPECS: &[ToolSpec] = &[
         name: "run",
         description: "Run a script by its id, with no skill in the way. This is the door for a \
                       code row YOU wrote with `write_code`, or one somebody handed you: exactly \
-                      what `invoke_skill` does with a step, minus the skill. The row states its \
+                      what `start` does with a step, minus the run. The row states its \
                       own language, and the mount that serves that language runs it; what you \
                       pass in `arguments` is what the script receives. Use `read_code` first if \
                       you need to see what it takes.",
@@ -287,7 +254,7 @@ static SPECS: &[ToolSpec] = &[
         name: "read_code",
         description: "Read a script back: its language, description, parameters and source, plus \
                       which version answered. Without `rev` it is the CURRENT version — the one \
-                      `invoke_skill` would run. With `rev` it is that exact version, which is how \
+                      `start` would run. With `rev` it is that exact version, which is how \
                       you see what an older run was given before you change it. Read before \
                       revising: `write_code` with a `code_id` replaces the script's meaning, and a \
                       blind edit is how a working step stops working.",
@@ -317,7 +284,7 @@ static SPECS: &[ToolSpec] = &[
                       yesterday stays readable and the address does not move (read it first with \
                       `read_code` when it is not yours from this turn). This is the writing half of \
                       execution — a procedure with real steps needs the scripts its steps run, or \
-                      `invoke_skill` has nothing to run.",
+                      `start` has nothing to run.",
         parameters: || {
             json!({
                 "type": "object",
@@ -641,9 +608,8 @@ pub fn call(
         "create_skill" => create_skill(doors, args, facts, store_url),
         "read_code" => read_code(doors, args, facts, store_url),
         "write_code" => write_code(doors, args, facts, store_url),
-        "start" => start(doors, args, facts, store_url),
+        "start" => start(doors, args, facts, store_url, walked),
         "advance" => advance_run(doors, args, facts, store_url),
-        "invoke_skill" => invoke(doors, args, facts, store_url, walked),
         "run" => run_code(doors, args, facts, store_url, walked),
         other => Err(format!(
             "unknown tool `{other}`; this deployment serves: {}",
@@ -682,10 +648,30 @@ fn create_skill(
     if let Some(title) = args.get("title").and_then(Value::as_str) {
         body["title"] = json!(title);
     }
-    for field in ["preconditions", "steps", "verification"] {
+    for field in ["preconditions", "verification"] {
         if let Some(value) = args.get(field) {
             body[field] = json!(value.to_string());
         }
+    }
+    // The plan is checked HERE, at the declaration: a skill whose steps cannot
+    // run is refused while the model still has the shape in hand, rather than
+    // discovered at `start` by whoever tried to use it later. The old ordered
+    // list is refused by name — an array says "next", a plan says "when the
+    // inputs resolve", and only the second can be a run.
+    if let Some(value) = args.get("steps") {
+        let text = match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let plan = schedule_plan(&text).map_err(|e| e.replace("start:", "create_skill:"))?;
+        let problems = schematic::validate(&plan);
+        if !problems.is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "problems": problems.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>(),
+            }));
+        }
+        body["steps"] = json!(text);
     }
     doors.post(&format!("{store_url}/skills/{scope}"), &body)
 }
@@ -795,6 +781,86 @@ fn touch(
 /// second meaning of "invoke" inside the same tool would make the model's
 /// control over the sequence invisible. A multi-step skill is a loop the MODEL
 /// drives — it saw the steps in the resolve answer.
+/// How many drive rounds one `start` may take. A conforming plan converges in a
+/// handful; the bound exists so a defect spins in the caller's hands, not here.
+const MAX_ROUNDS: usize = 32;
+
+/// Drive one run: execute every activation the ENGINE can execute, until there
+/// are none left.
+fn drive(
+    doors: &mut impl Doors,
+    facts: &Facts<'_>,
+    store_url: &str,
+    plan: &schematic::Plan,
+    run: &mut schematic::Run,
+    walked: &mut Vec<Walked>,
+) -> Result<Vec<Value>, String> {
+    let mut trace: Vec<Value> = Vec::new();
+    for _round in 0..MAX_ROUNDS {
+        let readiness = schematic::ready(plan, run);
+        let mut progress = false;
+        for activation in readiness.ready {
+            let Some(step) = plan.step(&activation.step) else {
+                continue;
+            };
+            let output = match &step.kind {
+                // A call is the engine's: the row runs on the mount that serves
+                // its language, with the step's inputs RESOLVED (the script sees
+                // values, not the plan's paths).
+                schematic::Kind::Call { code: Some(code_id), .. } => {
+                    let inputs = json!(activation.inputs);
+                    let (value, answer) =
+                        run_one(doors, facts, store_url, *code_id, &inputs, "start", walked)?;
+                    trace.push(json!({ "step": activation.step, "pass": activation.pass,
+                                       "attempt": activation.attempt, "output": answer }));
+                    value
+                }
+                // An end dispatches nothing: its inputs ARE the run's result.
+                schematic::Kind::End {} => {
+                    let value = json!(activation.inputs);
+                    trace.push(json!({ "step": activation.step, "pass": activation.pass,
+                                       "attempt": activation.attempt, "output": value,
+                                       "terminal": true }));
+                    value
+                }
+                // A call by ADDRESS, a request, a send: not the engine's to
+                // dispatch here. They stay ready and the caller decides.
+                _ => continue,
+            };
+            schematic::advance(
+                plan,
+                run,
+                schematic::Entry {
+                    step: activation.step.clone(),
+                    pass: activation.pass,
+                    attempt: activation.attempt,
+                    output,
+                },
+            )
+            .map_err(|reject| format!("start: {reject}"))?;
+            progress = true;
+        }
+        if !progress {
+            break;
+        }
+    }
+    Ok(trace)
+}
+
+/// The run's result: the inputs the first `end` it reached was given, or `null`
+/// while no path has closed.
+fn run_result(plan: &schematic::Plan, run: &schematic::Run) -> Value {
+    for entry in &run.entries {
+        if plan
+            .step(&entry.step)
+            .is_some_and(|step| matches!(step.kind, schematic::Kind::End {}))
+        {
+            return entry.output.clone();
+        }
+    }
+    Value::Null
+}
+
 /// The plan hash a run is stamped with: FNV-1a over the plan's JSON.
 ///
 /// An IDENTITY, not a checksum to defend anything with — the run records which
@@ -824,6 +890,7 @@ fn start(
     args: &Value,
     facts: &Facts<'_>,
     store_url: &str,
+    walked: &mut Vec<Walked>,
 ) -> Result<Value, String> {
     let skill_id = args
         .get("skill_id")
@@ -852,7 +919,12 @@ fn start(
             run.params.insert(name.clone(), value.clone());
         }
     }
-    let readiness = schematic::ready(&plan, &run);
+    // The run drives itself as far as the plan allows: every ready `call` runs on
+    // its mount, every `end` closes its path, and the loop stops when nothing left
+    // is the engine's to dispatch. A `request` waits for a person and a `send` for
+    // a subject this deployment may not serve — both stay in the ready set, which
+    // is the answer the caller gets.
+    let trace = drive(doors, facts, store_url, &plan, &mut run, walked)?;
 
     // The engine issues the run's id: k10r stores what it is handed and never
     // allocates one, because a run is the engine's object, not the corpus's.
@@ -864,17 +936,21 @@ fn start(
         &format!("{store_url}/runs/{scope}/{run_id}"),
         &json!({ "doc": schematic::run_to_json(&run), "ts_ms": run_id }),
     )?;
+    let readiness = schematic::ready(&plan, &run);
     Ok(json!({
         "ok": true,
         "run_id": run_id,
         "plan_hash": hash,
         "revision": revision.get("revision").cloned().unwrap_or(Value::Null),
+        "ran": trace,
+        "result": run_result(&plan, &run),
         "ready": readiness.ready.iter().map(|a| json!({
             "step": a.step,
             "pass": a.pass,
             "attempt": a.attempt,
             "inputs": a.inputs,
         })).collect::<Vec<_>>(),
+        "blocked": readiness.blocked.iter().map(|b| format!("{b:?}")).collect::<Vec<_>>(),
         "complete": readiness.complete,
         "stalled": readiness.stalled,
     }))
@@ -988,90 +1064,6 @@ fn schedule_plan(text: &str) -> Result<schematic::Plan, String> {
     schematic::plan_from_json(text).map_err(|e| format!("start: the skill's `steps` is not a plan: {e}"))
 }
 
-fn invoke(
-    doors: &mut impl Doors,
-    args: &Value,
-    facts: &Facts<'_>,
-    store_url: &str,
-    walked: &mut Vec<Walked>,
-) -> Result<Value, String> {
-    let skill_id = args
-        .get("skill_id")
-        .and_then(Value::as_u64)
-        .ok_or("invoke_skill: `skill_id` is required (the `node_id` resolve_skills answered)")?;
-    let scope = facts.scope("invoke_skill")?;
-    let skill = doors.get(&format!("{store_url}/skills/{scope}/{skill_id}"))?;
-
-    // The steps are TEXT in the row (the store does not parse what the producer
-    // owns) — parsing here is the walk's first act, not a second schema.
-    let steps_text = skill
-        .get("steps")
-        .and_then(Value::as_str)
-        .ok_or("invoke_skill: the skill answered no `steps`")?;
-    let steps: Vec<Value> = if steps_text.trim().is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_str(steps_text)
-            .map_err(|e| format!("invoke_skill: the skill's `steps` is not a JSON array: {e}"))?
-    };
-    let index = args.get("step").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let step = steps.get(index).ok_or_else(|| {
-        format!(
-            "invoke_skill: step {index} does not exist — this skill declares {} step(s)",
-            steps.len()
-        )
-    })?;
-    let code_id = step.get("code_id").and_then(Value::as_u64).ok_or_else(|| {
-        format!("invoke_skill: step {index} names no `code_id`")
-    })?;
-
-    // A code row is scoped since k10r ADR-0023 (it is a vertex of that corpus's
-    // graph), so the door carries the same scope the skill did.
-    let code = doors.get(&format!("{store_url}/code/{scope}/{code_id}"))?;
-    // The script rides the call as an ARGUMENT: the mount's own source is a
-    // fixed runner, and nothing about it varies per skill or version (ADR-0001
-    // §2 — skills are data, never types).
-    let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let (mount, source) = prepare(facts, &code, &arguments, "invoke_skill", code_id)?;
-
-    // The ATTEMPT is counted before the node is asked to run anything (k10r
-    // ADR-0018), on BOTH rows: the skill (this procedure was tried) and the script
-    // (this code ran). A call that never comes back must still be visible, which
-    // is why the count is a record about the call, not part of its result. Best
-    // effort by contract — a counter that cannot be written is not a reason to
-    // fail the step the model asked for.
-    touch(doors, store_url, "skills", scope, skill_id, "attempt");
-    touch(doors, store_url, "code", scope, code_id, "attempt");
-
-    let value = doors.mount(
-        &mount,
-        facts.session,
-        json!({ "code": source, "args": arguments }),
-    );
-    // The success is the SECOND record; a failed mount leaves `calls > ok`,
-    // which is exactly the state a reader is looking for.
-    if value.is_ok() {
-        touch(doors, store_url, "skills", scope, skill_id, "success");
-        touch(doors, store_url, "code", scope, code_id, "success");
-    }
-    let value = value?;
-    // What this turn actually walked, in order — the turn reports the
-    // composition after the loop (ADR-0016). Recorded only on SUCCESS: a step
-    // that failed is not part of a run worth proposing.
-    walked.push(Walked {
-        code_id,
-        description: code
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
-    });
-    // The call site closes what this code row finishes (ADR-0003 §3): the model
-    // dispatched the step, the binding did the rest. A FAILED run closes nothing
-    // — work is only done when the thing that does it succeeded.
-    Ok(close_bound(doors, facts, store_url, scope, code_id, value))
-}
-
 /// What a code row needs before a node is asked to run it: the mount that serves
 /// its language, its source, and its arguments checked against the row's own
 /// declaration.
@@ -1126,31 +1118,33 @@ fn prepare(
 
 /// `run`: a code row, on this deployment's node, with no skill in the way.
 ///
-/// `invoke_skill` reaches a script THROUGH a skill's step, which means a row that
-/// no skill names has no door at all — and a script the model itself wrote with
-/// `write_code` is exactly such a row. Everything else is the same work: the row
-/// states its language, the language picks the mount, the script rides the call
-/// as an argument, and the row's own `parameters` are enforced before a node is
-/// asked to run anything.
+/// A row runs by its id: the row states its language, the language picks the
+/// mount, the script rides the call as an argument, and the row's own
+/// `parameters` are enforced before a node is asked to run anything.
 ///
 /// The counters differ on purpose: there is no skill row to count, so only the
 /// code row records the attempt. Closing bound tasks and the walk stay the same —
 /// neither is about which door was used.
-fn run_code(
+/// Run ONE code row on the mount that serves its language — the shared half of
+/// `run` and of every `call` step a run drives.
+///
+/// Returns the script's own answer (a plan step's output) and the answer the
+/// MODEL reads (the same, wrapped with what the call closed). Counting, walking
+/// and closing are the same work whichever door reached the row.
+fn run_one(
     doors: &mut impl Doors,
-    args: &Value,
     facts: &Facts<'_>,
     store_url: &str,
+    code_id: u64,
+    arguments: &Value,
+    who: &str,
     walked: &mut Vec<Walked>,
-) -> Result<Value, String> {
-    let code_id = args
-        .get("code_id")
-        .and_then(Value::as_u64)
-        .ok_or("run: `code_id` is required (the row to run — `read_code` names it)")?;
-    let scope = facts.scope("run")?;
+) -> Result<(Value, Value), String> {
+    // The scope is the deployment's, not the caller's: `Facts::scope` answers the
+    // same number whoever asks, and only names the tool in its refusal.
+    let scope = facts.scope(who)?;
     let code = doors.get(&format!("{store_url}/code/{scope}/{code_id}"))?;
-    let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let (mount, source) = prepare(facts, &code, &arguments, "run", code_id)?;
+    let (mount, source) = prepare(facts, &code, arguments, who, code_id)?;
 
     // A call that never comes back must still be visible (k10r ADR-0018): the
     // attempt is counted before the node is asked to run anything, and the
@@ -1165,6 +1159,7 @@ fn run_code(
         touch(doors, store_url, "code", scope, code_id, "success");
     }
     let value = value?;
+
     // Recorded like any other step: "this turn ran this row" is the same fact
     // whichever door reached it, and the composition rule filters singletons.
     walked.push(Walked {
@@ -1175,7 +1170,24 @@ fn run_code(
             .unwrap_or_default()
             .to_string(),
     });
-    Ok(close_bound(doors, facts, store_url, scope, code_id, value))
+    let answer = close_bound(doors, facts, store_url, scope, code_id, value.clone());
+    Ok((value, answer))
+}
+
+fn run_code(
+    doors: &mut impl Doors,
+    args: &Value,
+    facts: &Facts<'_>,
+    store_url: &str,
+    walked: &mut Vec<Walked>,
+) -> Result<Value, String> {
+    let code_id = args
+        .get("code_id")
+        .and_then(Value::as_u64)
+        .ok_or("run: `code_id` is required (the row to run — `read_code` names it)")?;
+    let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let (_, answer) = run_one(doors, facts, store_url, code_id, &arguments, "run", walked)?;
+    Ok(answer)
 }
 
 /// Close every open task bound to `code_id`, and say so in the value the model
@@ -1477,6 +1489,25 @@ mod tests {
     static NOTHING_BOUND: std::collections::BTreeMap<u64, Vec<u64>> =
         std::collections::BTreeMap::new();
 
+    /// A node that does not answer: the mount fails, every other door passes
+    /// through to the recorder underneath.
+    struct Broken(Recorder);
+
+    impl Doors for Broken {
+        fn post(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+            self.0.post(url, body)
+        }
+        fn put(&mut self, url: &str, body: &Value) -> Result<Value, String> {
+            self.0.put(url, body)
+        }
+        fn get(&mut self, url: &str) -> Result<Value, String> {
+            self.0.get(url)
+        }
+        fn mount(&mut self, _type_name: &str, _key: &str, _args: Value) -> Result<Value, String> {
+            Err("the node did not answer".into())
+        }
+    }
+
     fn facts<'a>(mounts: &'a [(String, String)], session: &'a str) -> Facts<'a> {
         Facts {
             store_url: "http://mem.test/",
@@ -1503,28 +1534,6 @@ mod tests {
 
     fn python_mount() -> Vec<(String, String)> {
         vec![("python".to_string(), "runner_py".to_string())]
-    }
-
-    #[test]
-    fn the_list_carries_the_tool_faces_names() {
-        assert_eq!(
-            names(),
-            vec![
-                "recall_memory",
-                "commit_memory",
-                "resolve_skills",
-                "invoke_skill",
-                "start",
-                "advance",
-                "run",
-                "create_skill",
-                "read_code",
-                "write_code",
-                "open_task",
-                "move_task",
-                "list_tasks"
-            ]
-        );
     }
 
     #[test]
@@ -1579,10 +1588,12 @@ mod tests {
     #[test]
     fn start_writes_the_snapshot_and_answers_the_ready_set() {
         let mounts = python_mount();
-        let mut doors = Recorder::default().answering(
-            "/skills/37/9",
-            json!({ "steps": PLAN }),
-        );
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": PLAN }))
+            .answering(
+                "/code/37/7",
+                json!({ "language": "python", "source": "fetch()", "description": "fetch it" }),
+            );
         let value = call(
             &mut doors,
             "start",
@@ -1593,10 +1604,20 @@ mod tests {
         .expect("the door answered");
 
         assert_eq!(value["ok"], true, "{value}");
-        let ready = value["ready"].as_array().expect("a ready set");
-        assert_eq!(ready.len(), 1, "only the entry step can run: {value}");
-        assert_eq!(ready[0]["step"], "fetch");
+        // The engine drove the entry step: the row ran on the mount that serves
+        // its language, and the completion is in the run's log.
+        let ran = value["ran"].as_array().expect("a trace");
+        assert_eq!(ran.len(), 1, "one step was the engine's to run: {value}");
+        assert_eq!(ran[0]["step"], "fetch");
+        // The exit reads `$.fetch.body` and the script answered `{"ran": true}`:
+        // the step is BLOCKED rather than skipped, which is the whole point of
+        // resolving inputs before dispatching anything.
         assert_eq!(value["complete"], false);
+        assert!(
+            !value["blocked"].as_array().unwrap().is_empty(),
+            "an input that does not resolve is reported: {value}"
+        );
+        assert!(value["ready"].as_array().unwrap().is_empty());
 
         // One PUT, to the run's own address, carrying a run document whose
         // plan identity is the one that was validated.
@@ -1723,6 +1744,158 @@ mod tests {
     }
 
     #[test]
+    fn the_list_carries_the_tool_faces_names() {
+        assert_eq!(
+            names(),
+            vec![
+                "recall_memory",
+                "commit_memory",
+                "resolve_skills",
+                "start",
+                "advance",
+                "run",
+                "create_skill",
+                "read_code",
+                "write_code",
+                "open_task",
+                "move_task",
+                "list_tasks",
+            ]
+        );
+    }
+
+    /// `run` (and, through `run_one`, every `call` step a run drives): the
+    /// attempt is counted BEFORE the node is asked, the success after, and a
+    /// failure leaves the count alone — `calls > ok` is the visible difference.
+    #[test]
+    fn a_row_counts_its_attempt_before_it_runs_and_its_success_after() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default()
+            .answering("/code/37/4", json!({ "language": "python", "source": "print(1)" }));
+        call(
+            &mut doors,
+            "run",
+            &json!({ "code_id": 4, "arguments": {} }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the node answered");
+        let events: Vec<&Value> = doors
+            .posts
+            .iter()
+            .filter(|(url, _)| url.contains("/code/37/4/touch"))
+            .map(|(_, body)| &body["event"])
+            .collect();
+        assert_eq!(events, vec!["attempt", "success"], "{:?}", doors.posts);
+
+        // The same row, with a node that does not answer: the attempt is still
+        // counted, and there is no success beside it.
+        let mut broken = Broken(Recorder::default().answering(
+            "/code/37/4",
+            json!({ "language": "python", "source": "print(1)" }),
+        ));
+        let error = call(
+            &mut broken,
+            "run",
+            &json!({ "code_id": 4 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect_err("the node did not answer");
+        assert!(error.contains("did not answer"), "{error}");
+    }
+
+    /// A language no mount serves is refused with what this deployment declares,
+    /// and the row's own `parameters` are enforced before a node is asked.
+    #[test]
+    fn a_row_is_checked_against_the_deployment_and_its_own_parameters() {
+        let mounts = vec![("python".to_string(), "runner_py".to_string())];
+        let mut doors = Recorder::default().answering(
+            "/code/37/5",
+            json!({ "language": "ruby", "source": "puts 1" }),
+        );
+        let error = call(
+            &mut doors,
+            "run",
+            &json!({ "code_id": 5 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect_err("no mount serves ruby");
+        assert!(error.contains("no mount serves `ruby`"), "{error}");
+        assert!(doors.mounts.is_empty(), "nothing ran");
+
+        let mut doors = Recorder::default().answering(
+            "/code/37/6",
+            json!({
+                "language": "python",
+                "source": "print(1)",
+                "parameters": r#"{"type":"object","required":["url"]}"#
+            }),
+        );
+        let error = call(
+            &mut doors,
+            "run",
+            &json!({ "code_id": 6, "arguments": {} }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect_err("`url` is required by the row");
+        assert!(error.contains("url"), "{error}");
+        assert!(doors.mounts.is_empty(), "the node was never asked");
+    }
+
+    /// A skill is declared with a PLAN, and the declaration is where a plan is
+    /// checked: a broken graph is refused while the model still has it in hand,
+    /// and the old ordered list is refused by name.
+    #[test]
+    fn create_skill_holds_the_steps_to_the_plan_form() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default();
+        call(
+            &mut doors,
+            "create_skill",
+            &json!({ "name": "fetch_page", "content": "get a page", "steps": PLAN }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+        let (url, body) = &doors.posts[0];
+        assert_eq!(url, "http://mem.test/skills/37");
+        let stored = body["steps"].as_str().expect("steps travel as text");
+        assert!(stored.contains("\"out_edges\""), "the plan was stored: {stored}");
+
+        // An ordered list is not a plan.
+        let error = call(
+            &mut doors,
+            "create_skill",
+            &json!({ "name": "legacy", "content": "old", "steps": [{"code_id": 4}] }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect_err("an array is not a plan");
+        assert!(error.contains("old ordered list"), "{error}");
+
+        // A graph that cannot run is refused with its problems and nothing is sent.
+        let before = doors.posts.len();
+        let value = call(
+            &mut doors,
+            "create_skill",
+            &json!({ "name": "broken", "content": "x", "steps": {
+                "schema_version": 1,
+                "steps": [
+                    { "id": "a", "kind": "call", "code": 7, "out_edges": [{ "to": "z" }] }
+                ]
+            }}),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("a refusal is an answer");
+        assert_eq!(value["ok"], false, "{value}");
+        assert_eq!(doors.posts.len(), before, "nothing reached the store");
+    }
+
+    #[test]
     fn resolve_skills_posts_to_the_skill_door_with_the_scope_in_the_path() {
         let mounts = python_mount();
         let mut doors = Recorder::default();
@@ -1767,278 +1940,9 @@ mod tests {
         assert!(error.contains("memory_scope"), "{error}");
     }
 
-    #[test]
-    fn invoke_skill_walks_one_step_to_the_mount_that_serves_its_language() {
-        let mounts = python_mount();
-        let mut doors = Recorder::default()
-            .answering(
-                "/skills/37/9",
-                json!({
-                    "node_id": 9,
-                    "name": "github-issues",
-                    "steps": r#"[{"code_id":4,"note":"fetch"},{"code_id":5,"note":"format"}]"#,
-                }),
-            )
-            .answering(
-                "/code/37/5",
-                json!({
-                    "language": "python",
-                    "description": "formats them",
-                    "parameters": "{}",
-                    "source": "print('second step')",
-                }),
-            );
-
-        call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9, "step": 1, "arguments": { "repo": "orbsh/okra" } }),
-            &facts(&mounts, "channel-7"),
-            &mut Vec::new(),
-        )
-        .expect("the mount answered");
-
-        assert_eq!(
-            doors.gets,
-            vec![
-                "http://mem.test/skills/37/9".to_string(),
-                "http://mem.test/code/37/5".to_string()
-            ],
-            "the skill, then the code row the CHOSEN step names — never the first step by \
-             accident"
-        );
-        let (type_name, key, args) = &doors.mounts[0];
-        assert_eq!(type_name, "runner_py", "the language chose the mount");
-        assert_eq!(key, "channel-7", "residency is the caller's (ADR-0001 §6)");
-        assert_eq!(args["code"], "print('second step')");
-        assert_eq!(args["args"]["repo"], "orbsh/okra");
-    }
-
     /// ADR-0003 §3: `task --finishes_on--> code`, and the CALL SITE closes it. The
     /// model dispatched the step; nothing about the close is its judgement, and
     /// nothing about it is a round trip the model could have skipped.
-    #[test]
-    fn a_bound_task_is_closed_by_the_call_that_finished_it() {
-        let mounts = python_mount();
-        let mut ends_on: std::collections::BTreeMap<u64, Vec<u64>> =
-            std::collections::BTreeMap::new();
-        ends_on.insert(5, vec![12, 14]);
-        let mut doors = Recorder::default()
-            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":5}]"# }))
-            .answering("/code/37/5", json!({ "language": "python", "source": "print(1)" }));
-
-        let value = call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9, "step": 0 }),
-            &facts_bound(&mounts, "channel-7", &ends_on),
-            &mut Vec::new(),
-        )
-        .expect("the mount answered");
-
-        let moves: Vec<&(String, Value)> = doors
-            .posts
-            .iter()
-            .filter(|(url, _)| url.contains("/tasks/37/"))
-            .collect();
-        assert_eq!(moves.len(), 2, "one move per bound task: {:?}", doors.posts);
-        assert!(moves[0].0.ends_with("/tasks/37/12/move"), "{:?}", moves[0].0);
-        assert!(moves[1].0.ends_with("/tasks/37/14/move"), "{:?}", moves[1].0);
-        assert_eq!(moves[0].1["state"], json!("done"));
-        assert!(
-            moves[0].1["ts_ms"].as_u64().unwrap_or_default() > 0,
-            "the caller's clock rides the move"
-        );
-        assert_eq!(
-            value["finished_tasks"],
-            json!([12, 14]),
-            "the model is told what the call closed: {value}"
-        );
-        assert_eq!(
-            value["result"]["ran"],
-            json!(true),
-            "the step's own answer rides whole under `result`"
-        );
-    }
-
-    #[test]
-    fn a_failed_step_closes_nothing() {
-        let mounts = python_mount();
-        let mut ends_on: std::collections::BTreeMap<u64, Vec<u64>> =
-            std::collections::BTreeMap::new();
-        ends_on.insert(5, vec![12]);
-        let mut doors = Recorder::default()
-            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":5}]"# }))
-            .answering("/code/37/5", json!({ "language": "python", "source": "print(1)" }))
-            .refusing_the_run("the node died");
-
-        let error = call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9, "step": 0 }),
-            &facts_bound(&mounts, "channel-7", &ends_on),
-            &mut Vec::new(),
-        )
-        .expect_err("the mount refused");
-
-        assert_eq!(error, "the node died");
-        assert!(
-            !doors.posts.iter().any(|(url, _)| url.contains("/tasks/")),
-            "work is not done when the thing that does it failed: {:?}",
-            doors.posts
-        );
-    }
-
-    #[test]
-    fn invoke_skill_refuses_a_language_no_mount_serves() {
-        let mounts = python_mount();
-        let mut doors = Recorder::default()
-            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
-            .answering("/code/37/4", json!({ "language": "nu", "source": "1 + 1" }));
-
-        let Err(error) = call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9 }),
-            &facts(&mounts, "channel-7"),
-            &mut Vec::new(),
-        ) else {
-            panic!("a language with no mount cannot be called");
-        };
-        assert!(error.contains("no mount serves `nu`"), "{error}");
-        assert!(error.contains("python"), "it names what IS declared: {error}");
-        assert!(doors.mounts.is_empty(), "nothing ran");
-    }
-
-    #[test]
-    fn invoke_skill_refuses_a_step_the_skill_does_not_have() {
-        let mounts = python_mount();
-        let mut doors = Recorder::default()
-            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }));
-
-        let Err(error) = call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9, "step": 3 }),
-            &facts(&mounts, "channel-7"),
-            &mut Vec::new(),
-        ) else {
-            panic!("step 3 of a one-step skill must be refused");
-        };
-        assert!(error.contains("declares 1 step(s)"), "{error}");
-        assert!(doors.mounts.is_empty(), "nothing ran");
-    }
-
-    #[test]
-    fn the_declared_parameters_are_enforced_before_the_node_runs() {
-        let schema = r#"{"type":"object","required":["repo"],"properties":{"repo":{"type":"string"},"n":{"type":"integer"}}}"#;
-        let mounts = python_mount();
-
-        // Honoured: the walk proceeds with the arguments untouched.
-        let mut doors = Recorder::default()
-            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
-            .answering(
-                "/code/37/4",
-                json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
-            );
-        call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "n": 4 } }),
-            &facts(&mounts, "channel-7"),
-            &mut Vec::new(),
-        )
-        .expect("a call that honours the contract runs");
-        assert_eq!(doors.mounts.len(), 1);
-
-        // A missing required key is refused BY NAME, and nothing runs.
-        let mut doors = Recorder::default()
-            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
-            .answering(
-                "/code/37/4",
-                json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
-            );
-        let Err(error) = call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9, "arguments": { "n": 4 } }),
-            &facts(&mounts, "channel-7"),
-            &mut Vec::new(),
-        ) else {
-            panic!("a missing required key must not reach the node");
-        };
-        assert!(error.contains("missing required key: repo"), "{error}");
-        assert!(error.contains("the contract is:"), "it hands back the contract: {error}");
-        assert!(doors.mounts.is_empty(), "nothing ran");
-
-        // A wrong type is refused, and says what it got and what was wanted.
-        let mut doors = Recorder::default()
-            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
-            .answering(
-                "/code/37/4",
-                json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
-            );
-        let Err(error) = call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "n": "four" } }),
-            &facts(&mounts, "channel-7"),
-            &mut Vec::new(),
-        ) else {
-            panic!("a string where the row wants an integer must not reach the node");
-        };
-        assert!(error.contains("`arguments.n` is a string"), "{error}");
-        assert!(error.contains("wants integer"), "{error}");
-        assert!(doors.mounts.is_empty());
-    }
-
-    #[test]
-    fn a_row_that_declares_nothing_checks_nothing() {
-        let mounts = python_mount();
-
-        // `{}` — the shape every row in the tree has today.
-        for parameters in ["{}", "", "the repo, as owner/name"] {
-            let mut doors = Recorder::default()
-                .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
-                .answering(
-                    "/code/37/4",
-                    json!({ "language": "python", "parameters": parameters, "source": "print(1)" }),
-                );
-            call(
-                &mut doors,
-                "invoke_skill",
-                &json!({ "skill_id": 9, "arguments": { "anything": [1, 2] } }),
-                &facts(&mounts, "channel-7"),
-                &mut Vec::new(),
-            )
-            .unwrap_or_else(|e| panic!("`{parameters}` declares no schema, so it cannot refuse: {e}"));
-            assert_eq!(doors.mounts.len(), 1);
-        }
-    }
-
-    #[test]
-    fn additional_properties_false_is_the_rows_choice_to_make() {
-        let schema = r#"{"properties":{"repo":{"type":"string"}},"additionalProperties":false}"#;
-        let mounts = python_mount();
-        let mut doors = Recorder::default()
-            .answering("/skills/37/9", json!({ "steps": r#"[{"code_id":4}]"# }))
-            .answering(
-                "/code/37/4",
-                json!({ "language": "python", "parameters": schema, "source": "print(1)" }),
-            );
-        let Err(error) = call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9, "arguments": { "repo": "orbsh/okra", "verb": "run" } }),
-            &facts(&mounts, "channel-7"),
-            &mut Vec::new(),
-        ) else {
-            panic!("a closed contract takes no extra key");
-        };
-        assert!(error.contains("takes no `verb`"), "{error}");
-        assert!(doors.mounts.is_empty());
-    }
-
     #[test]
     fn a_composition_is_two_different_rows_and_the_wire_shape_is_the_walkers() {
         let one = Walked {
@@ -2083,7 +1987,14 @@ mod tests {
                 "name": "list-github-issues",
                 "title": "List issues",
                 "content": "Lists the open issues of a repository.",
-                "steps": [{ "code_id": 4, "note": "fetch" }],
+                "steps": {
+                    "schema_version": 1,
+                    "steps": [
+                        { "id": "fetch", "kind": "call", "code": 4,
+                          "out_edges": [{ "to": "done" }] },
+                        { "id": "done", "kind": "end" }
+                    ]
+                },
                 "preconditions": ["the repo is cloned"],
             }),
             &facts,
@@ -2095,10 +2006,10 @@ mod tests {
         let (url, body) = &doors.posts[0];
         assert_eq!(url, "http://mem.test/skills/37", "the scope is the deployment's");
         assert_eq!(body["name"], "list-github-issues");
-        assert_eq!(
-            body["steps"],
-            r#"[{"code_id":4,"note":"fetch"}]"#,
-            "the array travels as the JSON TEXT k10r stores (it parses nothing)"
+        let stored = body["steps"].as_str().expect("the plan travels as text");
+        assert!(
+            stored.contains("\"out_edges\""),
+            "the step graph travels as the JSON TEXT k10r stores (it parses nothing): {stored}"
         );
         assert_eq!(body["preconditions"], r#"["the repo is cloned"]"#);
         assert!(
@@ -2399,122 +2310,6 @@ mod tests {
         assert!(err.starts_with("run: "), "{err}");
         assert!(err.contains('n'), "{err}");
         assert!(doors.mounts.is_empty(), "the refusal happens before the node");
-    }
-
-    #[test]
-    fn an_invocation_counts_its_attempt_before_it_runs() {
-        let mut doors = Recorder::default()
-            .answering(
-                "/skills/37/9",
-                json!({ "steps": r#"[{"code_id": 4, "note": "run"}]"# }),
-            )
-            .answering(
-                "/code/37/4",
-                json!({ "language": "python", "description": "adds", "parameters": "{}", "source": "print(1)" }),
-            );
-        let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
-
-        call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9 }),
-            &facts,
-            &mut Vec::new(),
-        )
-        .expect("the step runs");
-
-        let touches: Vec<&(String, Value)> = doors
-            .posts
-            .iter()
-            .filter(|(url, _)| url.ends_with("/touch"))
-            .collect();
-        assert_eq!(
-            touches.len(),
-            4,
-            "two rows are counted, each with one attempt and one success"
-        );
-        assert_eq!(touches[0].1["event"], "attempt", "the attempt goes first");
-        assert_eq!(touches[1].1["event"], "attempt");
-        assert_eq!(touches[2].1["event"], "success", "the success comes after the run");
-        assert_eq!(touches[3].1["event"], "success");
-        assert_eq!(
-            touches[0].0, "http://mem.test/skills/37/9/touch",
-            "the procedure the model named is counted on its own node"
-        );
-        assert_eq!(
-            touches[1].0, "http://mem.test/code/37/4/touch",
-            "and the SCRIPT is counted on its row: one script serves many skills, \
-             so its use belongs to the script and not to whichever skill named it"
-        );
-        assert!(
-            touches[0].1["ts_ms"].as_u64().is_some_and(|ts| ts > 0),
-            "the caller owns the clock"
-        );
-    }
-
-    #[test]
-    fn a_failed_step_leaves_its_attempt_counted_and_no_success() {
-        /// A mount that refuses: the node is unreachable, not the store.
-        struct Broken(Recorder);
-        impl Doors for Broken {
-            fn post(&mut self, url: &str, body: &Value) -> Result<Value, String> {
-                self.0.post(url, body)
-            }
-            fn put(&mut self, url: &str, body: &Value) -> Result<Value, String> {
-                self.0.put(url, body)
-            }
-            fn get(&mut self, url: &str) -> Result<Value, String> {
-                self.0.get(url)
-            }
-            fn mount(
-                &mut self,
-                _type_name: &str,
-                _key: &str,
-                _args: Value,
-            ) -> Result<Value, String> {
-                Err("the node did not answer".into())
-            }
-        }
-
-        let inner = Recorder::default()
-            .answering(
-                "/skills/37/9",
-                json!({ "steps": r#"[{"code_id": 4, "note": "run"}]"# }),
-            )
-            .answering(
-                "/code/37/4",
-                json!({ "language": "python", "description": "adds", "parameters": "{}", "source": "print(1)" }),
-            );
-        let mut doors = Broken(inner);
-        let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
-        let mut walked = Vec::new();
-
-        let error = call(
-            &mut doors,
-            "invoke_skill",
-            &json!({ "skill_id": 9 }),
-            &facts,
-            &mut walked,
-        )
-        .unwrap_err();
-        assert!(error.contains("did not answer"));
-
-        let events: Vec<&str> = doors
-            .0
-            .posts
-            .iter()
-            .filter(|(url, _)| url.ends_with("/touch"))
-            .map(|(_, body)| body["event"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            events,
-            vec!["attempt", "attempt"],
-            "tried and broke is the state a reader is looking for — a failed run \
-             records an attempt on each row and no success on either"
-        );
-        assert!(walked.is_empty(), "a step that failed is not part of a run");
     }
 
     /// The filing rule (k10r ADR-0016 as re-cut): one report per step that

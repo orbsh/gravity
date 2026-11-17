@@ -1003,7 +1003,6 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
                 "recall_memory",
                 "commit_memory",
                 "resolve_skills",
-                "invoke_skill",
                 "start",
                 "advance",
                 "run",
