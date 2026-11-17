@@ -1101,42 +1101,64 @@ fn advance_run(
     let plan = schedule_plan(text)?;
     let hash = plan_hash(text);
 
-    let stored = doors.get(&format!("{store_url}/runs/{scope}/{run_id}"))?;
-    let doc = stored
-        .get("doc")
-        .and_then(Value::as_str)
-        .ok_or("advance: the run answer carried no document")?;
-    let mut run = schematic::run_from_json(doc)
-        .map_err(|e| format!("advance: the stored run is not a run: {e}"))?;
-    if run.plan_hash != hash {
-        return Ok(json!({
-            "ok": false,
-            "stale": true,
-            "why": format!(
-                "the run started from plan {} and the skill is now {hash}: the definition moved, \
-                 so this run cannot be advanced under it",
-                run.plan_hash
-            ),
-        }));
+    let url = format!("{store_url}/runs/{scope}/{run_id}");
+    // READ, APPEND, WRITE BACK — conditional on the revision that was read. A run
+    // is advanced from more than one place (two devices of one account, a turn and
+    // a page), and the log is the whole record: two writers each reading revision
+    // N would erase one completion apiece. The store refuses the stale write; the
+    // entry is idempotent, so re-reading and applying it again is correct — it
+    // either lands once or is already there.
+    let mut settled: Option<(schematic::Run, bool)> = None;
+    let mut last_error = String::new();
+    for _attempt in 0..3 {
+        let stored = doors.get(&url)?;
+        let doc = stored
+            .get("doc")
+            .and_then(Value::as_str)
+            .ok_or("advance: the run answer carried no document")?;
+        let mut run = schematic::run_from_json(doc)
+            .map_err(|e| format!("advance: the stored run is not a run: {e}"))?;
+        if run.plan_hash != hash {
+            return Ok(json!({
+                "ok": false,
+                "stale": true,
+                "why": format!(
+                    "the run started from plan {} and the skill is now {hash}: the definition \
+                     moved, so this run cannot be advanced under it",
+                    run.plan_hash
+                ),
+            }));
+        }
+        let written = match schematic::advance(
+            &plan,
+            &mut run,
+            schematic::Entry {
+                step: step.clone(),
+                pass,
+                attempt,
+                output: output.clone(),
+            },
+        ) {
+            Ok(schematic::Advanced::Appended) => true,
+            Ok(schematic::Advanced::Duplicate) => false,
+            Err(reject) => return Err(format!("advance: {reject}")),
+        };
+        let rev = stored.get("revision").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let body = json!({ "doc": schematic::run_to_json(&run), "rev": rev });
+        match doors.put(&url, &body) {
+            Ok(_) => {
+                settled = Some((run, written));
+                break;
+            }
+            // Someone wrote between this read and this write. One more round.
+            Err(error) => last_error = error,
+        }
     }
-
-    let entry = schematic::Entry {
-        step,
-        pass,
-        attempt,
-        output,
+    let Some((run, written)) = settled else {
+        return Err(format!(
+            "advance: the run stayed busy across three reads — somebody else is driving it ({last_error})"
+        ));
     };
-    let written = match schematic::advance(&plan, &mut run, entry) {
-        Ok(schematic::Advanced::Appended) => true,
-        Ok(schematic::Advanced::Duplicate) => false,
-        Err(reject) => return Err(format!("advance: {reject}")),
-    };
-    if written {
-        doors.put(
-            &format!("{store_url}/runs/{scope}/{run_id}"),
-            &json!({ "doc": schematic::run_to_json(&run) }),
-        )?;
-    }
     let readiness = schematic::ready(&plan, &run);
     Ok(json!({
         "ok": true,
@@ -1545,6 +1567,9 @@ mod tests {
         mounts: Vec<(String, String, Value)>,
         answers: Vec<(String, Value)>,
         mount_error: Option<String>,
+        /// How many writes to refuse before one lands — the race a run's
+        /// conditional write is built to survive.
+        put_conflicts: usize,
     }
 
     impl Recorder {
@@ -1555,6 +1580,11 @@ mod tests {
 
         /// A node that refuses the run — the failure class a task binding must
         /// not paper over.
+        fn losing_writes(mut self, conflicts: usize) -> Self {
+            self.put_conflicts = conflicts;
+            self
+        }
+
         fn refusing_the_run(mut self, reason: &str) -> Self {
             self.mount_error = Some(reason.to_string());
             self
@@ -1569,6 +1599,10 @@ mod tests {
 
         fn put(&mut self, url: &str, body: &Value) -> Result<Value, String> {
             self.puts.push((url.to_string(), body.clone()));
+            if self.put_conflicts > 0 {
+                self.put_conflicts -= 1;
+                return Err(format!("{url}: HTTP 409: revision conflict"));
+            }
             Ok(json!({ "revision": 1 }))
         }
 
@@ -1798,6 +1832,7 @@ mod tests {
         assert_eq!(ready[0]["step"], "done", "the exit is ready now");
         let (url, body) = doors.puts.first().expect("the run was written back");
         assert!(url.contains("/runs/37/5"), "{url}");
+        assert_eq!(body["rev"], 1, "the write names the revision it read");
         let stored_doc = body["doc"].as_str().unwrap();
         assert!(
             stored_doc.contains("\"fetch\""),
@@ -2146,6 +2181,31 @@ mod tests {
         let second = next_run_id();
         let third = next_run_id();
         assert!(first < second && second < third, "{first} {second} {third}");
+    }
+
+    /// Two writers, one row: a write refused because the revision moved is
+    /// re-read and re-applied — the entry is idempotent, so the retry lands once
+    /// and nothing is lost.
+    #[test]
+    fn advance_retries_a_write_the_store_refused() {
+        let mounts = python_mount();
+        let run_doc = schematic::run_to_json(&schematic::Run::new(plan_hash(PLAN)));
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": PLAN }))
+            .answering("/runs/37/", json!({ "doc": run_doc, "revision": 1 }))
+            .losing_writes(1);
+        let value = call(
+            &mut doors,
+            "advance",
+            &json!({ "skill_id": 9, "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+
+        assert_eq!(value["ok"], true, "{value}");
+        assert_eq!(value["written"], true, "the completion landed on the retry");
+        assert_eq!(doors.puts.len(), 2, "one refused write, one taken");
     }
 
     #[test]
