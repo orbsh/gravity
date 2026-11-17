@@ -902,7 +902,7 @@ fn turn(
         // for these N tools", which the results below answer one by one.
         messages.push(json!({ "role": "assistant", "tool_calls": calls }));
         for call in parsed {
-            let facts = gravity_booth::tools::Facts {
+            let world = gravity_booth::tools::World {
                 store_url: &turn.store_url,
                 memory_scope: Some(turn.memory_scope),
                 mounts: &mounts,
@@ -922,7 +922,7 @@ fn turn(
                     &mut doors,
                     &call.function.name,
                     &call.function.arguments,
-                    &facts,
+                    &world,
                     &mut walked,
                 );
                 // One report per step that EXTENDED the walk: a retried step
@@ -1801,7 +1801,7 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let owed = fetch_tasks(&store_url, settings.memory_scope);
     let ends_on = gravity_booth::tasks::bindings(owed.as_deref().unwrap_or_default());
 
-    let facts = gravity_booth::tools::Facts {
+    let world = gravity_booth::tools::World {
         store_url: &store_url,
         memory_scope: Some(settings.memory_scope),
         mounts: &mounts,
@@ -1821,7 +1821,7 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
                 "attempt": attempt,
                 "output": output,
             }),
-            &facts,
+            &world,
             &mut walked,
         )
         .map_err(anyhow::Error::msg)?

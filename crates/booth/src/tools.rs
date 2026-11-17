@@ -472,9 +472,16 @@ pub trait Doors {
 /// none has a default: a namespace, a mount table and a residency key are the
 /// deployment's declarations, and a guess would silently point at someone
 /// else's graph or instance (ADR-0004 §5).
-pub struct Facts<'a> {
+/// THE WORLD an execution is given: everything a step needs that the plan does not say.
+///
+/// Not to be confused with a memory-graph *fact* — the name this carried before said
+/// "facts", which is what k10r stores, but nothing here is one: this is where results go
+/// (`store_url`, `memory_scope`), what can run them (`mounts`), under which residency
+/// (`session`), and which open work they close (`ends_on`). A plan names none of it; the
+/// host hands it over, per call.
+pub struct World<'a> {
     pub store_url: &'a str,
-    /// k10r's namespace for this deployment's graph (facts AND skills).
+    /// k10r's namespace this deployment writes its runs, skills and memories in.
     pub memory_scope: Option<u64>,
     /// OPERATION language → the mount type that serves it (prism's manifest).
     pub mounts: &'a [(String, String)],
@@ -489,7 +496,7 @@ pub struct Facts<'a> {
     pub ends_on: &'a std::collections::BTreeMap<u64, Vec<u64>>,
 }
 
-impl Facts<'_> {
+impl World<'_> {
     fn scope(&self, tool: &str) -> Result<u64, String> {
         self.memory_scope.ok_or_else(|| {
             format!("{tool}: `memory_scope` is not set on this deployment (the turn args carry it)")
@@ -517,17 +524,17 @@ pub fn call(
     doors: &mut impl Doors,
     name: &str,
     args: &Value,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     walked: &mut Vec<Walked>,
 ) -> Result<Value, String> {
-    let store_url = facts.store();
+    let store_url = world.store();
     match name {
         "recall_memory" => {
             let query = args
                 .get("query")
                 .and_then(Value::as_str)
                 .ok_or("recall_memory: `query` is required")?;
-            let scope = facts.scope("recall_memory")?;
+            let scope = world.scope("recall_memory")?;
             doors.post(
                 &format!("{store_url}/memories/{scope}/recall"),
                 &json!([query]),
@@ -540,7 +547,7 @@ pub fn call(
             if !facts_arg.is_array() {
                 return Err("commit_memory: `facts` must be an array of 8-slot tuples".into());
             }
-            let scope = facts.scope("commit_memory")?;
+            let scope = world.scope("commit_memory")?;
             doors.post(&format!("{store_url}/memories/{scope}"), facts_arg)
         }
         "resolve_skills" => {
@@ -550,7 +557,7 @@ pub fn call(
                 .ok_or("resolve_skills: `query` is required")?;
             // A skill is a node in the same graph as the facts (k10r ADR-0015),
             // so the scope that addresses the graph addresses its skills too.
-            let scope = facts.scope("resolve_skills")?;
+            let scope = world.scope("resolve_skills")?;
             let mut body = json!({ "query": query });
             if let Some(limit) = args.get("limit") {
                 body["limit"] = limit.clone();
@@ -562,7 +569,7 @@ pub fn call(
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or("open_task: `name` is required")?;
-            let scope = facts.scope("open_task")?;
+            let scope = world.scope("open_task")?;
             let mut body = json!({ "name": name });
             if let Some(next) = args.get("next") {
                 body["next"] = next.clone();
@@ -587,26 +594,26 @@ pub fn call(
             if body.as_object().is_some_and(|map| map.is_empty()) {
                 return Err("move_task: send `state`, `next`, or both".into());
             }
-            let scope = facts.scope("move_task")?;
+            let scope = world.scope("move_task")?;
             doors.post(
                 &format!("{store_url}/tasks/{scope}/{task_id}/move"),
                 &body,
             )
         }
         "list_tasks" => {
-            let scope = facts.scope("list_tasks")?;
+            let scope = world.scope("list_tasks")?;
             let url = match args.get("state").and_then(Value::as_str) {
                 Some(state) => format!("{store_url}/tasks/{scope}?state={state}"),
                 None => format!("{store_url}/tasks/{scope}"),
             };
             doors.get(&url)
         }
-        "create_skill" => create_skill(doors, args, facts, store_url),
-        "read_code" => read_code(doors, args, facts, store_url),
-        "write_code" => write_code(doors, args, facts, store_url),
-        "start" => start(doors, args, facts, store_url, walked),
-        "advance" => advance_run(doors, args, facts, store_url),
-        "run" => run_code(doors, args, facts, store_url, walked),
+        "create_skill" => create_skill(doors, args, world, store_url),
+        "read_code" => read_code(doors, args, world, store_url),
+        "write_code" => write_code(doors, args, world, store_url),
+        "start" => start(doors, args, world, store_url, walked),
+        "advance" => advance_run(doors, args, world, store_url, walked),
+        "run" => run_code(doors, args, world, store_url, walked),
         other => Err(format!(
             "unknown tool `{other}`; this deployment serves: {}",
             names().join(", ")
@@ -624,7 +631,7 @@ pub fn call(
 fn create_skill(
     doors: &mut impl Doors,
     args: &Value,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
 ) -> Result<Value, String> {
     let name = args
@@ -637,7 +644,7 @@ fn create_skill(
         .get("content")
         .and_then(Value::as_str)
         .ok_or("create_skill: `content` is required (what the skill does)")?;
-    let scope = facts.scope("create_skill")?;
+    let scope = world.scope("create_skill")?;
     // Absent parts stay absent: the store merges, so sending "" would erase a
     // part a previous declaration filled.
     let mut body = json!({ "name": name, "content": content });
@@ -682,14 +689,14 @@ fn create_skill(
 fn read_code(
     doors: &mut impl Doors,
     args: &Value,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
 ) -> Result<Value, String> {
     let code_id = args
         .get("code_id")
         .and_then(Value::as_u64)
         .ok_or("read_code: `code_id` is required (the number a skill's step names)")?;
-    let scope = facts.scope("read_code")?;
+    let scope = world.scope("read_code")?;
     match args.get("rev").and_then(Value::as_u64) {
         Some(rev) => doors.get(&format!("{store_url}/code/{scope}/{code_id}/{rev}")),
         None => doors.get(&format!("{store_url}/code/{scope}/{code_id}")),
@@ -713,7 +720,7 @@ fn read_code(
 fn write_code(
     doors: &mut impl Doors,
     args: &Value,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
 ) -> Result<Value, String> {
     let language = args
@@ -726,7 +733,7 @@ fn write_code(
         .get("source")
         .and_then(Value::as_str)
         .ok_or("write_code: `source` is required (the script body)")?;
-    let scope = facts.scope("write_code")?;
+    let scope = world.scope("write_code")?;
     let mut body = json!({ "language": language, "source": source });
     if let Some(description) = args.get("description").and_then(Value::as_str) {
         body["description"] = json!(description);
@@ -823,7 +830,7 @@ const MAX_ROUNDS: usize = 32;
 /// are none left.
 fn drive(
     doors: &mut impl Doors,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
     plan: &schematic::Plan,
     run: &mut schematic::Run,
@@ -843,7 +850,7 @@ fn drive(
                 // values, not the plan's paths).
                 schematic::Kind::Call { code: Some(code_id), .. } => {
                     let inputs = json!(activation.inputs);
-                    match run_one(doors, facts, store_url, *code_id, &inputs, "start", walked) {
+                    match run_one(doors, world, store_url, *code_id, &inputs, "start", walked) {
                         Ok((value, answer)) => {
                             trace.push(json!({ "step": activation.step, "pass": activation.pass,
                                                "attempt": activation.attempt, "output": answer }));
@@ -886,7 +893,7 @@ fn drive(
                         continue;
                     };
                     let body = payload.clone().unwrap_or_else(|| json!(activation.inputs));
-                    let scope = facts.scope("start")?;
+                    let scope = world.scope("start")?;
                     let answer = doors.post(
                         &format!("{store_url}/{area}/{scope}"),
                         &body,
@@ -991,7 +998,7 @@ fn plan_hash(text: &str) -> String {
 fn start(
     doors: &mut impl Doors,
     args: &Value,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
     walked: &mut Vec<Walked>,
 ) -> Result<Value, String> {
@@ -999,7 +1006,7 @@ fn start(
         .get("skill_id")
         .and_then(Value::as_u64)
         .ok_or("start: `skill_id` is required (the `node_id` resolve_skills answered)")?;
-    let scope = facts.scope("start")?;
+    let scope = world.scope("start")?;
     let skill = doors.get(&format!("{store_url}/skills/{scope}/{skill_id}"))?;
     let text = skill
         .get("steps")
@@ -1036,7 +1043,7 @@ fn start(
     // anything runs, and the success only if the drive came back with no failed
     // entry — `calls > ok` is what a reader looks for.
     touch(doors, store_url, "skills", scope, skill_id, "attempt");
-    let trace = drive(doors, facts, store_url, &plan, &mut run, walked)?;
+    let trace = drive(doors, world, store_url, &plan, &mut run, walked)?;
     if !trace.iter().any(|entry| entry.get("failed").is_some()) {
         touch(doors, store_url, "skills", scope, skill_id, "success");
     }
@@ -1086,8 +1093,9 @@ fn origin_of(run: &schematic::Run) -> Option<(u64, u64)> {
 fn advance_run(
     doors: &mut impl Doors,
     args: &Value,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
+    walked: &mut Vec<Walked>,
 ) -> Result<Value, String> {
     let run_id = args
         .get("run_id")
@@ -1109,7 +1117,7 @@ fn advance_run(
     // page that never saw the starting call. An argument naming the skill would be a
     // second copy of the same fact, and two copies disagree eventually.
     let (scope, skill_id) = {
-        let read_scope = facts.scope("advance")?;
+        let read_scope = world.scope("advance")?;
         let stored = doors.get(&format!("{store_url}/runs/{read_scope}/{run_id}"))?;
         let doc = stored
             .get("doc")
@@ -1138,7 +1146,7 @@ fn advance_run(
     // N would erase one completion apiece. The store refuses the stale write; the
     // entry is idempotent, so re-reading and applying it again is correct — it
     // either lands once or is already there.
-    let mut settled: Option<(schematic::Run, bool)> = None;
+    let mut settled: Option<(schematic::Run, bool, Vec<Value>)> = None;
     let mut last_error = String::new();
     for _attempt in 0..3 {
         let stored = doors.get(&url)?;
@@ -1174,17 +1182,26 @@ fn advance_run(
             Err(reject) => return Err(format!("advance: {reject}")),
         };
         let rev = stored.get("revision").and_then(Value::as_u64).unwrap_or(0) as u32;
+        // WHAT CAN RUN, RUNS — the completion that just landed may have unblocked
+        // steps the engine can do itself, and a caller should not have to loop over
+        // `advance` to make that happen. Both go in ONE write: the answer and its
+        // consequences are one revision of the log, so a reader never sees an answer
+        // that has not been acted on.
+        let trace;
+        trace = drive(doors, world, store_url, &plan, &mut run, walked)?;
         let body = json!({ "doc": schematic::run_to_json(&run), "rev": rev });
         match doors.put(&url, &body) {
             Ok(_) => {
-                settled = Some((run, written));
+                settled = Some((run, written, trace));
                 break;
             }
-            // Someone wrote between this read and this write. One more round.
+            // Someone wrote between this read and this write. One more round: the
+            // re-read resumes from the log, so a step already recorded is not run
+            // twice, and the entry that did not land is applied again.
             Err(error) => last_error = error,
         }
     }
-    let Some((run, written)) = settled else {
+    let Some((run, written, trace)) = settled else {
         return Err(format!(
             "advance: the run stayed busy across three reads — somebody else is driving it ({last_error})"
         ));
@@ -1193,6 +1210,9 @@ fn advance_run(
     Ok(json!({
         "ok": true,
         "written": written,
+        // What this call's aftermath ran (a completion can unblock steps the engine
+        // does itself), each with its own step address and answer.
+        "ran": trace,
         "ready": readiness.ready.iter().map(|a| json!({
             "step": a.step,
             "pass": a.pass,
@@ -1231,7 +1251,7 @@ fn schedule_plan(text: &str) -> Result<schematic::Plan, String> {
 /// disagree about what "ready to run" means is how a script runs with arguments
 /// nobody checked, or a language no node serves.
 fn prepare(
-    facts: &Facts<'_>,
+    world: &World<'_>,
     code: &Value,
     arguments: &Value,
     who: &str,
@@ -1249,8 +1269,8 @@ fn prepare(
     // Language → mount is a MATCH against the deployment's declaration, not a
     // default: a language no mount serves cannot be called (ADR-0001 §7), and
     // the error names what this deployment does declare.
-    let mount = facts.mount_for(language).ok_or_else(|| {
-        let served: Vec<&str> = facts.mounts.iter().map(|(l, _)| l.as_str()).collect();
+    let mount = world.mount_for(language).ok_or_else(|| {
+        let served: Vec<&str> = world.mounts.iter().map(|(l, _)| l.as_str()).collect();
         format!(
             "{who}: no mount serves `{language}` here (this deployment declares: {})",
             if served.is_empty() {
@@ -1291,7 +1311,7 @@ fn prepare(
 /// and closing are the same work whichever door reached the row.
 fn run_one(
     doors: &mut impl Doors,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
     code_id: u64,
     arguments: &Value,
@@ -1300,9 +1320,9 @@ fn run_one(
 ) -> Result<(Value, Value), String> {
     // The scope is the deployment's, not the caller's: `Facts::scope` answers the
     // same number whoever asks, and only names the tool in its refusal.
-    let scope = facts.scope(who)?;
+    let scope = world.scope(who)?;
     let code = doors.get(&format!("{store_url}/code/{scope}/{code_id}"))?;
-    let (mount, source) = prepare(facts, &code, arguments, who, code_id)?;
+    let (mount, source) = prepare(world, &code, arguments, who, code_id)?;
 
     // A call that never comes back must still be visible (k10r ADR-0018): the
     // attempt is counted before the node is asked to run anything, and the
@@ -1310,7 +1330,7 @@ fn run_one(
     touch(doors, store_url, "code", scope, code_id, "attempt");
     let value = doors.mount(
         &mount,
-        facts.session,
+        world.session,
         json!({ "code": source, "args": arguments }),
     );
     if value.is_ok() {
@@ -1328,14 +1348,14 @@ fn run_one(
             .unwrap_or_default()
             .to_string(),
     });
-    let answer = close_bound(doors, facts, store_url, scope, code_id, value.clone());
+    let answer = close_bound(doors, world, store_url, scope, code_id, value.clone());
     Ok((value, answer))
 }
 
 fn run_code(
     doors: &mut impl Doors,
     args: &Value,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
     walked: &mut Vec<Walked>,
 ) -> Result<Value, String> {
@@ -1344,7 +1364,7 @@ fn run_code(
         .and_then(Value::as_u64)
         .ok_or("run: `code_id` is required (the row to run — `read_code` names it)")?;
     let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let (_, answer) = run_one(doors, facts, store_url, code_id, &arguments, "run", walked)?;
+    let (_, answer) = run_one(doors, world, store_url, code_id, &arguments, "run", walked)?;
     Ok(answer)
 }
 
@@ -1355,13 +1375,13 @@ fn run_code(
 /// swallowing it.
 fn close_bound(
     doors: &mut impl Doors,
-    facts: &Facts<'_>,
+    world: &World<'_>,
     store_url: &str,
     scope: u64,
     code_id: u64,
     value: Value,
 ) -> Value {
-    let Some(task_ids) = facts.ends_on.get(&code_id) else {
+    let Some(task_ids) = world.ends_on.get(&code_id) else {
         return value;
     };
     if task_ids.is_empty() {
@@ -1678,8 +1698,8 @@ mod tests {
         }
     }
 
-    fn facts<'a>(mounts: &'a [(String, String)], session: &'a str) -> Facts<'a> {
-        Facts {
+    fn world<'a>(mounts: &'a [(String, String)], session: &'a str) -> World<'a> {
+        World {
             store_url: "http://mem.test/",
             memory_scope: Some(37),
             mounts,
@@ -1688,12 +1708,12 @@ mod tests {
         }
     }
 
-    fn facts_bound<'a>(
+    fn world_bound<'a>(
         mounts: &'a [(String, String)],
         session: &'a str,
         ends_on: &'a std::collections::BTreeMap<u64, Vec<u64>>,
-    ) -> Facts<'a> {
-        Facts {
+    ) -> World<'a> {
+        World {
             store_url: "http://mem.test/",
             memory_scope: Some(37),
             mounts,
@@ -1731,7 +1751,7 @@ mod tests {
             &mut doors,
             "task_open",
             &json!({}),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         ) else {
             panic!("an unlisted tool must be refused");
@@ -1768,7 +1788,7 @@ mod tests {
             &mut doors,
             "start",
             &json!({ "skill_id": 9, "params": { "who": "me" } }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -1828,7 +1848,7 @@ mod tests {
             &mut doors,
             "start",
             &json!({ "skill_id": 9 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("a refusal is an answer, not a turn failure");
@@ -1855,16 +1875,20 @@ mod tests {
             &mut doors,
             "advance",
             &json!({ "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
 
         assert_eq!(value["ok"], true, "{value}");
         assert_eq!(value["written"], true);
+        // The completion unblocked the exit, and the exit RAN: what the engine can do
+        // itself happens inside the same call, so a caller does not loop over `advance`
+        // until the run stops moving.
+        assert_eq!(value["complete"], true, "{value}");
         let ready = value["ready"].as_array().expect("a ready set");
-        assert_eq!(ready.len(), 1, "{value}");
-        assert_eq!(ready[0]["step"], "done", "the exit is ready now");
+        assert!(ready.is_empty(), "nothing is left to run: {value}");
+        assert_eq!(value["ran"][0]["step"], "done", "the exit ran: {value}");
         let (url, body) = doors.puts.first().expect("the run was written back");
         assert!(url.contains("/runs/37/5"), "{url}");
         assert_eq!(body["rev"], 1, "the write names the revision it read");
@@ -1889,7 +1913,7 @@ mod tests {
             &mut doors,
             "advance",
             &json!({ "run_id": 5, "step": "fetch" }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("a stale run is an answer");
@@ -1911,7 +1935,7 @@ mod tests {
             &mut doors,
             "start",
             &json!({ "skill_id": 9 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect_err("an ordered list is not a plan");
@@ -1952,7 +1976,7 @@ mod tests {
             &mut doors,
             "run",
             &json!({ "code_id": 4, "arguments": {} }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the node answered");
@@ -1974,7 +1998,7 @@ mod tests {
             &mut broken,
             "run",
             &json!({ "code_id": 4 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect_err("the node did not answer");
@@ -1994,7 +2018,7 @@ mod tests {
             &mut doors,
             "run",
             &json!({ "code_id": 5 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect_err("no mount serves ruby");
@@ -2013,7 +2037,7 @@ mod tests {
             &mut doors,
             "run",
             &json!({ "code_id": 6, "arguments": {} }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect_err("`url` is required by the row");
@@ -2032,7 +2056,7 @@ mod tests {
             &mut doors,
             "create_skill",
             &json!({ "name": "fetch_page", "content": "get a page", "steps": PLAN }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -2046,7 +2070,7 @@ mod tests {
             &mut doors,
             "create_skill",
             &json!({ "name": "legacy", "content": "old", "steps": [{"code_id": 4}] }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect_err("an array is not a plan");
@@ -2063,7 +2087,7 @@ mod tests {
                     { "id": "a", "kind": "call", "code": 7, "out_edges": [{ "to": "z" }] }
                 ]
             }}),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("a refusal is an answer");
@@ -2093,7 +2117,7 @@ mod tests {
             &mut doors,
             "start",
             &json!({ "skill_id": 9 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -2121,7 +2145,7 @@ mod tests {
             &mut doors,
             "start",
             &json!({ "skill_id": 9 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -2158,7 +2182,7 @@ mod tests {
             &mut doors,
             "start",
             &json!({ "skill_id": 9 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -2191,7 +2215,7 @@ mod tests {
             &mut doors,
             "start",
             &json!({ "skill_id": 9 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("a failed step is an answer, not a turn failure");
@@ -2238,7 +2262,7 @@ mod tests {
             &mut doors,
             "advance",
             &json!({ "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -2265,7 +2289,7 @@ mod tests {
             &mut doors,
             "advance",
             &json!({ "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -2286,7 +2310,7 @@ mod tests {
             &mut doors,
             "advance",
             &json!({ "run_id": 5, "step": "fetch" }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect_err("nothing names the skill");
@@ -2308,7 +2332,7 @@ mod tests {
             &mut doors,
             "start",
             &json!({ "skill_id": 9 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -2329,7 +2353,7 @@ mod tests {
             &mut doors,
             "resolve_skills",
             &json!({ "query": "list github issues", "limit": 3 }),
-            &facts(&mounts, "s-1"),
+            &world(&mounts, "s-1"),
             &mut Vec::new(),
         )
         .expect("the door answered");
@@ -2347,7 +2371,7 @@ mod tests {
     fn a_missing_scope_names_the_fact_instead_of_guessing() {
         let mounts = python_mount();
         let mut doors = Recorder::default();
-        let facts = Facts {
+        let world = World {
             store_url: "http://mem.test",
             memory_scope: None,
             mounts: &mounts,
@@ -2358,7 +2382,7 @@ mod tests {
             &mut doors,
             "recall_memory",
             &json!({ "query": "x" }),
-            &facts,
+            &world,
             &mut Vec::new(),
         ) else {
             panic!("a tool with no scope must be refused");
@@ -2404,7 +2428,7 @@ mod tests {
     fn create_skill_posts_the_declaration_and_keeps_absent_parts_absent() {
         let mut doors = Recorder::default();
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
+        let world = world(&mounts, "channel-7");
 
         let value = call(
             &mut doors,
@@ -2423,7 +2447,7 @@ mod tests {
                 },
                 "preconditions": ["the repo is cloned"],
             }),
-            &facts,
+            &world,
             &mut Vec::new(),
         )
         .expect("the declaration lands");
@@ -2458,9 +2482,9 @@ mod tests {
             ..Recorder::default()
         };
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
+        let world = world(&mounts, "channel-7");
 
-        let value = call(&mut doors, "read_code", &json!({ "code_id": 4 }), &facts, &mut Vec::new())
+        let value = call(&mut doors, "read_code", &json!({ "code_id": 4 }), &world, &mut Vec::new())
             .expect("the read lands");
         assert_eq!(value["source"], "print(2)");
         assert_eq!(
@@ -2480,7 +2504,7 @@ mod tests {
             &mut doors,
             "read_code",
             &json!({ "code_id": 4, "rev": 1 }),
-            &facts,
+            &world,
             &mut Vec::new(),
         )
         .expect("the version reads");
@@ -2493,8 +2517,8 @@ mod tests {
     fn read_code_refuses_a_call_without_a_script_to_read() {
         let mut doors = Recorder::default();
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
-        let err = call(&mut doors, "read_code", &json!({}), &facts, &mut Vec::new())
+        let world = world(&mounts, "channel-7");
+        let err = call(&mut doors, "read_code", &json!({}), &world, &mut Vec::new())
             .expect_err("no id, nothing to read");
         assert!(err.contains("code_id"), "{err}");
         assert!(doors.gets.is_empty(), "nothing was fetched");
@@ -2507,7 +2531,7 @@ mod tests {
         // door carries TEXT, so the conversion is this boundary's.
         let mut doors = Recorder::default();
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
+        let world = world(&mounts, "channel-7");
 
         let value = call(
             &mut doors,
@@ -2518,7 +2542,7 @@ mod tests {
                 "description": "sum the numbers",
                 "parameters": { "n": "array of integers" },
             }),
-            &facts,
+            &world,
             &mut Vec::new(),
         )
         .expect("the script lands");
@@ -2546,13 +2570,13 @@ mod tests {
         // while the version that ran stays readable (k10r ADR-0023).
         let mut doors = Recorder::default();
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
+        let world = world(&mounts, "channel-7");
 
         let value = call(
             &mut doors,
             "write_code",
             &json!({ "language": "python", "source": "print(2)", "code_id": 4 }),
-            &facts,
+            &world,
             &mut Vec::new(),
         )
         .expect("the revision lands");
@@ -2568,12 +2592,12 @@ mod tests {
     fn write_code_refuses_a_call_it_cannot_carry_out() {
         let mut doors = Recorder::default();
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
+        let world = world(&mounts, "channel-7");
         let err = call(
             &mut doors,
             "write_code",
             &json!({ "source": "print(1)" }),
-            &facts,
+            &world,
             &mut Vec::new(),
         )
         .expect_err("a script without a language cannot be routed");
@@ -2583,7 +2607,7 @@ mod tests {
             &mut doors,
             "write_code",
             &json!({ "language": "python" }),
-            &facts,
+            &world,
             &mut Vec::new(),
         )
         .expect_err("a language without a body is not code");
@@ -2595,13 +2619,13 @@ mod tests {
     fn create_skill_refuses_what_it_cannot_identify() {
         let mut doors = Recorder::default();
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
+        let world = world(&mounts, "channel-7");
 
         let unnamed = call(
             &mut doors,
             "create_skill",
             &json!({ "content": "does a thing" }),
-            &facts,
+            &world,
             &mut Vec::new(),
         );
         assert!(unnamed.unwrap_err().contains("`name` is required"));
@@ -2610,7 +2634,7 @@ mod tests {
             &mut doors,
             "create_skill",
             &json!({ "name": "  ", "content": "does a thing" }),
-            &facts,
+            &world,
             &mut Vec::new(),
         );
         assert!(empty.unwrap_err().contains("`name` is required"));
@@ -2619,7 +2643,7 @@ mod tests {
             &mut doors,
             "create_skill",
             &json!({ "name": "x" }),
-            &facts,
+            &world,
             &mut Vec::new(),
         );
         assert!(no_body.unwrap_err().contains("`content` is required"));
@@ -2645,13 +2669,13 @@ mod tests {
             }),
         );
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
+        let world = world(&mounts, "channel-7");
 
         call(
             &mut doors,
             "run",
             &json!({ "code_id": 4, "arguments": { "n": [1, 2, 3] } }),
-            &facts,
+            &world,
             &mut Vec::new(),
         )
         .expect("the mount answered");
@@ -2675,13 +2699,13 @@ mod tests {
             json!({ "language": "python", "parameters": "{}", "source": "print(1)" }),
         );
         let mounts = python_mount();
-        let facts = facts(&mounts, "channel-7");
+        let world = world(&mounts, "channel-7");
 
         call(
             &mut doors,
             "run",
             &json!({ "code_id": 4 }),
-            &facts,
+            &world,
             &mut Vec::new(),
         )
         .expect("the row runs");
@@ -2708,7 +2732,7 @@ mod tests {
             &mut doors,
             "run",
             &json!({ "code_id": 4 }),
-            &facts(&mounts, "channel-7"),
+            &world(&mounts, "channel-7"),
             &mut Vec::new(),
         )
         .expect_err("nothing serves steel here");
@@ -2729,7 +2753,7 @@ mod tests {
             &mut doors,
             "run",
             &json!({ "code_id": 4, "arguments": {} }),
-            &facts(&mounts, "channel-7"),
+            &world(&mounts, "channel-7"),
             &mut Vec::new(),
         )
         .expect_err("the row says `n` is required");
@@ -2774,7 +2798,7 @@ mod tests {
             &mut doors,
             "open_task",
             &json!({ "name": "ship-the-face-change" }),
-            &facts(&[], "channel-7"),
+            &world(&[], "channel-7"),
             &mut Vec::new(),
         )
         .unwrap();
@@ -2788,7 +2812,7 @@ mod tests {
             &mut doors,
             "open_task",
             &json!({ "name": "x", "state": "doing", "next": "read the diff" }),
-            &facts(&[], "channel-7"),
+            &world(&[], "channel-7"),
             &mut Vec::new(),
         )
         .unwrap();
@@ -2805,7 +2829,7 @@ mod tests {
             &mut doors,
             "move_task",
             &json!({ "task_id": 9, "state": "blocked" }),
-            &facts(&[], "channel-7"),
+            &world(&[], "channel-7"),
             &mut Vec::new(),
         )
         .unwrap();
@@ -2820,7 +2844,7 @@ mod tests {
             &mut doors,
             "move_task",
             &json!({ "task_id": 9 }),
-            &facts(&[], "channel-7"),
+            &world(&[], "channel-7"),
             &mut Vec::new(),
         ) else {
             panic!("a move that names nothing is a mistake, not a no-op");
@@ -2836,7 +2860,7 @@ mod tests {
             &mut doors,
             "list_tasks",
             &json!({ "state": "open" }),
-            &facts(&[], "channel-7"),
+            &world(&[], "channel-7"),
             &mut Vec::new(),
         )
         .unwrap();
@@ -2848,7 +2872,7 @@ mod tests {
             &mut doors,
             "list_tasks",
             &json!({}),
-            &facts(&[], "channel-7"),
+            &world(&[], "channel-7"),
             &mut Vec::new(),
         )
         .unwrap();
