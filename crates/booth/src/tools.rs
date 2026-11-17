@@ -1035,7 +1035,15 @@ fn start(
     // is the engine's to dispatch. A `request` waits for a person and a `send` for
     // a subject this deployment may not serve — both stay in the ready set, which
     // is the answer the caller gets.
+    // A run IS the skill being used (k10r ADR-0018's counters are about the
+    // PROCEDURE, not about which door reached it): the attempt is counted before
+    // anything runs, and the success only if the drive came back with no failed
+    // entry — `calls > ok` is what a reader looks for.
+    touch(doors, store_url, "skills", scope, skill_id, "attempt");
     let trace = drive(doors, facts, store_url, &plan, &mut run, walked)?;
+    if !trace.iter().any(|entry| entry.get("failed").is_some()) {
+        touch(doors, store_url, "skills", scope, skill_id, "success");
+    }
 
     // The engine issues the run's id: k10r stores what it is handed and never
     // allocates one, because a run is the engine's object, not the corpus's.
@@ -2098,11 +2106,12 @@ mod tests {
         .expect("the door answered");
 
         assert_eq!(value["ok"], true, "{value}");
-        assert_eq!(
-            doors.posts[0].0, "http://mem.test/memories/37",
-            "the subject picked the ingest door"
-        );
-        assert_eq!(doors.posts[0].1[0][0], "alice", "the payload was the body");
+        let ingest = doors
+            .posts
+            .iter()
+            .find(|(url, _)| url.ends_with("/memories/37"))
+            .unwrap_or_else(|| panic!("the subject picked the ingest door: {:?}", doors.posts));
+        assert_eq!(ingest.1[0][0], "alice", "the payload was the body");
         assert_eq!(value["complete"], true, "the path closed: {value}");
 
         // A subject with no deliverer: the step stays ready, nothing is posted.
@@ -2123,7 +2132,11 @@ mod tests {
             &mut Vec::new(),
         )
         .expect("the door answered");
-        assert!(doors.posts.is_empty(), "nothing was delivered");
+        assert!(
+            !doors.posts.iter().any(|(url, _)| url.contains("/memories/")),
+            "nothing was delivered: {:?}",
+            doors.posts
+        );
         assert_eq!(value["ok"], true, "{value}");
         let ready = value["ready"].as_array().unwrap_or_else(|| panic!("{value}"));
         assert_eq!(ready.len(), 1, "the send is parked, not dropped: {value}");
@@ -2285,6 +2298,34 @@ mod tests {
         )
         .expect_err("nothing names the skill");
         assert!(error.contains("names no origin"), "{error}");
+    }
+
+    /// Starting a run counts on the SKILL: the procedure was used, whichever door
+    /// reached it, and a drive with a failed step is not a success.
+    #[test]
+    fn start_counts_the_skill_before_and_after() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": PLAN }))
+            .answering(
+                "/code/37/7",
+                json!({ "language": "python", "source": "fetch()" }),
+            );
+        call(
+            &mut doors,
+            "start",
+            &json!({ "skill_id": 9 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+        let events: Vec<&Value> = doors
+            .posts
+            .iter()
+            .filter(|(url, _)| url.contains("/skills/37/9/touch"))
+            .map(|(_, body)| &body["event"])
+            .collect();
+        assert_eq!(events, vec!["attempt", "success"], "{:?}", doors.posts);
     }
 
     #[test]
