@@ -242,6 +242,87 @@ const DONE_EVENT: &str = "ui:turn.done";
 /// adds no frame vocabulary — and the answer returns the way every answer does, as
 /// the next turn's text, where the model calls `advance`.
 const RUN_PAGE_EVENT: &str = "ui:run.page";
+/// WHAT THE MODEL IS TOLD, and nothing else.
+///
+/// A run's answer is written for the EDGE: the page needs every waiting form and the
+/// addresses of the walk. The model needs to know whether its call landed and what
+/// comes next — the rest is the run's own ledger (it is in k10r) and the page's
+/// business (it is in the frames). Feeding the whole answer back as the tool message
+/// put the engine's bookkeeping into the conversation, where it stays forever and
+/// shifts every later turn's context.
+///
+/// So: a status, the run it is about, and at most what a person is being asked for.
+fn conclusion(value: &Value) -> Value {
+    let about_a_run = value.get("requests").is_some()
+        || value.get("complete").is_some()
+        || value.get("ready").is_some();
+    if !about_a_run {
+        return value.clone();
+    }
+    let mut said = json!({ "ok": value.get("ok").cloned().unwrap_or(json!(true)) });
+    if let Some(run_id) = value.get("run_id").and_then(Value::as_u64) {
+        said["run_id"] = json!(run_id);
+    }
+    // A failed step is the one thing a reader must not lose: it is why the run did
+    // not do what was asked.
+    if let Some(failed) = value
+        .get("ran")
+        .and_then(Value::as_array)
+        .and_then(|ran| ran.iter().find(|entry| entry.get("failed").is_some()))
+    {
+        said["status"] = json!("failed");
+        said["failed"] = json!({ "step": failed["step"], "reason": failed["reason"] });
+        return said;
+    }
+    let asks = value
+        .get("requests")
+        .and_then(Value::as_array)
+        .filter(|asks| !asks.is_empty());
+    if let Some(asks) = asks {
+        said["status"] = json!("waiting");
+        // Field NAMES, not declarations: the page drew the form, and a second copy
+        // here would drift from it.
+        said["asks"] = json!(asks
+            .iter()
+            .map(|ask| json!({
+                "step": ask["step"],
+                "fields": ask["form"]["fields"]
+                    .as_array()
+                    .map(|fields| fields.iter().map(|f| f["name"].clone()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            }))
+            .collect::<Vec<_>>());
+        return said;
+    }
+    if value.get("complete").and_then(Value::as_bool) == Some(true) {
+        said["status"] = json!("complete");
+        said["result"] = value.get("result").cloned().unwrap_or(Value::Null);
+        return said;
+    }
+    if value.get("stalled").and_then(Value::as_bool) == Some(true) {
+        said["status"] = json!("stalled");
+        return said;
+    }
+    let next: Vec<Value> = value
+        .get("ready")
+        .and_then(Value::as_array)
+        .map(|ready| {
+            ready
+                .iter()
+                .map(|a| json!({ "step": a["step"], "pass": a["pass"], "attempt": a["attempt"] }))
+                .collect()
+        })
+        .unwrap_or_default();
+    if next.is_empty() {
+        said["status"] = json!("blocked");
+        said["blocked"] = value.get("blocked").cloned().unwrap_or(json!([]));
+    } else {
+        said["status"] = json!("ready");
+        said["next"] = json!(next);
+    }
+    said
+}
+
 /// What the plan's `send` to the page becomes, now that a deployment has bound it.
 ///
 /// The plan said "the ask is over" (`{"subject": "ui", "payload": {"clear": "ask"}}`);
@@ -1005,10 +1086,11 @@ fn turn(
                         // (a model that re-asks rather than moving on) keeps only
                         // the last answer: what the store owes the next turn is
                         // the effect, not the retries.
+                        let told = conclusion(&value);
                         let event = ToolEvent {
                             tool: call.function.name.clone(),
                             args: call.function.arguments.to_string(),
-                            result: value.to_string(),
+                            result: told.to_string(),
                         };
                         // ADR-0024: the round lands in the store as it completed, not
                         // at the end of the turn — the same net-effect record the
@@ -1023,7 +1105,7 @@ fn turn(
                             }
                             _ => tool_events.push(event),
                         }
-                        value.to_string()
+                        told.to_string()
                     }
                     Err(error) => json!({ "error": error }).to_string(),
                 }
@@ -2853,6 +2935,47 @@ mod tests {
     }
 
     use super::*;
+
+    /// The model hears the outcome, not the ledger: an answer that names every ready
+    /// step and every ran one makes the conversation grow with the engine's bookkeeping.
+    #[test]
+    fn the_model_hears_the_outcome_and_not_the_ledger() {
+        // A waiting run: the status, the run, and the field names a person will fill.
+        let waiting = conclusion(&json!({
+            "ok": true, "run_id": 9, "written": true,
+            "ready": [], "requests": [{ "step": "ask", "pass": 0, "attempt": 0,
+                "form": { "fields": [{ "name": "branch", "type": "choice",
+                                       "options": ["left", "right"] }] } }],
+            "ran": [{ "step": "fetch", "output": { "body": "x" } }],
+            "complete": false, "stalled": false,
+        }));
+        assert_eq!(waiting["status"], "waiting", "{waiting}");
+        assert_eq!(waiting["asks"][0]["fields"], json!(["branch"]), "{waiting}");
+        assert!(waiting.get("ran").is_none(), "the walk is not the model's: {waiting}");
+
+        // A finished run: its result, which is the whole point.
+        let complete = conclusion(&json!({
+            "ok": true, "run_id": 9, "complete": true, "result": { "total": 9 },
+        }));
+        assert_eq!(complete["status"], "complete");
+        assert_eq!(complete["result"]["total"], 9);
+
+        // A failed step is said plainly, because it is why the ask went unanswered.
+        let failed = conclusion(&json!({
+            "ok": true, "run_id": 9, "complete": false,
+            "ran": [{ "step": "fetch", "failed": true, "reason": "the node did not answer" }],
+            "requests": [],
+        }));
+        assert_eq!(failed["status"], "failed");
+        assert!(failed["failed"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("did not answer"));
+
+        // Anything that is not a run answer is passed through untouched.
+        let other = conclusion(&json!({ "outcome": "committed", "id": 3 }));
+        assert_eq!(other, json!({ "outcome": "committed", "id": 3 }));
+    }
 
     /// A `send` to the page becomes a row removal in the stream the forms went into,
     /// addressed by the answer's own id — so a second device watching the conversation
