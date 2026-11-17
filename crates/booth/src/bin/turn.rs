@@ -646,6 +646,22 @@ fn frames_chunk(turn_id: &str, first: bool, chunk: &str) -> Vec<Value> {
 /// data under `data` and the speaker in `sender` (`{name, sender, data}` — prism ADR-0017's
 /// `ui:` envelope); a direct caller (a test, a sibling booth) sends the args flat. The
 /// hidden parameter is "who wrapped this", so unwrap once here instead of at every field.
+/// The answer's values: `{field: {data, payload}}` in, `{field: value}` out. A caller that
+/// sends bare values (a CLI, a test) is handed back as it came.
+fn answer_values(args: &Value) -> Value {
+    let Some(map) = args.as_object() else {
+        return args.clone();
+    };
+    Value::Object(
+        map.iter()
+            .map(|(field, sent)| {
+                let value = sent.get("data").cloned().unwrap_or_else(|| sent.clone());
+                (field.clone(), value)
+            })
+            .collect(),
+    )
+}
+
 fn payload(envelope: &Value) -> &Value {
     envelope
         .get("data")
@@ -1974,7 +1990,13 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
         .or_else(|| envelope.get("id").and_then(Value::as_str))
         .context("answer: neither the envelope nor the payload names the step — a form's id IS its address")?;
     let (run_id, step, pass, attempt) = parse_address(address)?;
-    let output = args.get("data").cloned().unwrap_or(Value::Null);
+    // WHAT THE PERSON SAID, as values. A form uplink's payload is the field map itself
+    // (`{field: {data, payload}}` — fluxen's Message envelope, where `payload` is the field's
+    // own declaration and `data` is the answer). The run records the answer alone: a plan reads
+    // `$.ask.side`, not `$.ask.side.data`, and nothing downstream has to know the wire's
+    // envelope. Unwrapping a second `data` here read a key the venue never sends, which is why
+    // the first answer in a real browser landed in the log as `null`.
+    let output = answer_values(args);
     let mounts = mounts_of_settings(&settings, &json!({}));
     // A finished call closes the tasks bound to the code row that ran (ADR-0003 §3) — the
     // same fact a turn reads, fetched from the same place, so an answer and a turn agree
@@ -2987,6 +3009,20 @@ fn fetch_tasks(store_url: &str, scope: u64) -> Option<Vec<Value>> {
 mod tests {
 
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    /// A person's answer reaches the log as VALUES, not as the wire's envelope: the form sends
+    /// `{side: {data: "right", payload: {...}}}`, and a plan binding `$.ask.side` must read
+    /// "right". The first real browser answer was recorded as `null` because the handler looked
+    /// for a second `data` inside the field map — the shape nobody sends.
+    #[test]
+    fn an_answer_is_recorded_as_the_values_the_person_gave() {
+        let sent = json!({
+            "side": { "data": "right", "payload": { "kind": "field", "field": "side" } },
+        });
+        assert_eq!(answer_values(&sent), json!({ "side": "right" }));
+        // A direct caller already sends values; nothing is rewritten.
+        assert_eq!(answer_values(&json!({ "side": "right" })), json!({ "side": "right" }));
+    }
 
     /// The form a waiting run sends IS the answer's address: the row lands in the
     /// conversation, its `id` is the step it answers, and its uplink names the door.
