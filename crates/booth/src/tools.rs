@@ -793,6 +793,15 @@ fn touch(
 /// itself can receive.
 const SUBJECTS: &[(&str, &str)] = &[("memory/fact", "memories")];
 
+/// The subject that means "the page", not a store.
+///
+/// A plan that wants something to HAPPEN on screen declares the intent and stops
+/// there — `{"subject": "ui", "payload": {"clear": "ask"}}` says "the ask is over",
+/// and this deployment decides what that looks like (today: drop the row whose id is
+/// that step's answer address). Plans never spell a frame: the wire belongs to the
+/// renderer, and a plan that carried it would have to change when the renderer does.
+const UI_SUBJECT: &str = "ui";
+
 /// The last run id this process issued, so two `start` calls in the same
 /// millisecond cannot land on one address (the second would REPLACE the first:
 /// k10r's run door takes the id it is handed, and the revision would show a single
@@ -886,22 +895,40 @@ fn drive(
                 // subject nobody here serves leaves the step READY — parked, not
                 // dropped, because a message that vanished cannot report itself.
                 schematic::Kind::Send { subject, payload } => {
-                    let Some((_, area)) = SUBJECTS
-                        .iter()
-                        .find(|(served, _)| served == subject)
-                    else {
-                        continue;
-                    };
                     let body = payload.clone().unwrap_or_else(|| json!(activation.inputs));
-                    let scope = world.scope("start")?;
-                    let answer = doors.post(
-                        &format!("{store_url}/{area}/{scope}"),
-                        &body,
-                    )?;
-                    trace.push(json!({ "step": activation.step, "pass": activation.pass,
-                                       "attempt": activation.attempt, "subject": subject,
-                                       "output": answer }));
-                    answer
+                    // THE PAGE IS NOT A STORE. A send to it completes here — nobody
+                    // reads a send's value, by definition — and the trace carries what
+                    // the edge must draw. The addresses are resolved against the log,
+                    // because only the log knows which passes of that step exist; the
+                    // run's own id is the caller's (this fn is given a run, not its
+                    // address), so the caller composes the final id.
+                    if subject == UI_SUBJECT {
+                        let mut entry = json!({ "step": activation.step, "pass": activation.pass,
+                                                "attempt": activation.attempt, "subject": subject,
+                                                "output": body });
+                        if let Some(named) = body.get("clear").and_then(Value::as_str) {
+                            entry["clear"] = json!(run
+                                .entries
+                                .iter()
+                                .filter(|past| past.step == named)
+                                .map(|past| json!({ "step": past.step, "pass": past.pass,
+                                                    "attempt": past.attempt }))
+                                .collect::<Vec<_>>());
+                        }
+                        trace.push(entry);
+                        body
+                    } else {
+                        let Some((_, area)) = SUBJECTS.iter().find(|(served, _)| served == subject)
+                        else {
+                            continue;
+                        };
+                        let scope = world.scope("start")?;
+                        let answer = doors.post(&format!("{store_url}/{area}/{scope}"), &body)?;
+                        trace.push(json!({ "step": activation.step, "pass": activation.pass,
+                                           "attempt": activation.attempt, "subject": subject,
+                                           "output": answer }));
+                        answer
+                    }
                 }
                 // A call by ADDRESS and a request are not the engine's: one is a
                 // route this deployment may not mount, the other waits for a
@@ -1864,6 +1891,55 @@ mod tests {
 
     /// `advance` appends one completion, writes the run back, and answers the
     /// next ready set — and a redelivered completion writes nothing twice.
+    /// A `send` to the page is not a store's business: it completes here, it POSTs
+    /// nothing, and it resolves the step addresses the edge needs — the plan said
+    /// "the ask is over", not which rows that is.
+    #[test]
+    fn a_send_to_the_page_completes_here_and_names_the_rows() {
+        const UI_PLAN: &str = r#"{
+            "schema_version": 1,
+            "steps": [
+                { "id": "ask", "kind": "request",
+                  "form": { "fields": [{ "name": "branch", "type": "string" }] },
+                  "out_edges": [{ "to": "close" }] },
+                { "id": "close", "kind": "send", "subject": "ui",
+                  "payload": { "clear": "ask" },
+                  "out_edges": [{ "to": "done" }] },
+                { "id": "done", "kind": "end", "inputs": { "saw": "$.close.clear" } }
+            ]
+        }"#;
+        let mounts = python_mount();
+        let run = schematic::Run::new(plan_hash(UI_PLAN)).with_origin("skill:37/9");
+        let mut doors = Recorder::default()
+            .answering("/skills/37/9", json!({ "steps": UI_PLAN }))
+            .answering("/runs/37/", json!({ "doc": schematic::run_to_json(&run), "revision": 1 }));
+
+        let value = call(
+            &mut doors,
+            "advance",
+            &json!({ "run_id": 5, "step": "ask", "output": { "branch": "left" } }),
+            &world(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the ask lands");
+
+        assert!(
+            doors.posts.is_empty(),
+            "a page is not a store: {:?}",
+            doors.posts
+        );
+        let ran = value["ran"].as_array().expect("a walk");
+        assert_eq!(ran[0]["step"], "close", "{value}");
+        assert_eq!(ran[0]["subject"], "ui", "{value}");
+        assert_eq!(
+            ran[0]["clear"],
+            json!([{ "step": "ask", "pass": 0, "attempt": 0 }]),
+            "the rows the page must drop, resolved against the log: {value}"
+        );
+        // The exit ran too: the clear step completed, so nothing was left waiting.
+        assert_eq!(value["complete"], true, "{value}");
+    }
+
     #[test]
     fn advance_appends_once_and_answers_the_next_ready_set() {
         let mounts = python_mount();

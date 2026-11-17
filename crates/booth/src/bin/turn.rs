@@ -241,7 +241,59 @@ const DONE_EVENT: &str = "ui:turn.done";
 /// unchanged (a non-array payload becomes a vals slot named by the event), so this
 /// adds no frame vocabulary — and the answer returns the way every answer does, as
 /// the next turn's text, where the model calls `advance`.
-const RUN_REQUEST_EVENT: &str = "ui:run.request";
+const RUN_PAGE_EVENT: &str = "ui:run.page";
+/// What the plan's `send` to the page becomes, now that a deployment has bound it.
+///
+/// The plan said "the ask is over" (`{"subject": "ui", "payload": {"clear": "ask"}}`);
+/// this turns that into the frames the renderer understands — a `remove` of the row
+/// whose id is that step's answer address. Same slot the forms were appended to, so
+/// the order the plan implies is the order the page sees, without the plan knowing
+/// anything about frames.
+/// The same, for a tool answer that names its run: `start` answers one, `advance`
+/// was GIVEN one.
+fn page_updates(value: &Value, args: &Value) -> Vec<Value> {
+    let run_id = value
+        .get("run_id")
+        .and_then(Value::as_u64)
+        .or_else(|| args.get("run_id").and_then(Value::as_u64));
+    let Some(run_id) = run_id else {
+        return Vec::new();
+    };
+    let ran: &[Value] = value
+        .get("ran")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    ui_frames(run_id, ran)
+}
+
+fn ui_frames(run_id: u64, ran: &[Value]) -> Vec<Value> {
+    let mut frames = Vec::new();
+    for entry in ran {
+        if entry.get("subject").and_then(Value::as_str) != Some("ui") {
+            continue;
+        }
+        let Some(addresses) = entry.get("clear").and_then(Value::as_array) else {
+            continue;
+        };
+        for address in addresses {
+            let (Some(step), Some(pass), Some(attempt)) = (
+                address.get("step").and_then(Value::as_str),
+                address.get("pass").and_then(Value::as_u64),
+                address.get("attempt").and_then(Value::as_u64),
+            ) else {
+                continue;
+            };
+            frames.push(json!({
+                "action": "remove",
+                "slot": MESSAGES_SLOT,
+                "id": format!("{run_id}/{step}/{pass}/{attempt}"),
+            }));
+        }
+    }
+    frames
+}
+
 /// A run that moved and is not waiting on anybody: finished, or blocked on something
 /// this deployment cannot do. The page stops asking when it hears this.
 const RUN_DONE_EVENT: &str = "ui:run.done";
@@ -913,6 +965,9 @@ fn turn(
             // inside the call (where the answer is in hand) and emitted after the
             // ctx borrow ends.
             let mut awaiting: Option<Value> = None;
+            // What this call decided the page should do (a `send` to `ui`), captured
+            // where the answer is in hand and emitted once the ctx borrow ends.
+            let mut page: Vec<Value> = Vec::new();
             // The ctx borrow lives only for this call: the provider re-open
             // below needs it back.
             let content = {
@@ -945,6 +1000,7 @@ fn turn(
                         // steps whose form is unanswered, and the address
                         // (run, step, pass, attempt) an answer comes back with.
                         awaiting = awaiting_of(&value, &call.function.arguments);
+                        page = page_updates(&value, &call.function.arguments);
                         // One record per call that SUCCEEDED. The same call twice
                         // (a model that re-asks rather than moving on) keeps only
                         // the last answer: what the store owes the next turn is
@@ -972,12 +1028,23 @@ fn turn(
                     Err(error) => json!({ "error": error }).to_string(),
                 }
             };
+            // A `send` to the page happens where the plan put it: the row goes as soon
+            // as the step that said so completed, not at the end of the turn.
+            if !page.is_empty() {
+                emit(
+                    ctx,
+                    RUN_PAGE_EVENT,
+                    device.as_deref(),
+                    Some(&turn.id),
+                    json!(page),
+                )?;
+            }
             if let Some(awaiting) = awaiting.take() {
                 let forms = request_forms(&awaiting);
                 if !forms.is_empty() {
                     emit(
                         ctx,
-                        RUN_REQUEST_EVENT,
+                        RUN_PAGE_EVENT,
                         device.as_deref(),
                         Some(&turn.id),
                         json!(forms),
@@ -1830,11 +1897,22 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // Say what is next on the SAME channel the question went out on: another form, or
     // the run's answer. Nothing is said when the answer was a repeat — the page has
     // already heard the consequence of the first delivery.
+    let page = ui_frames(
+        run_id,
+        value
+            .get("ran")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+    );
+    if !page.is_empty() {
+        emit(ctx, RUN_PAGE_EVENT, device.as_deref(), None, json!(page))?;
+    }
     let awaiting = awaiting_of(&value, &json!({}));
     if let Some(awaiting) = awaiting {
         let forms = request_forms(&awaiting);
         if !forms.is_empty() {
-            emit(ctx, RUN_REQUEST_EVENT, device.as_deref(), None, json!(forms))?;
+            emit(ctx, RUN_PAGE_EVENT, device.as_deref(), None, json!(forms))?;
         }
     } else if value.get("written").and_then(Value::as_bool).unwrap_or(false) {
         emit(
@@ -2775,6 +2853,44 @@ mod tests {
     }
 
     use super::*;
+
+    /// A `send` to the page becomes a row removal in the stream the forms went into,
+    /// addressed by the answer's own id — so a second device watching the conversation
+    /// sees the form go when the first one answers.
+    #[test]
+    fn a_clear_send_becomes_a_removal_in_the_stream() {
+        let ran = vec![json!({
+            "step": "close", "subject": "ui",
+            "clear": [{ "step": "ask", "pass": 0, "attempt": 0 }],
+        })];
+        assert_eq!(
+            ui_frames(9, &ran),
+            vec![json!({ "action": "remove", "slot": MESSAGES_SLOT, "id": "9/ask/0/0" })]
+        );
+        // `start` answers the run id; `advance` was handed it. Both compose the same ids.
+        assert_eq!(
+            page_updates(
+                &json!({ "run_id": 4, "ran": [{ "subject": "ui",
+                        "clear": [{ "step": "ask", "pass": 1, "attempt": 0 }] }] }),
+                &json!({})
+            ),
+            vec![json!({ "action": "remove", "slot": MESSAGES_SLOT, "id": "4/ask/1/0" })]
+        );
+        assert_eq!(
+            page_updates(
+                &json!({ "ran": [{ "subject": "ui",
+                        "clear": [{ "step": "ask", "pass": 0, "attempt": 0 }] }] }),
+                &json!({ "run_id": 6 })
+            ),
+            vec![json!({ "action": "remove", "slot": MESSAGES_SLOT, "id": "6/ask/0/0" })]
+        );
+        // A send to a store subject says nothing to the page.
+        assert!(page_updates(
+            &json!({ "run_id": 4, "ran": [{ "subject": "memory/fact", "output": [] }] }),
+            &json!({})
+        )
+        .is_empty());
+    }
 
     /// A run that waits on a person is the one answer a page must act on, and it
     /// carries the address the answer comes back through.
