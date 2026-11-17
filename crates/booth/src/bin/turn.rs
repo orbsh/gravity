@@ -1963,10 +1963,16 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
             .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))
             .unwrap_or_else(|| "page".to_string()),
     };
+    // THE ADDRESS RIDES THE ENVELOPE, not the fields: a page's form sends `Outflow {dest, id,
+    // data}`, and the venue puts `id` beside the device and the sender — it is a fact about the
+    // delivery, not something the person typed. A direct caller (a CLI, a test) has no venue to
+    // say it, so it may put `id` in the payload instead; both are the same address, read in that
+    // order rather than duplicated into the payload by every sender.
     let address = args
         .get("id")
         .and_then(Value::as_str)
-        .context("answer: the uplink carries no `id` — a form's id IS the address of the step it answers")?;
+        .or_else(|| envelope.get("id").and_then(Value::as_str))
+        .context("answer: neither the envelope nor the payload names the step — a form's id IS its address")?;
     let (run_id, step, pass, attempt) = parse_address(address)?;
     let output = args.get("data").cloned().unwrap_or(Value::Null);
     let mounts = mounts_of_settings(&settings, &json!({}));
