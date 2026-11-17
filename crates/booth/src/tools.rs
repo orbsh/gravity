@@ -878,6 +878,35 @@ fn drive(
     Ok(trace)
 }
 
+/// What the run is waiting for a PERSON to answer: the ready steps whose kind is
+/// `request`, in the shape a renderer needs — the form as data (it already is:
+/// schematic's `Form` is fields and types, not a schema language), the inputs
+/// already resolved, and the `(step, pass, attempt)` that `advance` takes to
+/// record the answer when it comes.
+///
+/// This is the whole of the engine's opinion about interaction: it says what is
+/// missing and where the answer goes. Drawing it is the host's, and so is
+/// deciding which of several waiting requests a person sees first.
+fn waiting(readiness: &schematic::Readiness, plan: &schematic::Plan) -> Vec<Value> {
+    readiness
+        .ready
+        .iter()
+        .filter_map(|activation| {
+            let step = plan.step(&activation.step)?;
+            match &step.kind {
+                schematic::Kind::Request { form, .. } => Some(json!({
+                    "step": activation.step,
+                    "pass": activation.pass,
+                    "attempt": activation.attempt,
+                    "form": serde_json::to_value(form).unwrap_or(Value::Null),
+                    "inputs": activation.inputs,
+                })),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// The run's result: the inputs the first `end` it reached was given, or `null`
 /// while no path has closed.
 fn run_result(plan: &schematic::Plan, run: &schematic::Run) -> Value {
@@ -982,6 +1011,7 @@ fn start(
             "inputs": a.inputs,
         })).collect::<Vec<_>>(),
         "blocked": readiness.blocked.iter().map(|b| format!("{b:?}")).collect::<Vec<_>>(),
+        "requests": waiting(&readiness, &plan),
         "complete": readiness.complete,
         "stalled": readiness.stalled,
     }))
@@ -1074,6 +1104,7 @@ fn advance_run(
             "inputs": a.inputs,
         })).collect::<Vec<_>>(),
         "blocked": readiness.blocked.iter().map(|b| format!("{b:?}")).collect::<Vec<_>>(),
+        "requests": waiting(&readiness, &plan),
         "complete": readiness.complete,
         "stalled": readiness.stalled,
     }))
@@ -1984,6 +2015,44 @@ mod tests {
         let ready = value["ready"].as_array().unwrap_or_else(|| panic!("{value}"));
         assert_eq!(ready.len(), 1, "the send is parked, not dropped: {value}");
         assert_eq!(ready[0]["step"], "tell");
+    }
+
+    /// A `request` is what a run waits on a person for: `start` answers it with the
+    /// form as data, the inputs as values, and the address `advance` takes — the
+    /// engine says what is missing and where the answer goes, and draws nothing.
+    #[test]
+    fn a_request_step_is_answered_as_a_form_and_an_address() {
+        let mounts = python_mount();
+        let plan = r#"{
+          "schema_version": 1,
+          "steps": [
+            { "id": "ask", "kind": "request",
+              "form": { "title": "Pick a branch",
+                        "fields": [ { "name": "branch", "type": "choice",
+                                      "options": ["retry", "fine"], "title": "Next" } ] },
+              "out_edges": [{ "to": "done", "when": "retry" }, { "to": "done", "when": "*" }] },
+            { "id": "done", "kind": "end" }
+          ]
+        }"#;
+        let mut doors = Recorder::default().answering("/skills/37/9", json!({ "steps": plan }));
+        let value = call(
+            &mut doors,
+            "start",
+            &json!({ "skill_id": 9 }),
+            &facts(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the door answered");
+
+        assert_eq!(value["ok"], true, "{value}");
+        let waiting = value["requests"].as_array().expect("a waiting set");
+        assert_eq!(waiting.len(), 1, "{value}");
+        assert_eq!(waiting[0]["step"], "ask");
+        assert_eq!(waiting[0]["pass"], 0);
+        assert_eq!(waiting[0]["attempt"], 0);
+        assert_eq!(waiting[0]["form"]["fields"][0]["name"], "branch");
+        assert_eq!(waiting[0]["form"]["title"], "Pick a branch");
+        assert_eq!(value["complete"], false, "nothing ran: a person has to answer");
     }
 
     #[test]
