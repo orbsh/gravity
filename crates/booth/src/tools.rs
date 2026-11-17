@@ -153,17 +153,13 @@ static SPECS: &[ToolSpec] = &[
             json!({
                 "type": "object",
                 "properties": {
-                    "skill_id": {
-                        "type": "integer",
-                        "description": "The skill the run belongs to (its plan is re-read and must still match)."
-                    },
                     "run_id": { "type": "integer", "description": "The id `start` answered." },
                     "step": { "type": "string", "description": "The step id that finished." },
                     "output": { "description": "What the step produced; the run keeps it whole." },
                     "pass": { "type": "integer", "description": "Loop pass (default 0 — the first)." },
                     "attempt": { "type": "integer", "description": "Attempt within the pass (default 0)." }
                 },
-                "required": ["skill_id", "run_id", "step"]
+                "required": ["run_id", "step"]
             })
         },
         nature: Nature::Fast,
@@ -1074,8 +1070,7 @@ fn start(
 }
 
 /// The `(scope, skill)` a run's origin spells — `skill:{scope}/{id}`, the one form
-/// this booth writes. A run started by an older build carries none, which is why
-/// `advance` still accepts an explicit `skill_id`.
+/// this booth writes, and the ONLY place `advance` learns which skill a run belongs to.
 fn origin_of(run: &schematic::Run) -> Option<(u64, u64)> {
     let rest = run.origin.as_deref()?.strip_prefix("skill:")?;
     let (scope, skill) = rest.split_once('/')?;
@@ -1109,25 +1104,23 @@ fn advance_run(
     let attempt = args.get("attempt").and_then(Value::as_u64).unwrap_or(0) as u32;
     let output = args.get("output").cloned().unwrap_or(Value::Null);
 
-    // WHICH skill: the caller may name it (a page that already knows), or the run
-    // may say — it carries the address it started from. A run whose origin is
-    // missing and whose caller says nothing is refused rather than guessed at.
-    let (scope, skill_id) = match args.get("skill_id").and_then(Value::as_u64) {
-        Some(skill_id) => (facts.scope("advance")?, skill_id),
-        None => {
-            let read_scope = facts.scope("advance")?;
-            let stored = doors.get(&format!("{store_url}/runs/{read_scope}/{run_id}"))?;
-            let doc = stored
-                .get("doc")
-                .and_then(Value::as_str)
-                .ok_or("advance: the run answer carried no document")?;
-            let run = schematic::run_from_json(doc)
-                .map_err(|e| format!("advance: the stored run is not a run: {e}"))?;
-            origin_of(&run).ok_or(
-                "advance: no `skill_id` in the args, and the run names no origin — pass the \
-                 skill the run belongs to",
-            )?
-        }
+    // WHICH skill: the RUN says, and only the run. It carries the address it started
+    // from, so an advance is possible from anywhere — another device, another day, a
+    // page that never saw the starting call. An argument naming the skill would be a
+    // second copy of the same fact, and two copies disagree eventually.
+    let (scope, skill_id) = {
+        let read_scope = facts.scope("advance")?;
+        let stored = doors.get(&format!("{store_url}/runs/{read_scope}/{run_id}"))?;
+        let doc = stored
+            .get("doc")
+            .and_then(Value::as_str)
+            .ok_or("advance: the run answer carried no document")?;
+        let run = schematic::run_from_json(doc)
+            .map_err(|e| format!("advance: the stored run is not a run: {e}"))?;
+        origin_of(&run).ok_or(
+            "advance: this run names no origin — a run started before origins existed cannot \
+             be advanced, because nothing says which skill it belongs to",
+        )?
     };
 
     let skill = doors.get(&format!("{store_url}/skills/{scope}/{skill_id}"))?;
@@ -1854,14 +1847,14 @@ mod tests {
     #[test]
     fn advance_appends_once_and_answers_the_next_ready_set() {
         let mounts = python_mount();
-        let run_doc = schematic::run_to_json(&schematic::Run::new(plan_hash(PLAN)));
+        let run_doc = schematic::run_to_json(&schematic::Run::new(plan_hash(PLAN)).with_origin("skill:37/9"));
         let mut doors = Recorder::default()
             .answering("/skills/37/9", json!({ "steps": PLAN }))
             .answering("/runs/37/", json!({ "doc": run_doc, "revision": 1 }));
         let value = call(
             &mut doors,
             "advance",
-            &json!({ "skill_id": 9, "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
+            &json!({ "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
             &facts(&mounts, "s-1"),
             &mut Vec::new(),
         )
@@ -1888,14 +1881,14 @@ mod tests {
     #[test]
     fn advance_refuses_a_run_whose_plan_moved() {
         let mounts = python_mount();
-        let run_doc = schematic::run_to_json(&schematic::Run::new("0000000000000000"));
+        let run_doc = schematic::run_to_json(&schematic::Run::new("0000000000000000").with_origin("skill:37/9"));
         let mut doors = Recorder::default()
             .answering("/skills/37/9", json!({ "steps": PLAN }))
             .answering("/runs/37/", json!({ "doc": run_doc, "revision": 1 }));
         let value = call(
             &mut doors,
             "advance",
-            &json!({ "skill_id": 9, "run_id": 5, "step": "fetch" }),
+            &json!({ "run_id": 5, "step": "fetch" }),
             &facts(&mounts, "s-1"),
             &mut Vec::new(),
         )
@@ -2236,7 +2229,7 @@ mod tests {
     #[test]
     fn advance_retries_a_write_the_store_refused() {
         let mounts = python_mount();
-        let run_doc = schematic::run_to_json(&schematic::Run::new(plan_hash(PLAN)));
+        let run_doc = schematic::run_to_json(&schematic::Run::new(plan_hash(PLAN)).with_origin("skill:37/9"));
         let mut doors = Recorder::default()
             .answering("/skills/37/9", json!({ "steps": PLAN }))
             .answering("/runs/37/", json!({ "doc": run_doc, "revision": 1 }))
@@ -2244,7 +2237,7 @@ mod tests {
         let value = call(
             &mut doors,
             "advance",
-            &json!({ "skill_id": 9, "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
+            &json!({ "run_id": 5, "step": "fetch", "output": { "body": "hi" } }),
             &facts(&mounts, "s-1"),
             &mut Vec::new(),
         )

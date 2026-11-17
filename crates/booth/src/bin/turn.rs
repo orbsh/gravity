@@ -65,6 +65,10 @@ fn main() -> anyhow::Result<()> {
         // booth refuses an admin verb, so that door is an event like the turn's, behind the same
         // auth declaration.
         .on("save", |ctx: &mut Ctx, args: Value| save(ctx, &args))
+        // A PAGE ANSWERING A FORM. The answer is the run's next completion, so this
+        // handler does what `advance` does and nothing more: no model is called, because
+        // the mechanical part of a run does not need one and the person already decided.
+        .on("answer", |ctx: &mut Ctx, args: Value| answer(ctx, &args))
         // THE RESOURCE DOOR (ADR-0003 §7): the Effector asks by (owner, type, sequence) and gets
         // material for ONE transfer; after it publishes, it reports the reference it produced and
         // this booth writes the version row and advances the pointer. The node never holds a
@@ -106,7 +110,7 @@ fn storage_schema() -> Value {
                 "schema": {
                     "key_len": 16,
                     "key_fields": key,
-                    "layout_version": 1,
+                    "layout_version": 2,
                     "hot_width": 16,
                     "payload_header_len": 3,
                     "hot_fields": [
@@ -116,6 +120,10 @@ fn storage_schema() -> Value {
                     "cold_fields": [
                         {"name": "store_url", "ty": "Str", "width": 0, "offset": 0, "tag": 1},
                         {"name": "memory_format", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
+                        // THE MOUNT TABLE, where a deployment is configured: which operation
+                        // language a mount type serves. It is deployment knowledge, not
+                        // something a page should carry on every keystroke (layout v2).
+                        {"name": "mounts", "ty": "Str", "width": 0, "offset": 0, "tag": 3},
                     ],
                     "slots": slots.clone(),
                 },
@@ -155,6 +163,10 @@ struct Settings {
     memory_scope: u64,
     memory_format: String,
     default_model: u64,
+    /// The mount table as stored: a JSON array of `{language, type}`. Absent on a
+    /// deployment that never declared one — a turn then falls back to what its caller
+    /// carries, and a page's answer has nothing to run steps with.
+    mounts: Option<String>,
 }
 
 fn read_settings(ctx: &mut Ctx) -> anyhow::Result<Settings> {
@@ -184,6 +196,7 @@ fn read_settings(ctx: &mut Ctx) -> anyhow::Result<Settings> {
             .get("default_model")
             .and_then(Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("turn: `settings` id 1 is missing `default_model`"))?,
+        mounts: row.get("mounts").and_then(Value::as_str).map(str::to_string),
     })
 }
 
@@ -223,6 +236,15 @@ const UI_EVENT: &str = "ui:turn";
 const OPENED_EVENT: &str = "ui:turn.opened";
 
 const DONE_EVENT: &str = "ui:turn.done";
+/// A run that stopped on a `request`: the step's form, as data, with the address
+/// the answer goes back through. The PAGE draws it; the venue forwards any emit
+/// unchanged (a non-array payload becomes a vals slot named by the event), so this
+/// adds no frame vocabulary — and the answer returns the way every answer does, as
+/// the next turn's text, where the model calls `advance`.
+const RUN_REQUEST_EVENT: &str = "ui:run.request";
+/// A run that moved and is not waiting on anybody: finished, or blocked on something
+/// this deployment cannot do. The page stops asking when it hears this.
+const RUN_DONE_EVENT: &str = "ui:run.done";
 /// A drawing turn's failure, said the same way.
 const ERROR_EVENT: &str = "ui:turn.error";
 /// Where a deployment's configuration is ANSWERED: the save is an event, so its result is said.
@@ -276,6 +298,94 @@ fn out_of(args: &Value) -> anyhow::Result<Out<'_>> {
             .and_then(Value::as_str)
             .context("turn: a delta consumer must name the `event` its chunks are spoken as")?,
     ))
+}
+
+/// What a tool answer says the page must ask, if anything: a run's unanswered
+/// `request` steps, with the run they belong to and the skill it was started from.
+///
+/// A tool answer with no `requests` (or an empty one) says nothing — a run that is
+/// merely finished, or waiting on a delivery, is not a question for a person.
+fn awaiting_of(value: &Value, args: &Value) -> Option<Value> {
+    let requests = value
+        .get("requests")
+        .and_then(Value::as_array)
+        .filter(|requests| !requests.is_empty())?;
+    Some(json!({
+        "run_id": value.get("run_id"),
+        "skill_id": args.get("skill_id"),
+        "requests": requests,
+    }))
+}
+
+/// The uplink a form's answer takes. A control's target is `dest` and never `event`
+/// (acCrete ADR-0023: downlink writes a slot, uplink calls a handler, and the two are
+/// not symmetrical); the venue prefixes it, so this is `ui:run.answer` on the wire.
+const ANSWER_DEST: &str = "run.answer";
+
+/// A waiting run, as PAGE.
+///
+/// One form per waiting step, and the form carries its ADDRESS in its own `id`
+/// (`<run>/<step>/<pass>/<attempt>`). Submitting sends
+/// `Outflow { dest, id, data }` — the address rides the answer itself, which is what
+/// makes a batch of answers and a second device ordinary traffic instead of a
+/// guessing game about which chat message meant what.
+fn request_forms(awaiting: &Value) -> Vec<Value> {
+    let run_id = awaiting.get("run_id").and_then(Value::as_u64).unwrap_or(0);
+    let empty = Vec::new();
+    let requests = awaiting
+        .get("requests")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    requests
+        .iter()
+        .map(|request| {
+            let step = request.get("step").and_then(Value::as_str).unwrap_or("");
+            let pass = request.get("pass").and_then(Value::as_u64).unwrap_or(0);
+            let attempt = request.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+            let address = format!("{run_id}/{step}/{pass}/{attempt}");
+            let form = request.get("form").cloned().unwrap_or(Value::Null);
+            let mut children = Vec::new();
+            let empty_fields = Vec::new();
+            for field in form
+                .get("fields")
+                .and_then(Value::as_array)
+                .unwrap_or(&empty_fields)
+            {
+                let name = field.get("name").and_then(Value::as_str).unwrap_or("");
+                // The declared kind and its options ride `payload`: the field widget
+                // draws what the FORM said, not what gravity guesses.
+                children.push(json!({
+                    "type": "input",
+                    "id": name,
+                    "bind": { "value": {
+                        "kind": "field",
+                        "field": name,
+                        "payload": field.clone(),
+                    }},
+                }));
+            }
+            children.push(json!({
+                "type": "button",
+                "attrs": { "oneshot": true },
+                "bind": { "value": { "kind": "submit", "default": "submit" } },
+            }));
+            json!({
+                // THE STREAM, not a region of our own: a form a person must answer is
+                // part of the conversation, and the rack already draws it (selector
+                // `assistant`: the deployment is the one asking). No new slot, no new
+                // template — the message list is where an exchange belongs.
+                "action": "append",
+                "slot": MESSAGES_SLOT,
+                "data": {
+                    "type": "form",
+                    "id": address,
+                    "attrs": { "selector": "assistant" },
+                    "bind": { "value": { "kind": "dest", "dest": ANSWER_DEST } },
+                    "children": children,
+                },
+            })
+        })
+        .collect()
 }
 
 /// One venue emit. `name` is the recipient event — a compiled view body is not told which
@@ -562,7 +672,7 @@ fn turn(
         channel_id,
         member_id,
         memory_scope: settings.memory_scope,
-        memory_format: settings.memory_format,
+        memory_format: settings.memory_format.clone(),
         endpoint: recipe.endpoint,
         model: recipe.model,
         key_env: recipe.key_env,
@@ -769,7 +879,7 @@ fn turn(
         // The mount table the deployment declares (prism's manifest, carried in
         // the turn args): operation language → the mount type that serves it.
         // Empty is a fact ("this deployment declares no nodes"), absent is not.
-        let mounts = mounts_of(args);
+        let mounts = mounts_of_settings(&settings, args);
         // Residency for a mount call is the CONVERSATION (ADR-0001 §6 leaves
         // the key to the caller): a step script's own state survives the turns
         // of one conversation and nothing else.
@@ -799,6 +909,10 @@ fn turn(
                 session: &session,
                 ends_on: &ends_on,
             };
+            // The waiting requests of a run that stopped on a person, captured
+            // inside the call (where the answer is in hand) and emitted after the
+            // ctx borrow ends.
+            let mut awaiting: Option<Value> = None;
             // The ctx borrow lives only for this call: the provider re-open
             // below needs it back.
             let content = {
@@ -826,6 +940,11 @@ fn turn(
                 }
                 match outcome {
                     Ok(value) => {
+                        // A run that is waiting for a PERSON is the one tool
+                        // answer a page has to act on: `start`/`advance` name the
+                        // steps whose form is unanswered, and the address
+                        // (run, step, pass, attempt) an answer comes back with.
+                        awaiting = awaiting_of(&value, &call.function.arguments);
                         // One record per call that SUCCEEDED. The same call twice
                         // (a model that re-asks rather than moving on) keeps only
                         // the last answer: what the store owes the next turn is
@@ -853,6 +972,18 @@ fn turn(
                     Err(error) => json!({ "error": error }).to_string(),
                 }
             };
+            if let Some(awaiting) = awaiting.take() {
+                let forms = request_forms(&awaiting);
+                if !forms.is_empty() {
+                    emit(
+                        ctx,
+                        RUN_REQUEST_EVENT,
+                        device.as_deref(),
+                        Some(&turn.id),
+                        json!(forms),
+                    )?;
+                }
+            }
             // ONE assistant message carries ALL the calls, and it is pushed
             // before this loop: a model that answers two requests in one round
             // produces one message with two calls, and pushing it per call fed
@@ -1100,6 +1231,31 @@ fn stream_answer(
     }
 }
 
+
+/// The mount table, from the deployment's row first and the caller's list second.
+///
+/// The row wins because it is where the deployment is configured; the argument stays for
+/// a direct caller (the CLI, a test seam) that has no row to read, and for a deployment
+/// that has not declared one yet. Both shapes are the same: `{language, type}`.
+fn mounts_of_settings(settings: &Settings, args: &Value) -> Vec<(String, String)> {
+    if let Some(text) = settings.mounts.as_deref() {
+        if let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(text) {
+            let declared: Vec<(String, String)> = entries
+                .iter()
+                .filter_map(|entry| {
+                    Some((
+                        entry.get("language")?.as_str()?.to_string(),
+                        entry.get("type")?.as_str()?.to_string(),
+                    ))
+                })
+                .collect();
+            if !declared.is_empty() {
+                return declared;
+            }
+        }
+    }
+    mounts_of(args)
+}
 
 /// The mount table the deployment declares: operation language → the mount type serving
 /// it (prism's manifest, carried in the turn args).
@@ -1611,6 +1767,106 @@ fn frame_form(
 /// It is deliberately NARROW: two collections, the row addressed by `id`, and the document checked
 /// against the keys a turn reads. A missing key is refused BY NAME here instead of becoming a turn
 /// that dies mid-flight with a message about someone else's problem.
+/// A PAGE'S ANSWER TO A WAITING RUN — and nothing else.
+///
+/// No turn, no model: the answer is in hand, the remaining work is mechanical (append
+/// the completion, recompute what is ready, run what the engine can run), and a run may
+/// outlive every turn that touched it. The address is the form's own `id`
+/// (`<run>/<step>/<pass>/<attempt>`), so a page answering two forms in one gesture is two
+/// uplinks, and a second device answering the same one is the same (step, pass, attempt)
+/// — which `advance` already treats as a repeat, not a second completion.
+fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
+    let device = device_of(envelope);
+    let user = sender_user(envelope);
+    let args = payload(envelope);
+    let settings = read_settings(ctx)?;
+    let store_url = settings.store_url.trim_end_matches('/').to_string();
+    let member = match user {
+        Some(user) => user.to_string(),
+        None => args
+            .get("member_id")
+            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))
+            .unwrap_or_else(|| "page".to_string()),
+    };
+    let address = args
+        .get("id")
+        .and_then(Value::as_str)
+        .context("answer: the uplink carries no `id` — a form's id IS the address of the step it answers")?;
+    let (run_id, step, pass, attempt) = parse_address(address)?;
+    let output = args.get("data").cloned().unwrap_or(Value::Null);
+    let mounts = mounts_of_settings(&settings, &json!({}));
+    // A finished call closes the tasks bound to the code row that ran (ADR-0003 §3) — the
+    // same fact a turn reads, fetched from the same place, so an answer and a turn agree
+    // about what work a step ends.
+    let owed = fetch_tasks(&store_url, settings.memory_scope);
+    let ends_on = gravity_booth::tasks::bindings(owed.as_deref().unwrap_or_default());
+
+    let facts = gravity_booth::tools::Facts {
+        store_url: &store_url,
+        memory_scope: Some(settings.memory_scope),
+        mounts: &mounts,
+        session: &member,
+        ends_on: &ends_on,
+    };
+    let value = {
+        let mut doors = VenueDoors { ctx };
+        let mut walked = Vec::new();
+        gravity_booth::tools::call(
+            &mut doors,
+            "advance",
+            &json!({
+                "run_id": run_id,
+                "step": step,
+                "pass": pass,
+                "attempt": attempt,
+                "output": output,
+            }),
+            &facts,
+            &mut walked,
+        )
+        .map_err(anyhow::Error::msg)?
+    };
+
+    // Say what is next on the SAME channel the question went out on: another form, or
+    // the run's answer. Nothing is said when the answer was a repeat — the page has
+    // already heard the consequence of the first delivery.
+    let awaiting = awaiting_of(&value, &json!({}));
+    if let Some(awaiting) = awaiting {
+        let forms = request_forms(&awaiting);
+        if !forms.is_empty() {
+            emit(ctx, RUN_REQUEST_EVENT, device.as_deref(), None, json!(forms))?;
+        }
+    } else if value.get("written").and_then(Value::as_bool).unwrap_or(false) {
+        emit(
+            ctx,
+            RUN_DONE_EVENT,
+            device.as_deref(),
+            None,
+            json!({
+                "run_id": run_id,
+                "complete": value.get("complete").cloned().unwrap_or(json!(false)),
+                "blocked": value.get("blocked").cloned().unwrap_or(json!([])),
+            }),
+        )?;
+    }
+    Ok(json!({ "done": true, "written": value.get("written") }))
+}
+
+/// `<run>/<step>/<pass>/<attempt>` — the address a form's `id` carries.
+fn parse_address(address: &str) -> anyhow::Result<(u64, String, u32, u32)> {
+    let mut parts = address.rsplitn(4, '/');
+    let attempt = parts.next().context("answer: no attempt in the address")?;
+    let pass = parts.next().context("answer: no pass in the address")?;
+    let step = parts.next().context("answer: no step in the address")?;
+    let run_id = parts.next().context("answer: no run in the address")?;
+    Ok((
+        run_id.parse().context("answer: the run id is not a number")?,
+        step.to_string(),
+        pass.parse().context("answer: the pass is not a number")?,
+        attempt.parse().context("answer: the attempt is not a number")?,
+    ))
+}
+
 fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
     let args = payload(envelope);
@@ -2483,7 +2739,61 @@ fn fetch_tasks(store_url: &str, scope: u64) -> Option<Vec<Value>> {
 
 #[cfg(test)]
 mod tests {
+
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    /// The form a waiting run sends IS the answer's address: the row lands in the
+    /// conversation, its `id` is the step it answers, and its uplink names the door.
+    #[test]
+    fn a_waiting_run_is_drawn_as_an_addressed_form_in_the_stream() {
+        let waiting = json!({
+            "run_id": 17,
+            "requests": [{
+                "step": "ask", "pass": 0, "attempt": 0,
+                "form": { "title": "Which way?", "fields": [
+                    { "name": "branch", "type": "choice", "options": ["left", "right"] },
+                ]},
+            }],
+        });
+        let frames = request_forms(&waiting);
+        assert_eq!(frames.len(), 1);
+        let frame = &frames[0];
+        assert_eq!(frame["action"], "append");
+        assert_eq!(frame["slot"], MESSAGES_SLOT, "the form is a message, not a region");
+        let form = &frame["data"];
+        assert_eq!(form["id"], "17/ask/0/0", "the address the answer comes back on");
+        assert_eq!(form["bind"]["value"]["dest"], "run.answer");
+        assert_eq!(form["children"][0]["id"], "branch");
+        assert_eq!(
+            form["children"][0]["bind"]["value"]["payload"]["options"][1],
+            "right",
+            "the field's own declaration rides with it"
+        );
+        assert_eq!(form["children"][1]["bind"]["value"]["kind"], "submit");
+        assert_eq!(parse_address("17/ask/0/0").unwrap(), (17, "ask".into(), 0, 0));
+        assert!(parse_address("17/ask").is_err(), "an address is four parts");
+    }
+
+    use super::*;
+
+    /// A run that waits on a person is the one answer a page must act on, and it
+    /// carries the address the answer comes back through.
+    #[test]
+    fn a_waiting_run_becomes_a_page_question() {
+        let answer = json!({
+            "ok": true, "run_id": 17, "complete": false,
+            "requests": [{ "step": "ask", "pass": 0, "attempt": 0,
+                           "form": { "fields": [{ "name": "branch", "type": "choice" }] } }],
+        });
+        let said = awaiting_of(&answer, &json!({ "skill_id": 9 })).expect("a question");
+        assert_eq!(said["run_id"], 17);
+        assert_eq!(said["skill_id"], 9);
+        assert_eq!(said["requests"][0]["step"], "ask");
+
+        // Nothing waiting: nothing to ask.
+        assert!(awaiting_of(&json!({ "requests": [] }), &json!({})).is_none());
+        assert!(awaiting_of(&json!({ "ok": true }), &json!({})).is_none());
+    }
 
     use super::{read_products, read_review_facts, Pointer};
 

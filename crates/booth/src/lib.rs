@@ -92,6 +92,11 @@ pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
                 // And the SCREEN (ADR-0007 §4: management is a view). It draws forms whose buttons
                 // emit the save event above, so the vocabulary is discoverable from the venue
                 // itself and an AI drives exactly what a person clicks.
+                // A PAGE'S ANSWER to a waiting run's form. Addressed by the answering
+                // device (one page, one answer stream) and gated like the turn: an
+                // anonymous page has no run to advance.
+                .on_as("ui:run.answer", "device", "answer")
+                .gated()
                 .on_as("ui:gravity-model", "device", "screen")
                 .gated()
                 // The shell a renderer connects to: the layout is the application's answer, and
