@@ -805,7 +805,7 @@ fn turn(
         None => {
             let member = user.or_else(|| args.get("member_id").and_then(Value::as_str));
             let member = member.context("turn: no `channel_id` and no member to look one up for")?;
-            first_channel_of(&store_url, member)?
+            channel_of(&store_url, member)?
         }
     };
     // WHO is speaking. A PAGE has no field for it — the venue mounts `sender {device, user}`
@@ -2224,30 +2224,84 @@ impl Doors for VenueDoors<'_, '_> {
     }
 }
 
-/// One POST to k10r, with the door's answer as the tool result and its refusal
-/// as the error text (a 4xx is the caller's mistake to read, not a turn
-/// failure).
-/// THE MEMBER'S FIRST CHANNEL — the answer to "which conversation" when the caller is a page
-/// and the channel is the application's own fact. k10r serves it (`GET /members/{id}/channels`,
-/// one row per membership), and taking the first is the honest default for a deployment that
-/// has not yet built the channel list a person would switch in.
-fn first_channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
-    let url = format!("{store_url}/members/{member}/channels");
-    let resp = ureq::get(&url)
+/// THE CONVERSATION IS THE PERSON'S, and this engine opens it.
+///
+/// A turn used to need a channel that somebody else had already made; on a fresh deployment
+/// nobody had, so the first thing a person said was refused. Channels are gravity's business
+/// (`k10r` stores them, the engine decides them), and the decision here is the smallest one
+/// that can hold: ONE conversation per member, opened on first use.
+///
+/// The id is DERIVED from the member rather than allocated, so two turns racing on a member's
+/// first message open the same channel instead of two — `put_channel` is idempotent, and a
+/// derived id keeps it so without a mapping table to keep in step. A u64 hash over the member's
+/// text collides only if two members hash alike, which one deployment will not see; the day a
+/// deployment does, the fix is a mapping row, not a different hash.
+const GRAVITY_APP_ID: &str = "4f1b6c1e-0d3a-5f2b-9c47-6a1d0e5b8c22";
+
+fn channel_id_for(member: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in member.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The member's conversation: the first channel they are in, or the one this engine opens.
+fn channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
+    let listed = ureq::get(&format!("{store_url}/members/{member}/channels"))
         .call()
         .with_context(|| format!("turn: asking the store which channels {member} is in failed"))?;
     let rows: Value =
-        serde_json::from_reader(resp.into_reader()).context("turn: bad channel list")?;
-    rows.as_array()
-        .and_then(|rows| {
-            rows.iter()
-                .find_map(|row| row.get("channel_id").and_then(Value::as_u64))
+        serde_json::from_reader(listed.into_reader()).context("turn: bad channel list")?;
+    if let Some(open) = rows.as_array().and_then(|rows| {
+        rows.iter()
+            .find_map(|row| row.get("channel_id").and_then(Value::as_u64))
+    }) {
+        return Ok(open);
+    }
+
+    let channel = channel_id_for(member);
+    ureq::post(&format!("{store_url}/channels/{channel}"))
+        .send_json(json!({
+            "app_id": GRAVITY_APP_ID,
+            "scene": "conversation",
+            "created_ms": now_ms(),
+        }))
+        .map(|_| ())
+        .or_else(|e| match e {
+            // 204 is what a fresh open answers; a repeat open is the same row, so a body-less
+            // answer is success too — the door does not say which, and does not need to.
+            ureq::Error::Status(code, _) if (200..300).contains(&code) => Ok(()),
+            other => Err(format!("turn: opening channel {channel} failed: {other}")),
         })
-        .with_context(|| {
-            format!("turn: {member} is in no channel — a turn needs a conversation to write into")
+        .map_err(anyhow::Error::msg)?;
+    ureq::post(&format!("{store_url}/channels/{channel}/members"))
+        .send_json(json!({
+            "member_id": member,
+            "display_name": member,
+            "role": 0,
+            "since_ms": now_ms(),
+        }))
+        .map(|_| ())
+        .or_else(|e| match e {
+            ureq::Error::Status(code, _) if (200..300).contains(&code) => Ok(()),
+            other => Err(format!("turn: joining channel {channel} failed: {other}")),
         })
+        .map_err(anyhow::Error::msg)?;
+    Ok(channel)
 }
 
+/// One POST to k10r, with the door's answer as the tool result and its refusal
+/// as the error text (a 4xx is the caller's mistake to read, not a turn
+/// failure).
 fn post_json(url: &str, body: &Value) -> Result<Value, String> {
     match ureq::post(url).send_json(body.clone()) {
         Ok(resp) => resp
