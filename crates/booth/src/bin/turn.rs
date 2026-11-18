@@ -547,15 +547,28 @@ fn request_forms(awaiting: &Value) -> Vec<Value> {
         .collect()
 }
 
+/// WHO A FRAME IS FOR. The venue names ONE address per emit: a `user` reaches every device that
+/// account is live on (the fan-out is the venue's — a booth cannot enumerate devices, ADR-0018
+/// §3), a `device` reaches one connection. A person has one conversation, not one per machine,
+/// so the conversation's frames name the account; the connection is the fallback for a page that
+/// has not signed in and therefore has no account to address.
+struct To<'a> {
+    user: Option<&'a str>,
+    device: Option<&'a str>,
+}
+
+fn to<'a>(user: Option<&'a str>, device: Option<&'a str>) -> To<'a> {
+    To { user, device }
+}
+
 /// One venue emit. `name` is the recipient event — a compiled view body is not told which
 /// event fired (the concrete name is consumed by the dispatcher), so the emitter states
-/// it; `device` is the recipient (one device: an application that has groups would name
-/// more, but this one has no channel to be a member of); the payload hangs off `data`,
-/// which is the shape the venue reads as "a delivery, not a request".
+/// it; `to` is the address (see `To`); the payload hangs off `data`, which is the shape the
+/// venue reads as "a delivery, not a request".
 fn emit(
     ctx: &mut Ctx,
     event: &str,
-    device: Option<&str>,
+    to: To<'_>,
     turn: Option<&str>,
     data: Value,
 ) -> anyhow::Result<()> {
@@ -568,7 +581,12 @@ fn emit(
         // down (`host.call`, induction ADR-0002).
         envelope["turn"] = json!(turn);
     }
-    if let Some(device) = device {
+    if let Some(user) = to.user {
+        // ONE ADDRESS, and the account is the stronger one: the venue already knows which
+        // connections are live for it, and a signed-in person's second machine is part of the
+        // same conversation rather than a stranger to it.
+        envelope["user"] = json!(user);
+    } else if let Some(device) = to.device {
         // NO `sender` on a booth's own speech: the venue excludes the sender from its
         // fan-out, so marking the asking device as the sender would send the answer to
         // everyone EXCEPT the one connection that wants it.
@@ -750,7 +768,7 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
                 if turned.cancelled {
                     data["reason"] = json!("cancelled");
                 }
-                emit(ctx, DONE_EVENT, device.as_deref(), id.as_deref(), data)?;
+                emit(ctx, DONE_EVENT, to(user.as_deref(), device.as_deref()), id.as_deref(), data)?;
             }
             Ok(json!({ "done": true, "value": { "reply": turned.reply } }))
         }
@@ -762,7 +780,7 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
                 if let Some(id) = &id {
                     data["turn"] = json!(id);
                 }
-                let _ = emit(ctx, ERROR_EVENT, device.as_deref(), id.as_deref(), data);
+                let _ = emit(ctx, ERROR_EVENT, to(user.as_deref(), device.as_deref()), id.as_deref(), data);
             }
             Err(error)
         }
@@ -1006,7 +1024,7 @@ fn turn(
     emit(
         ctx,
         OPENED_EVENT,
-        device,
+        to(user.as_deref(), device),
         Some(&turn.id),
         json!({ "turn": turn.id }),
     )?;
@@ -1017,7 +1035,7 @@ fn turn(
         let ask = text_field(turn.args, "user_message");
         let frames = frames_open(&turn.id, ask.as_deref());
         if !frames.is_empty() {
-            emit(ctx, UI_EVENT, device, Some(&turn.id), json!(frames))?;
+            emit(ctx, UI_EVENT, to(user.as_deref(), device), Some(&turn.id), json!(frames))?;
         }
     }
     // The rows of the calls that SUCCEEDED, in order: the keep set's middle.
@@ -1158,7 +1176,7 @@ fn turn(
                 emit(
                     ctx,
                     RUN_PAGE_EVENT,
-                    device.as_deref(),
+                    to(user.as_deref(), device.as_deref()),
                     Some(&turn.id),
                     json!(page),
                 )?;
@@ -1169,7 +1187,7 @@ fn turn(
                     emit(
                         ctx,
                         RUN_PAGE_EVENT,
-                        device.as_deref(),
+                        to(user.as_deref(), device.as_deref()),
                         Some(&turn.id),
                         json!(forms),
                     )?;
@@ -1213,7 +1231,7 @@ fn turn(
         .to_string();
 
     // 5. The answer, one emit per chunk, with a live side branch advanced between pulls.
-    let streamed = stream_answer(ctx, &out, device, &pump, delta, &turn, &mut tails);
+    let streamed = stream_answer(ctx, &out, device, user.as_deref(), &pump, delta, &turn, &mut tails);
     // The bit is this ACTIVATION's and it is spent either way — finished, stopped, or failed.
     // Clearing here is what keeps a stop from ending the next turn of the same instance.
     ctx.stop_clear()?;
@@ -1270,7 +1288,7 @@ fn turn(
         emit(
             ctx,
             UI_EVENT,
-            device,
+            to(user.as_deref(), device),
             Some(&turn.id),
             json!([{ "action": "set", "slot": SCENE_SLOT, "data": { "nodes": nodes, "links": links } }]),
         )?;
@@ -1369,6 +1387,7 @@ fn stream_answer(
     ctx: &mut Ctx,
     out: &Out<'_>,
     device: Option<&str>,
+    user: Option<&str>,
     pump: &Pump,
     mut delta: String,
     turn: &Turn<'_>,
@@ -1382,13 +1401,13 @@ fn stream_answer(
                 emit(
                     ctx,
                     UI_EVENT,
-                    device,
+                    to(user.as_deref(), device),
                     Some(&turn.id),
                     json!(frames_chunk(&turn.id, first, &delta)),
                 )?;
             }
             Out::Data(event) => {
-                emit(ctx, event, device, Some(&turn.id), json!({ "delta": delta }))?
+                emit(ctx, event, to(user.as_deref(), device), Some(&turn.id), json!({ "delta": delta }))?
             }
         }
         first = false;
@@ -1486,13 +1505,14 @@ const LAYOUT_EVENT: &str = "ui:layout";
 /// `gravity-model`, which the venue turns into `ui:gravity-model` with this device as the sender.
 fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
+    let user = sender_user(envelope);
     // THE ANSWER IS THE ACTION LIST ITSELF, never a `{frames: [...]}` wrapper: prism forwards an
     // array as the renderer's message and would INJECT anything else into a slot named by the
     // event — a page that gets a map draws nothing and reports nothing (ADR-0017 §8).
     // The management page ships WITH its forms: the layout is rebuilt on every save anyway
     // (`screen`), so there is no separate "load the forms" step to trigger.
     let forms = frames_model(ctx).unwrap_or_default();
-    emit(ctx, LAYOUT_EVENT, device.as_deref(), None, json!(frame_root(forms)))?;
+    emit(ctx, LAYOUT_EVENT, to(user.as_deref(), device.as_deref()), None, json!(frame_root(forms)))?;
     Ok(json!({ "done": true }))
 }
 
@@ -1825,13 +1845,14 @@ fn say_notice(rows: &mut Vec<Value>, message: &str) -> anyhow::Result<()> {
 /// can use to configure anything).
 fn screen(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
+    let user = sender_user(envelope);
     // THE ANSWER IS THE LAYOUT ITSELF, rebuilt. A screen that appended its rows into a list would
     // stack a second set of forms every time it was asked (the list is keyed by row id, and these
     // rows have none) — so the screen REPLACES the root, exactly as the shell did, and asking twice
     // leaves one screen. The caller names no slot: a click cannot carry one, and this booth owns
     // what a screen looks like anyway.
     let forms = frames_model(ctx)?;
-    emit(ctx, SCREEN_EVENT, device.as_deref(), None, json!(frame_root(forms)))?;
+    emit(ctx, SCREEN_EVENT, to(user.as_deref(), device.as_deref()), None, json!(frame_root(forms)))?;
     Ok(json!({ "done": true }))
 }
 
@@ -1972,7 +1993,7 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let args = payload(envelope);
     let settings = read_settings(ctx)?;
     let store_url = settings.store_url.trim_end_matches('/').to_string();
-    let member = match user {
+    let member = match user.as_deref() {
         Some(user) => user.to_string(),
         None => args
             .get("member_id")
@@ -2042,19 +2063,19 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
             .unwrap_or_default(),
     );
     if !page.is_empty() {
-        emit(ctx, RUN_PAGE_EVENT, device.as_deref(), None, json!(page))?;
+        emit(ctx, RUN_PAGE_EVENT, to(user.as_deref(), device.as_deref()), None, json!(page))?;
     }
     let awaiting = awaiting_of(&value, &json!({}));
     if let Some(awaiting) = awaiting {
         let forms = request_forms(&awaiting);
         if !forms.is_empty() {
-            emit(ctx, RUN_PAGE_EVENT, device.as_deref(), None, json!(forms))?;
+            emit(ctx, RUN_PAGE_EVENT, to(user.as_deref(), device.as_deref()), None, json!(forms))?;
         }
     } else if value.get("written").and_then(Value::as_bool).unwrap_or(false) {
         emit(
             ctx,
             RUN_DONE_EVENT,
-            device.as_deref(),
+            to(user.as_deref(), device.as_deref()),
             None,
             json!({
                 "run_id": run_id,
@@ -2083,10 +2104,11 @@ fn parse_address(address: &str) -> anyhow::Result<(u64, String, u32, u32)> {
 
 fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
+    let user = sender_user(envelope);
     let args = payload(envelope);
     match write_row(ctx, args) {
         Ok(saved) => {
-            emit(ctx, SAVED_EVENT, device.as_deref(), None, saved)?;
+            emit(ctx, SAVED_EVENT, to(user.as_deref(), device.as_deref()), None, saved)?;
             Ok(json!({ "done": true }))
         }
         Err(error) => {
@@ -2094,7 +2116,7 @@ fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
             let _ = emit(
                 ctx,
                 SAVE_REFUSED_EVENT,
-                device.as_deref(),
+                to(user.as_deref(), device.as_deref()),
                 None,
                 json!({ "detail": detail }),
             );
@@ -2104,7 +2126,7 @@ fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
             // decides how long it stays on screen.
             let mut rows = Vec::new();
             let _ = say_notice(&mut rows, &detail)
-                .and_then(|()| emit(ctx, NOTICE_EVENT, device.as_deref(), None, json!(rows)));
+                .and_then(|()| emit(ctx, NOTICE_EVENT, to(user.as_deref(), device.as_deref()), None, json!(rows)));
             Err(error)
         }
     }

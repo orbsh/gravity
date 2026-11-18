@@ -1439,9 +1439,11 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
     }
     let done = done.expect("the turn said it was done");
 
-    // Every emit carries the DEVICE that asked, and names the event its payload is for.
-    // No channel, and no `sender`: the venue excludes a sender from its own event's
-    // fan-out, so naming the asker there would send the answer to everyone but the asker.
+    // Every emit carries the ACCOUNT that asked — one conversation, every device of theirs
+    // (the venue performs the fan-out; a booth cannot enumerate devices, ADR-0018 §3) — and
+    // names the event its payload is for. No channel, and no `sender`: the venue excludes a
+    // sender from its own event's fan-out, so naming the asker there would send the answer to
+    // everyone but the asker.
     //
     // The collector subscribes to the prefix, so it also sees the page's own request
     // (`ui:turn.submit`) — that one is the input, not the booth's speech, and the venue
@@ -1454,9 +1456,13 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
     assert!(emits.len() >= 3, "frames + done: {emits:?}");
     for event in emits {
         assert_eq!(
-            event.get("device").and_then(Value::as_str),
-            Some(device),
-            "an emit is delivered to the device that asked: {event}"
+            event.get("user").and_then(Value::as_str),
+            Some(TEST_MEMBER),
+            "an emit reaches the account that asked: {event}"
+        );
+        assert!(
+            event.get("device").is_none(),
+            "one address per emit — the account, not the connection: {event}"
         );
         assert!(
             event.get("sender").is_none(),
