@@ -565,6 +565,13 @@ fn to<'a>(user: Option<&'a str>, device: Option<&'a str>) -> To<'a> {
 /// event fired (the concrete name is consumed by the dispatcher), so the emitter states
 /// it; `to` is the address (see `To`); the payload hangs off `data`, which is the shape the
 /// venue reads as "a delivery, not a request".
+/// The page's name for this booth's region — a DEPLOYMENT fact, not a code fact: the frame that
+/// declares the region and this process must agree, so the name comes from the environment the
+/// deployment sets for both. The default is the reference frame's (`prism/assets/shell.json`).
+fn island() -> String {
+    std::env::var("GRAVITY_ISLAND").unwrap_or_else(|_| "gravity-model".to_string())
+}
+
 fn emit(
     ctx: &mut Ctx,
     event: &str,
@@ -572,7 +579,12 @@ fn emit(
     turn: Option<&str>,
     data: Value,
 ) -> anyhow::Result<()> {
-    let mut envelope = json!({ "name": event });
+    // WHICH REGION THIS SURFACE BELONGS TO (prism ADR-0019). The venue namespaces the slots of an
+    // island's frames, and this is the one fact it cannot derive: the event's name says what
+    // happened (`ui:layout`, `ui:turn.done`), never which part of the page it is about. A booth
+    // that says it cannot write into another island by accident; a booth that does not is left
+    // alone (its slots keep their bare names, which is correct for a venue-owned surface).
+    let mut envelope = json!({ "name": event, "island": island() });
     if let Some(turn) = turn {
         // WHICH turn this chunk belongs to. A device may have several in flight — the type
         // declares `unbounded` (aura ADR-0046) — and every chunk of every turn arrives at the
