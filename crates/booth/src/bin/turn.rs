@@ -1558,81 +1558,71 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// filling a form, and a pager that unmounted the home page would leave those frames naming a
 /// slot the layout no longer has.
 fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
-    // Hosted, the page switch is the HOST's: prism's shell already owns a pager over
-    // `pages`, and this booth's rows land inside it. Emitting our own pager here made the
-    // tree contain itself — the host's pager row holds this booth's tree, which held a
-    // pager over the same slot — and rendering it recursed until the wasm stack died
-    // (`RangeError: Maximum call stack size exceeded`, reported far away, inside the
-    // navbar, because that is where the stack ran out, not where the loop was).
-    // Standalone this booth is its own page, so it does need one.
-    let mut children = vec![frame_navbar()];
-    if !hosted {
-        children.push(frame_pager());
+    // THE CONVERSATION PAGE: the split the example uses (examples/yaml/00.main.yaml) — a
+    // horizontal case with `stage-split`, a `stage-graph` column on the left and a `stage-stream`
+    // column on the right. The widths are the bundle's own CSS — graph `1 1 40%`, stream
+    // `1 0 620px`, and under 1000px the graph pins to 240px — which is what makes the GRAPH absorb
+    // the compression while the stream keeps its width.
+    let conversation = json!({
+        "type": "frame",
+        "attrs": {"class": ["maximize", "stage-split", "shrink"], "horizontal": true},
+        "children": [frame_scene(), frame_stream()],
+    });
+
+    // HOSTED: the region's content and nothing else. The shell — navbar, page switch, tabs — is
+    // the host's, and everything below is what happens when a booth brings its own anyway:
+    //
+    //   - a second navbar renders on top of the host's (measured: "this deployment" twice in the
+    //     DOM);
+    //   - our `home`/`manage` rows land in the HOST's `pages` slot, next to the rows it writes for
+    //     its regions;
+    //   - and our own `pages` node bound that same slot, while the host's rows hold our whole tree
+    //     — so the tree contained itself and rendering recursed until the wasm stack died
+    //     (`RangeError: Maximum call stack size exceeded`, reported far away in the navbar,
+    //     because that is where the stack ran out, not where the loop was).
+    //
+    // The settings forms have no home here: a host declares the regions a booth draws into, and
+    // management is a standalone-only surface — this booth's own page, reached by its own pager.
+    if hosted {
+        let root = json!({
+            "type": "frame",
+            "attrs": {"class": ["maximize", "col"]},
+            "children": [conversation, frame_notice()],
+        });
+        return vec![json!({ "action": "set", "slot": "", "data": root })];
     }
-    children.push(frame_auth());
-    children.push(frame_notice());
+
+    // STANDALONE: it IS a page, so it brings its own shell, its own pager and its own bar.
     let root = json!({
         "type": "frame",
         "attrs": {"class": ["maximize", "col"]},
-        "children": children,
+        "children": [frame_navbar(), frame_pager(), frame_auth(), frame_notice()],
     });
-    // The same tree either way; only its ADDRESS changes. Hosted, this booth addresses the region
-    // by the EMPTY slot — "my surface" — and the venue names it (`island:<the page's name for this
-    // booth>`, prism ADR-0019). The booth does not know that name and does not spell it: the prefix
-    // is put on by the only party that knows the frame, which is also what keeps one application
-    // from writing into another's region by accident.
-    let head = if hosted {
-        json!({ "action": "set", "slot": "", "data": root })
-    } else {
-        json!({ "action": "create", "slot": "", "data": root })
-    };
     vec![
-        head,
-        // The pages, as a dictionary: a row's `id` IS its key, and the bar selects by it.
-        json!({
-            "action": "append",
-            "slot": PAGES_SLOT,
-            "data": {
-                "id": "home",
-                "type": "frame",
-                // THE SPLIT THE EXAMPLE USES (examples/yaml/00.main.yaml): a horizontal case with
-                // `stage-split`, a `stage-graph` column on the left and a `stage-stream` column on
-                // the right. The widths are the bundle's own CSS — graph `1 1 40%`, stream
-                // `1 0 620px`, and under 1000px the graph pins to 240px — which is what makes the
-                // GRAPH absorb the compression while the stream keeps its width.
-                "attrs": {"class": ["maximize", "stage-split", "shrink"], "horizontal": true},
-                "children": [frame_scene(), frame_stream()],
-            },
-        }),
-        json!({
-            "action": "append",
-            "slot": PAGES_SLOT,
-            "data": {
-                "id": "manage",
-                "type": "frame",
-                "attrs": {"class": ["main", "col", "gap", "scrolly"]},
-                "children": forms,
-            },
-        }),
+        json!({ "action": "create", "slot": "", "data": root }),
+        json!({ "action": "append", "slot": PAGES_SLOT, "data": {
+            "id": "home",
+            "type": "frame",
+            "attrs": {"class": ["maximize", "stage-split", "shrink"], "horizontal": true},
+            "children": [frame_scene(), frame_stream()],
+        }}),
+        json!({ "action": "append", "slot": PAGES_SLOT, "data": {
+            "id": "manage",
+            "type": "frame",
+            "attrs": {"class": ["main", "col", "gap", "scrolly"]},
+            "children": forms,
+        }}),
         // The bar's items: a short label per page, same ids.
-        json!({
-            "action": "append",
-            "slot": TABS_SLOT,
-            "data": {
-                "id": "home",
-                "type": "text",
-                "bind": {"value": {"kind": "default", "default": "对话"}},
-            },
-        }),
-        json!({
-            "action": "append",
-            "slot": TABS_SLOT,
-            "data": {
-                "id": "manage",
-                "type": "text",
-                "bind": {"value": {"kind": "default", "default": "管理"}},
-            },
-        }),
+        json!({ "action": "append", "slot": TABS_SLOT, "data": {
+            "id": "home",
+            "type": "text",
+            "bind": {"value": {"kind": "default", "default": "对话"}},
+        }}),
+        json!({ "action": "append", "slot": TABS_SLOT, "data": {
+            "id": "manage",
+            "type": "text",
+            "bind": {"value": {"kind": "default", "default": "管理"}},
+        }}),
     ]
 }
 
