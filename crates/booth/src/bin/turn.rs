@@ -1558,10 +1558,23 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// filling a form, and a pager that unmounted the home page would leave those frames naming a
 /// slot the layout no longer has.
 fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
+    // Hosted, the page switch is the HOST's: prism's shell already owns a pager over
+    // `pages`, and this booth's rows land inside it. Emitting our own pager here made the
+    // tree contain itself — the host's pager row holds this booth's tree, which held a
+    // pager over the same slot — and rendering it recursed until the wasm stack died
+    // (`RangeError: Maximum call stack size exceeded`, reported far away, inside the
+    // navbar, because that is where the stack ran out, not where the loop was).
+    // Standalone this booth is its own page, so it does need one.
+    let mut children = vec![frame_navbar()];
+    if !hosted {
+        children.push(frame_pager());
+    }
+    children.push(frame_auth());
+    children.push(frame_notice());
     let root = json!({
         "type": "frame",
         "attrs": {"class": ["maximize", "col"]},
-        "children": [frame_navbar(), frame_pager(), frame_auth(), frame_notice()],
+        "children": children,
     });
     // The same tree either way; only its ADDRESS changes. Hosted, this booth addresses the region
     // by the EMPTY slot — "my surface" — and the venue names it (`island:<the page's name for this
