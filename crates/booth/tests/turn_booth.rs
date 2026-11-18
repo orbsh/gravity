@@ -2366,3 +2366,49 @@ async fn a_fast_only_turn_keeps_its_raw_results() {
         "a fast-only turn is never flushed: {after:#?}"
     );
 }
+
+/// HOSTED, the shell is ONE REGION of the venue's frame (prism ADR-0019): the same tree, a different
+/// address. A `create` here would replace the root and erase the navigation and every other island
+/// in the page, so the address is the whole difference — and this is where it is locked.
+#[tokio::test]
+async fn a_hosted_shell_sets_its_region_instead_of_replacing_the_page() {
+    let endpoint = sse_server(vec!["hi"]).await;
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &endpoint).await;
+    let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
+
+    Realm::emit(
+        &engine.realm,
+        None,
+        "ui:connect",
+        json!({
+            "name": "ui:connect",
+            "device": device,
+            // The venue says a frame exists. The booth does not check the page (it has no page) and
+            // does not guess: the flag is the one fact it needs.
+            "shell": true,
+            "sender": { "device": device, "user": TEST_MEMBER },
+            "data": { "device": device, "islands": ["gravity_turn"] },
+        }),
+    )
+    .await
+    .unwrap();
+
+    let mut layout = None;
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        layout = seen.all("ui:layout").into_iter().next();
+        if layout.is_some() {
+            break;
+        }
+    }
+    let root = layout.expect("the shell answered the connection");
+    let frames = root["data"].as_array().expect("the answer is an action list");
+    let head = &frames[0];
+    assert_eq!(head["action"], "set", "hosted: a region, not the root — {head}");
+    assert_eq!(
+        head["slot"], "island:gravity_turn",
+        "the slot name IS the address (the booth's own type, no table to keep in step): {head}"
+    );
+    assert_eq!(head["data"]["type"], "case", "the tree travels unchanged");
+}

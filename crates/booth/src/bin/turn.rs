@@ -1503,6 +1503,16 @@ const LAYOUT_EVENT: &str = "ui:layout";
 /// §8 — the layout is data on the wire). fluxen renders a bare button as nothing (a button IS a
 /// form's submit), so the control is a form with no fields: clicking it submits `{}` to
 /// `gravity-model`, which the venue turns into `ui:gravity-model` with this device as the sender.
+/// Whether the venue drew a frame around this page (prism ADR-0019). The field rides every delivery
+/// the venue makes — top level, so one question has one place — and an OLD venue that does not say
+/// it gets the old behaviour: this booth draws the whole page.
+fn hosted(envelope: &Value) -> bool {
+    envelope
+        .get("shell")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
     let user = sender_user(envelope);
@@ -1512,7 +1522,18 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // The management page ships WITH its forms: the layout is rebuilt on every save anyway
     // (`screen`), so there is no separate "load the forms" step to trigger.
     let forms = frames_model(ctx).unwrap_or_default();
-    emit(ctx, LAYOUT_EVENT, to(user.as_deref(), device.as_deref()), None, json!(frame_root(forms)))?;
+    // TWO ARRANGEMENTS (prism ADR-0019). HOSTED: the venue already drew the frame from a file, and
+    // this booth owns ONE region inside it — a `create` here would replace the root, erasing the
+    // navigation and every other island along with it. STANDALONE: nothing was drawn, so this booth
+    // is the page. The venue says which; the booth never guesses, because guessing wrong is silent.
+    let hosted = hosted(envelope);
+    emit(
+        ctx,
+        LAYOUT_EVENT,
+        to(user.as_deref(), device.as_deref()),
+        None,
+        json!(frame_root(forms, hosted)),
+    )?;
     Ok(json!({ "done": true }))
 }
 
@@ -1524,17 +1545,22 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// every page MOUNTED (`display: dom`): a turn streams into `messages` while a person may be
 /// filling a form, and a pager that unmounted the home page would leave those frames naming a
 /// slot the layout no longer has.
-fn frame_root(forms: Vec<Value>) -> Vec<Value> {
+fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
+    let root = json!({
+        "type": "case",
+        "attrs": {"class": ["maximize", "col"]},
+        "children": [frame_navbar(), frame_pager(), frame_auth(), frame_notice()],
+    });
+    // The same tree either way; only its ADDRESS changes. Hosted, it is one region of the venue's
+    // frame (`island:<this booth's type>` — the slot name is the address, prism ADR-0019); alone, it
+    // is the root of the page.
+    let head = if hosted {
+        json!({ "action": "set", "slot": format!("{}{}", "island:", gravity_booth::TURN_TYPE), "data": root })
+    } else {
+        json!({ "action": "create", "slot": "", "data": root })
+    };
     vec![
-        json!({
-            "action": "create",
-            "slot": "",
-            "data": {
-                "type": "case",
-                "attrs": {"class": ["maximize", "col"]},
-                "children": [frame_navbar(), frame_pager(), frame_auth(), frame_notice()],
-            },
-        }),
+        head,
         // The pages, as a dictionary: a row's `id` IS its key, and the bar selects by it.
         json!({
             "action": "append",
@@ -1852,7 +1878,15 @@ fn screen(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // leaves one screen. The caller names no slot: a click cannot carry one, and this booth owns
     // what a screen looks like anyway.
     let forms = frames_model(ctx)?;
-    emit(ctx, SCREEN_EVENT, to(user.as_deref(), device.as_deref()), None, json!(frame_root(forms)))?;
+    // The screen is the same tree as the shell, so it lands the same way: a region inside the
+    // venue's frame, or the root of the page when there is no frame.
+    emit(
+        ctx,
+        SCREEN_EVENT,
+        to(user.as_deref(), device.as_deref()),
+        None,
+        json!(frame_root(forms, hosted(envelope))),
+    )?;
     Ok(json!({ "done": true }))
 }
 
