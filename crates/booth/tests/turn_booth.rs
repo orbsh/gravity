@@ -2407,8 +2407,9 @@ async fn a_hosted_shell_sets_its_region_instead_of_replacing_the_page() {
     let head = &frames[0];
     assert_eq!(head["action"], "set", "hosted: a region, not the root — {head}");
     assert_eq!(
-        head["slot"], "island:gravity_turn",
-        "the slot name IS the address (the booth's own type, no table to keep in step): {head}"
+        head["slot"], "",
+        "the booth addresses \"my surface\" and the VENUE names it (prism ADR-0019): an application \
+         that spelled the prefix itself would be spelling a name it was never told: {head}"
     );
     assert_eq!(head["data"]["type"], "case", "the tree travels unchanged");
 }

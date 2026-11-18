@@ -1551,11 +1551,13 @@ fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
         "attrs": {"class": ["maximize", "col"]},
         "children": [frame_navbar(), frame_pager(), frame_auth(), frame_notice()],
     });
-    // The same tree either way; only its ADDRESS changes. Hosted, it is one region of the venue's
-    // frame (`island:<this booth's type>` — the slot name is the address, prism ADR-0019); alone, it
-    // is the root of the page.
+    // The same tree either way; only its ADDRESS changes. Hosted, this booth addresses the region
+    // by the EMPTY slot — "my surface" — and the venue names it (`island:<the page's name for this
+    // booth>`, prism ADR-0019). The booth does not know that name and does not spell it: the prefix
+    // is put on by the only party that knows the frame, which is also what keeps one application
+    // from writing into another's region by accident.
     let head = if hosted {
-        json!({ "action": "set", "slot": format!("{}{}", "island:", gravity_booth::TURN_TYPE), "data": root })
+        json!({ "action": "set", "slot": "", "data": root })
     } else {
         json!({ "action": "create", "slot": "", "data": root })
     };
