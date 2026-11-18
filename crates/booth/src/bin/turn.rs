@@ -620,7 +620,7 @@ fn frame_message(id: &str, selector: &str, text: &str) -> Value {
         "slot": MESSAGES_SLOT,
         "data": {
             "id": id,
-            "type": "case",
+            "type": "frame",
             "attrs": { "selector": selector },
             "children": [{
                 "type": "text",
@@ -1559,7 +1559,7 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// slot the layout no longer has.
 fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
     let root = json!({
-        "type": "case",
+        "type": "frame",
         "attrs": {"class": ["maximize", "col"]},
         "children": [frame_navbar(), frame_pager(), frame_auth(), frame_notice()],
     });
@@ -1581,7 +1581,7 @@ fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
             "slot": PAGES_SLOT,
             "data": {
                 "id": "home",
-                "type": "case",
+                "type": "frame",
                 // THE SPLIT THE EXAMPLE USES (examples/yaml/00.main.yaml): a horizontal case with
                 // `stage-split`, a `stage-graph` column on the left and a `stage-stream` column on
                 // the right. The widths are the bundle's own CSS — graph `1 1 40%`, stream
@@ -1596,7 +1596,7 @@ fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
             "slot": PAGES_SLOT,
             "data": {
                 "id": "manage",
-                "type": "case",
+                "type": "frame",
                 "attrs": {"class": ["main", "col", "gap", "scrolly"]},
                 "children": forms,
             },
@@ -1627,7 +1627,7 @@ fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
 /// the pager reads the same local slot — so switching pages costs no round trip.
 fn frame_navbar() -> Value {
     json!({
-        "type": "case",
+        "type": "frame",
         "attrs": {"class": ["--head", "nogrow", "horizontal", "center", "box", "gap"]},
         "children": [
             {
@@ -1685,7 +1685,7 @@ fn frame_pager() -> Value {
 /// channel list would take in a conventional application.
 fn frame_scene() -> Value {
     json!({
-        "type": "case",
+        "type": "frame",
         "attrs": {"class": ["stage-graph", "col", "gap"], "horizontal": false},
         "children": [
             {
@@ -1721,7 +1721,7 @@ fn frame_menu() -> Value {
         },
         "bind": {"value": {"kind": "source", "source": MENU_SLOT}},
         "item": [{
-            "type": "case",
+            "type": "frame",
             "attrs": {"class": ["nogrow", "horizontal", "center", "gap"]},
             "children": [{
                 "type": "text",
@@ -1738,7 +1738,7 @@ fn frame_menu() -> Value {
 /// carries no selector and is the fallback, which is what the reply and anything else lands on.
 fn frame_stream() -> Value {
     json!({
-        "type": "case",
+        "type": "frame",
         "attrs": {"class": ["stage-stream", "main", "shrink", "col"]},
         "children": [frame_messages(), frame_composer()],
     })
@@ -1779,14 +1779,14 @@ fn frame_messages() -> Value {
         "bind": {"value": {"kind": "source", "source": MESSAGES_SLOT}},
         "item": [
             {
-                "type": "case",
+                "type": "frame",
                 "attrs": {
                     "selector": "user",
                     "class": ["nogrow", "as-end", "accent", "box", "border", "round", "shadow"],
                 },
             },
             {
-                "type": "case",
+                "type": "frame",
                 "attrs": {"class": ["nogrow", "as-stretch", "box", "border", "round", "shadow"]},
             },
         ],
@@ -1820,8 +1820,9 @@ const MENU_SLOT: &str = "menu";
 /// region — and knows nothing else about login, which is what keeps the form reusable.
 const AUTH_SLOT: &str = "auth";
 
-/// THE PLATFORM'S REGION, AS AN OVERLAY. A `placeholder` is the node that RENDERS a data slot as a
-/// live node (a plain `case` has no such binding), so the auth booth's `set` lands here and the
+/// THE PLATFORM'S REGION, AS AN OVERLAY. A `frame` bound to a source RENDERS the node tree that
+/// slot holds (that is what "frame" means since fluxen ADR 0027 — the old split between a static
+/// `case` and a slot-rendering `placeholder` is gone), so the auth booth's `set` lands here and the
 /// renderer fades it in. The shell names the slot and nothing else — the form, the fields and the
 /// verb behind them are the platform's.
 fn frame_auth() -> Value {
@@ -1829,7 +1830,7 @@ fn frame_auth() -> Value {
         "type": "float",
         "attrs": {"class": ["auth"]},
         "children": [{
-            "type": "placeholder",
+            "type": "frame",
             "id": "auth-region",
             "attrs": {"class": ["--auth"]},
             "bind": {"value": {"kind": "source", "source": AUTH_SLOT}},
@@ -1869,7 +1870,7 @@ fn say_notice(rows: &mut Vec<Value>, message: &str) -> anyhow::Result<()> {
         "slot": NOTICE_SLOT,
         "data": {
             "id": format!("notice-{at}"),
-            "type": "case",
+            "type": "frame",
             "attrs": {"class": ["box", "border", "round", "shadow", "gap"]},
             "children": [{
                 "type": "text",

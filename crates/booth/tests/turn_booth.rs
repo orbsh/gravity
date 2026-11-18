@@ -2411,5 +2411,5 @@ async fn a_hosted_shell_sets_its_region_instead_of_replacing_the_page() {
         "the booth addresses \"my surface\" and the VENUE names it (prism ADR-0019): an application \
          that spelled the prefix itself would be spelling a name it was never told: {head}"
     );
-    assert_eq!(head["data"]["type"], "case", "the tree travels unchanged");
+    assert_eq!(head["data"]["type"], "frame", "the tree travels unchanged");
 }
