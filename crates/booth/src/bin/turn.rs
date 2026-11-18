@@ -1678,32 +1678,29 @@ fn frame_pager() -> Value {
     })
 }
 
-/// THE LEFT AREA: the scene is a canvas running the deployment's forcegraph module
-/// (`/assets/forcegraph/index.js`, 3d-force-graph). The layout is the module's business now —
-/// fluxen's native `forcegraph` node is gone (ADR 0029): a renderer is a url, and the one that
-/// ships is the 3D one. What the scene draws is data the deployment pushes into `scene` as
-/// `{nodes, links, focus?}`. Below it a menu, in a rack, so the same column that shows the field
-/// of things also lists the ways into them — the shape a channel list would take in a
-/// conventional application.
+/// THE LEFT AREA: the scene is a forcegraph, and what it draws is data the deployment pushes
+/// into `scene` as `{nodes, links, focus?}` (fluxen ADR 0018 — a native node, not a canvas
+/// module: the layout lives in wasm, no URL, no options bag). Below it a menu, in a rack, so
+/// the same column that shows the field of things also lists the ways into them — the shape a
+/// channel list would take in a conventional application.
 fn frame_scene() -> Value {
     json!({
         "type": "frame",
         "attrs": {"class": ["stage-graph", "col", "gap"], "horizontal": false},
         "children": [
             {
-                "type": "canvas",
-                "url": "/assets/forcegraph/index.js",
-                // `100%` of a box that has a height: the frame around it grows (class `main`), so
+                "type": "forcegraph",
+                // `100%` of a box that has a height: the graph's own case grows (class `main`), so
                 // the percentage resolves against a real size — the example's shape, verbatim.
                 "attrs": {"class": ["main"], "width": "100%", "height": "100%"},
-                // The module's own bag (ADR 0017): fluxen does not read a key of it. The native
-                // node's `style` keys were snake_case and two of them (`highlight_reach`,
-                // `link_shape`) had no counterpart in this renderer — they are gone, not renamed.
-                "options": {
-                    "nodeSizePx": 4,
-                    "linkWidthPx": 2.5,
-                    "linkOpacity": 0.85,
-                    "fitPaddingPx": 56,
+                "style": {
+                    "node_size_ratio": 2,
+                    "link_width_px": 2.5,
+                    "link_opacity": 0.85,
+                    "highlight_reach": true,
+                    "reach_hops": 1,
+                    "fit_padding_px": 56,
+                    "link_shape": "straight",
                 },
                 "bind": {"value": {"kind": "source", "source": SCENE_SLOT}},
             },
