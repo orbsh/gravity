@@ -2336,7 +2336,11 @@ fn channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
     ureq::post(&format!("{store_url}/channels/{channel}/members"))
         .send_json(json!({
             "member_id": member,
-            "display_name": member,
+            // THE NAME IS NOT OURS TO COPY. A member row carries a `display_name` that somebody
+            // SETS (the person, or the booth that owns names); the login name lives in the venue's
+            // auth store and never crosses into this one, and echoing the id into the display
+            // column is a copy that reads as a name and is not one. Empty until somebody sets it.
+            "display_name": "",
             "role": 0,
             "since_ms": now_ms(),
         }))
