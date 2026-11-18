@@ -1659,7 +1659,11 @@ async fn the_shell_declares_the_conversation() {
     assert_eq!(areas[0]["attrs"]["class"][0], "stage-graph");
     assert_eq!(areas[1]["attrs"]["class"][0], "stage-stream", "{:?}", areas[1]);
     let left: Vec<Value> = areas[0]["children"].as_array().unwrap().clone();
-    assert_eq!(left[0]["type"], "forcegraph", "the scene is the field: {:?}", left[0]);
+    assert_eq!(left[0]["type"], "canvas", "the scene is a canvas module: {:?}", left[0]);
+    assert_eq!(
+        left[0]["url"], "/assets/forcegraph/index.js",
+        "the 3D renderer is a url, not a node type fluxen compiles in (ADR 0029)"
+    );
     assert_eq!(
         left[0]["bind"]["value"]["source"], "scene",
         "and what it draws is data the deployment pushes, not a picture baked into the layout"
