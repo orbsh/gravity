@@ -1,415 +1,50 @@
 # PLAN
 
-Design lives in the wiki (stateless-agent-architecture.md / krystallizer.md) and in this repo's ADRs (`docs/adr/`: 0001 — the execution surface, 0002 — the CLI form, 0003 — the skill execution shape); this file only sequences phases.
+Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) and in this repo's ADRs (`docs/adr/`: 0001 the execution surface, 0002 the CLI form, 0003 the skill execution shape, 0004 the fixed tool list, 0005–0012 as each landed). This file is the index: what landed when, what is left, and where the reason is written.
 
-RENAMED 2026-11-07: `turn executor` reads `turn booth`, and the test trait `ToolExecutor` reads `ToolDispatch`. The platform's `executor` (one booth instance's live execution unit, on effector/aura) is a different concept and does not appear in this repo.
+## Milestone A — the local turn booth
 
-## Milestone A — Local turn booth
+- [x] 0 — Workspace skeleton, one happy-path turn; the seam's currency is the projection — 2026-10-10 … 2026-10-20 — ADR-0007
+- [x] 1 — The LLM layer: one blocking SSE reader in the turn's own process, no provider booth — 2026-10-13 — `gravity-core llm::sse`, `llm::tool_stream`
+- [x] 2 — The tool-call loop against a fixed tool list; a tool failure is a value, never a turn failure — 2026-10-26 — ADR-0004
+- [x] 2.5 — Transcript/history split: the net effect as rows, one per round, failures stay process — 2026-10-31 — k10r ADR-0024
+  - [ ] the cold CALL's result path — owned by 4.5
+- [x] 2.6 — Progress as data: a task row per step, completed at the call site — 2026-10-31 — ADR-0003, ADR-0011
+- [ ] 3 — Compression as a side branch — ADR-0003
+  - [x] the turn-loop half: the branch opens off k10r's verdict and lands at the checkpoint door — 2026-10-26
+  - [ ] the standalone trigger: no idle/no-turn tick exists anywhere in the tree
+  - [ ] the branch's owner after the turn returns — `drain_tails` holds the turn today; needs one process serving two requests first (induction ADR-0002, steps 1–3)
 
-- [x] Phase 0 — Workspace skeleton: `crates/{core,cli,config}`. One happy-path turn: fetch_session (the projection) → LLM call → append delta. No tools yet; plain chat against Krystallizer.
-  LANDED 2026-10-10: `MemorySurface` seam (in-process `ChannelStore` wrap / mem-server `HttpSurface` — ADR-0007 as revised: HTTP is the single cross-process form, in-process is a local detail); config takes `store_path` or `store_url` (store_url wins); turn contract tests run the same assertions through BOTH surfaces against a real mem-server (failed turn appends nothing, one-ts-two-subs delta, checkpoint pruning flows through the seam). Turn body copy in the seam test stands in for the LLM stub until LlmClient grows an injectable transport (Phase 1).
-  LANDED 2026-10-20 (k10r's read side moved to rendering — the seam's currency is now the PROJECTION, not storage rows): `fetch_session` returns `SessionProjection { head: String, coverage_ts, summary, increment: Vec<(MessageKey, ViewRow{role: Option<String>, kind, content})> }`. ① The head is TEXT rendered by k10r (initialization memory), injected as the FIRST system block verbatim — gravity assembles nothing about the graph. ② The increment entry is flat and carries the role NAME (k10r's mapping; `None` = an unpoliced code, read as `user`) — the old nested `{key, row:{role u8}}` decode is gone from both `HttpSurface` and the booth's turn guest. ③ The representation is a deployment fact: `memory_format` (config / `GRAVITY_MEMORY_FORMAT` in prism's turn args) sends `?format=`, and `struct` is REFUSED at once (`MemoryFormat::from_config`) because it returns fact data for a caller that assembles the graph — which this executor never does. ④ `InProcessSurface` now wraps `mem_core::ServiceStores` (one database, both keyspaces; channel-then-graph lock order) and renders through the same function, so both surfaces answer byte-identical heads — `head_is_rendered_by_both_surfaces` pins it. Repair cost paid here: both locked okm pins (gravity, prism) sat at revs older than mem-core@k10r HEAD requires; both moved to `bd023aa`.
-- [x] Phase 1 — LLM layer: the turn opens its own LLM stream, IN ITS OWN PROCESS (`gravity_core::llm::live`: a blocking reader over the endpoint's SSE body, decoded by `llm::sse`, calls reassembled by `llm::tool_stream`, one envelope per pull, `done: true` closes). There is no provider booth and no sibling to ask: a stream is a value on a thread, so two streams — the answer and a compression branch, or two devices' turns — are two threads. Key custody: the env var is NAMED in the request and the value is read at open, never in a module or an arg. Transport-level retry/backoff lives here. Responsibility cut: model selection, fallback, circuit breaking, transcript-aware retry are gravity-side ("LLM identity stays Gravity-side" — cache binding, untouched). Parallelism is the PROCESS's, not the wire's: induction dispatches each frame with its request id, so one turn process serves several streams at once (the answer's and every branch's). Rounds on ONE instance overlap too: the turn declares `unbounded`, so aura keeps one resident process and lets every call in at once (ADR-0046 — the declaration is the booth's own, `queued` meaning arrive-and-wait; `unbounded` is legal only on a carrier that pairs replies by request id). Measured both ways: two rounds of 1.5 s and 0.8 s took 2.35 s while the realm serialized every call behind one session lock, and 1.5 s once the declaration existed. Prompt-view byte-stability contract test (fetched view prefix must be byte-identical — context-cache correctness depends on it).
-  LANDED 2026-10-13 (mostly with Phase 4.1 — the stream client IS the streaming provider; the phase closes with its residuals): ① the SSE wire decoder has ONE home (`gravity-core llm::sse`, gravity `72886a5`) — the stream client and any streaming consumer share it, the transport stays with the caller (feed/decode protocol, no reqwest-eventsource needed: the caller is a sync process, `ureq`'s blocking reader IS the pull backpressure). AMENDED 2026-10-28, from the first run against a real endpoint: a call does not arrive, its FRAGMENTS do — the first delta carries `id` and the function name with an empty argument string, every later delta appends a slice under the same `index`. The decoder stays a frame decoder, and `gravity-core llm::tool_stream::ToolCallAccumulator` answers the other question ("what has the stream said so far"): it merges by `index`, concatenates `arguments`, takes `id`/`type`/`name` once, and hands back a call an endpoint would have sent in one piece. The provider holds it while the stream keeps talking about calls and emits the envelope when it stops — so `tool_calls` in an envelope is a COMPLETE call, which is the contract the turn already assumed. Every stub streams one whole call, so this was invisible until a real model answered: dispatching the first fragment dispatched an empty argument document, and the turn ended with no reply and no tool effect. ② transport retry (gravity `931c75b`'s follow-up): constant backoff, 3 attempts on transient failures (connect errors, 5xx); a 4xx fails through on the FIRST attempt — retrying a 401 is just delay. Two contract tests lock both. ③ prompt-view byte-stability (`crates/core/tests/prompt_stability.rs`, 3 tests): same state assembles byte-identical views across BOTH surfaces (in-process and HTTP each own their store — one fjall directory = one process, ADR-0007, so the cross-surface assertion compares the same logical conversation, not the same directory); appended history is a byte prefix of the next prompt (append-only, prefix cache hits ride it); checkpoint compression is the ONE deliberate rewrite (documents the boundary). Residual (recorded, not owed): the CLI's `LlmClient::complete` is still non-streaming blocking — Milestone A's bring-up path, Phase 2's tool loop decides whether it collapses into the streaming face.
-- [x] Phase 2 — Tool-call loop: parse LLM tool calls → dispatch to Probe → record tool_call/tool_result into delta → feed back. One mode only; no privileged calls. Delta boundary: only this turn's additions, never a full-session write-back.
-  THE LIST LANDED 2026-10-26 (ADR-0004): the loop now has affordances to parse against — the turn sends a FIXED, hardcoded `tools` array on every inference round (including the loop's re-opens) and dispatches by NAME to the door that name belongs to. Three entries are wired because three doors answer: `recall_memory` (`POST /memories/{scope}/recall`, k10r renders with its own read budget), `commit_memory` (`POST /memories/{scope}`, the 8-slot fact tuples, k10r's ingest adjudicates functional relations and answers landed / rewritten / dropped), and — since the same day — `resolve_skills` (`POST /skills/{scope}/resolve`, k10r ADR-0015 landed the skill node and its door; a skill is a node in the same graph, so the graph's scope addresses it). `invoke_skill` followed the same day, once the walk existed (Phase 4.6, below): a tool the substrate cannot serve teaches the model that failing tools are normal, and the substrate now serves this one. The scope rides the turn args (`memory_scope`, from prism's `GRAVITY_MEMORY_SCOPE`), never a compiled constant — k10r's namespace numbers are k10r's declarations, and a missing scope makes the affected tool name the absent fact instead of reading a namespace nobody declared. Every tool failure is a VALUE the model reads (`{"error": …}`), never a turn failure. The old `tool_target` arg and its ctx.invoke dispatch are gone with the list: mounts are reached by `invoke_skill` when it lands, not by whatever name a model invents. Gates: gravity 38/0 — `a_tool_call_reaches_its_door_and_feeds_back` asserts the list rode BOTH rounds, that the ingest answered an outcome, and that `/graph/37` shows the entity the tuple named (a tool's own text is not evidence that the write landed); four unit tests pin the list's shape, the unlisted-name refusal, and the missing-scope refusal. prism `turn_e2e` 5/5. `scripts/smoke-venue.sh` rides the whole real stack with the stub asking for `resolve_skills` on round 0 (and refusing to serve round 1 unless the declared skill's name came back in the tool message) and `commit_memory` on round 1 — and asserts the fact in `/graph/37` (`alice`/`tea`/`likes`), not the reply alone. That run found the boundary the unit tests could not: the turn was surfacing tool_result items on its pull face, and prism's pump refuses anything that is not `item.delta` ("envelope item carries no delta string") — the turn died mid-flight over its own progress. Tool results now stay in the loop and in the turn's transcript; a UI-facing tool frame would be prism's protocol to add.
-  LANDED 2026-10-13 (first cut — gravity `4a82359`; the Start-face dispatch loop and its e2e land in the same day's follow-up batch): gravity-core gains the `tool` module — the OpenAI tool-call shapes with the wire's JSON-string `arguments` decoded ONCE at the boundary (`parse_tool_calls`), `ToolResultMessage`/`ToolDispatch`, and the standing rule that a tool FAILURE is a value into the next inference, never a turn failure. The SSE decoder carries `tool_calls` through the chunk stream as its own event (`SseEvent::ToolCalls`, arguments verbatim — the caller parses); the provider guest forwards them verbatim inside its envelope (the provider is transport, not policy). The turn guest runs the loop on its START face: a `tool_calls`-first reply (no content) is parsed, dispatched through `ctx.invoke(tool_target, "", name, args)` to a SIBLING booth type, the result is appended to the working message list as the OpenAI feed-back pair (assistant call + `role: "tool"`), and the stream is re-opened with it; the results also ride `TOOL_RESULTS`, which the PULL face surfaces first — the consumer sees the loop's progress before the content deltas. The cap is 8 rounds, and a provider still asking for tools when it runs out fails the turn with a named error (never an empty first token, never a stream that opens and then dies on an empty reply). `tool_target` is a DEPLOYMENT fact read from the turn args (default `effector`) — gravity resolves no locations itself (Phase 4.5's target shape). Gates: workspace 23/0 (`tool_call_dispatches_to_the_sibling_booth` dispatches into effector's `induction_loop` fixture registered as a sibling booth type and pins the loop's exactly-one re-open; `a_provider_that_never_stops_asking_for_tools_fails_the_turn` pins the cap and "a failed turn appends nothing"), clippy 0, fmt clean. Test-recipe note (superseded 2026-10-26): `boot()` sets `GRAVITY_TEST_KEY` itself, so the suite asks the machine for nothing. Before that, six of the seven tests failed on any machine that had not exported the variable by hand — and they failed as an EMPTY stream, because a failed guest answers a STRING value (`{done:true, value:"…"}`) and `drain_turn` read `done` alone; the terminal round is checked now, so the failure names its cause instead of reading as "the model said nothing". Residual (2.5's face): the transcript/history split (what the working message list persists at turn end vs what the next inference replays), the tool list's source (targets come from the tool list, never from gravity code), and `tool_call`/`tool_result` delta accounting.
-- [x] Phase 2.5 — Transcript/history split + cold-call declaration: CLOSED 2026-11-09 for the TRANSCRIPT half, re-measured against the code — `TurnLog::open` before the first inference (`crates/booth/src/bin/turn.rs:682`), the answer row written and closed with question+calls+answer (`:874-878`), `/channels/{c}/turns/{id}/close` (`:2243`, `:2259`), and the cold half's compaction on a human turn (`:749-755`). What stays OPEN is one thing, not the phase: the cold CALL's result path (a value-shaped caller has no shape for `Pending`) — see Phase 4.5's ruling line. The text below is the phase's landing record, unchanged:
-  **LANDED 2026-10-31 — the history half (net effect as rows, written per round).** The
-  working messages (assistant `tool_calls` + `role:"tool"` results, failures, retries)
-  stay in RESIDENT memory for the loop and are never persisted; the store gets the net
-  effect, in the channel log that already exists (no new table, no new ns). The rows are
-  written AS THE TURN RUNS, under a turn id the STORE mints at the turn's open
-  (`POST /channels/{c}/messages` with no `turn_id` — the question's own row opens the turn and the store mints its id): the question lands before the first inference, one row per
-  SUCCESSFUL tool call lands when that round completes, the answer lands last, and the turn
-  closes with ONE `kind = FINAL` record naming the records to keep — the question, the
-  successful calls, the answer — whereupon k10r purges the rest of the turn (k10r
-  ADR-0024). Each row carries its own clock; `sub` is the same-millisecond tiebreak. A tool row is `role=system` + `kind=TOOL_CALL` (k10r's vocabulary, which
-  was declared from the start and had no writer until now) and its content is the
-  self-describing line `[tool] <name> <args> -> <result>`, result truncated at
-  2 000 chars. Why SYSTEM and not `role:"tool"`: a protocol tool message is only
-  legal directly after the assistant's `tool_calls`, so replaying one three turns
-  later is a request providers reject. Why only successes: a correction loop's
-  failures are PROCESS — the model needed them to fix the call, a later turn does
-  not, and a retried-identical call keeps only its last answer. A failed turn
-  writes no closing record: its rows stay OPEN and the projection skips them
-  (k10r ADR-0024), so a failure costs visibility, not correctness. The net-effect
-  row shape above is unchanged by the turn axis; what moved is WHEN it is written — the
-  end of the turn became every round, and the closing record is what publishes them.
-  The writer states codes through
-  `gravity_core::surface::{Role, Kind}` (`#[repr(u8)]`, discriminants spelled as
-  k10r's own constants, `TryFrom<u8>` total) instead of literals — and the labels
-  stay k10r's: the enum carries codes, `role_name` carries names, so there is one
-  mapping, not two. Reading back, a code the store does not recognise now renders
-  as `system`, not `user` (the row happened; its speaker is unnamed; `user` would
-  put words in the user's mouth). Gate: gravity 88/0, prism 64/0.
-  **SECOND HALF LANDED 2026-10-31 — the transcript side of the cold path.**
-  `nature` now has its first reader (`tools::nature_of`, the spec list is the
-  registry): a round that asks for a `human`-nature tool triggers a compaction of
-  the FINISHED rounds before it is dispatched — each one collapses from
-  `assistant.tool_calls` + its `tool` answers into one `system` line per call, the
-  same `[tool] … -> …` renderer the history uses. That is PLAN's "the transcript
-  takes the minimal replay set": a cold call may not answer for minutes, and the
-  model has already read those payloads to decide it. The round ABOUT to run stays
-  raw (its results are what the next inference reasons over), and a `fast`-only
-  turn is never compacted ("zero flushes"). Compaction replaces the whole pairing
-  because an unanswered `tool_calls` message is a malformed request. Gate:
-  gravity 90/0, clippy 0.
-  STILL OPEN in this phase: what a cold call does BESIDES compacting — write a row
-  for the call it dispatched, and re-enter on the result. Neither is blocked on
-  gravity's own code; both are blocked on the CALL SEAM, in two places:
-  - **The carrier has one invoke shape.** induction's `Arm::Invoke` is
-    request/reply (`induction-host/src/ops.rs:121`): the host answers with a
-    `Reply`, and the guest is parked in `read_host_reply` until it arrives. No
-    frame says "register this and answer me an id".
-  - **The realm's value-shaped door refuses a cold slot.** gravity's invoke lands
-    in aura's `dispatch_call`, which can only answer `Done` or `Err` — a cold slot
-    comes back as an error: `Waited::Pending(id) => Err("cold target cannot return
-    a value to a parked caller (call {id}); emit instead")` (aura
-    `crates/realm/src/lib.rs:137`).
-  So a cold tool call cannot return ANYTHING today: the tier exists in aura
-  (`CallSlot::Cold`, `pending_calls` with its `session` field, `resolve_call`),
-  the guest never gets to declare it, and the one door that would carry the answer
-  is a request/reply.
-  NOT a route: `emit` is gravity's OUTPUT face (`ui:*` frames to the front end or
-  the CLI) and `iterate` is the LLM token stream plus the compression branch.
-  Neither carries a tool call and neither returns a result to the loop; aura's
-  "emit instead" addresses realm-internal work handed to a queue-shaped target,
-  not a caller that needs its result back to finish the round. The tier is NOT the
-  frame's business — it is a declaration on the target inside the realm
-  (`CallSpec`), and a guest neither states it nor needs to; what Phase 4.5 owes is
-  an ANSWER shape for a value-shaped caller (a pending handle as a value, or no
-  value-shaped question for work that finishes later). A dispatched cold call DOES write rows while its turn is undecided: every round
-  lands as it runs, the turn carries an id the STORE mints at its open, and an
-  open turn is working state the projection skips. The turn closes with ONE
-  `kind = FINAL` record naming the subs to keep and k10r collapses the rest
-  (k10r ADR-0024). BOTH HALVES OF THAT CODE EXIST NOW: k10r's key carries the turn (ADR-0024
-  landed in mem-core and the HTTP surface), and gravity writes per round and submits the
-  closing record (`TurnLog` in the turn binary: open before the first inference, one row
-  per successful call, answer, close with the keep set). A turn that fails writes no
-  closing record at all — its rows stay OPEN and the projection skips them, which is why a
-  failure costs visibility and not correctness.
-  RECORDED, NOT ADOPTED (2026-10-31, user's call): "recall happens when the
-  question arrives" — the turn would send the question to k10r, k10r would search
-  its own memory and append whatever looks useful as NOTES behind the question
-  before gravity submits it to the LLM. Deliberately deferred ("先记下来，等进
-  一步完善了再用"), and it does NOT replace the tool: `recall_memory` stays in the
-  list permanently — it is the model's own second, sharper search, and an agent
-  that cannot search again is a one-shot reader. When the mechanism lands, the
-  notes are EPHEMERAL: the stored user row keeps the question, never the notes
-  (derived context is not memory, and a summarizer that reads them would record
-  them as things the user said). the in-turn tool loop keeps a working transcript in resident memory (calls, errors, retries — what the next LLM inference needs); session history receives the net effect, row by row AS THE TURN RUNS (intermediate failures are process, not memory; a turn is collapsed to its net effect by the store when it closes, so an unfinished turn is working state the projection skips). Every tool declares its execution nature at registration (fast/idempotent vs human-touch/external — declared per tool, static, rides `tool_invoke_count`'s registration info); declared-cold tools trigger the cold path at call time (transcript persist + prune before flush: history takes final state, transcript takes the minimal replay set), everything else stays hot with zero flushes. Gravity never branches on local vs remote — execution location lives in target resolution (user namespace + node alias + capability from the tool list), invoke targets come from the tool list, not from Gravity code.
-- [x] Phase 2.6 — Progress as data (ADR-0003): a multi-step task's progress is ROWS, not prose the model advances — one task row per step, bound (edge) to the call that completes it, so completion is written at the call site. Truth lives in k10r as structured application state (an enumeration question the approximate memory face cannot answer); gravity pulls the session's open todos WITH the turn-start projection it already fetches, so every pre-dispatch check inside a turn is a memory read — zero per-call round trips, no LLM on the gate's path. Branch/step logic is a GLUE SCRIPT (code composes; the flow-engine form is rejected), and glue can only ride a mount whose carrier is `induction` (Phase 4.6's manifest states which mounts those are). **THE COMPOSITION SENTENCE IS SUPERSEDED 2026-11-16 BY ADR-0011**: composition is a graph of steps with control edges, a step's code is a leaf that receives no ctx, so no `induction`-carrier constraint exists and `invoke_skill` starts a run instead of walking one step per call. What still stands here is progress-as-data (§3 of that ADR) and "execution history writes counters, never topology". Execution history writes counters, never topology: re-parenting is a definition change, promoted by an audited act and never self-applied (Phase 5's weight write-back is the counter's home).
-  **LANDED 2026-10-31 — both open halves (ADR-0003's Update).** The binding is
-  `task --finishes_on--> code`, an ordinary fact: k10r ADR-0023 made a code row a VERTEX
-  of the fact graph (a bare surrogate id had nothing a fact could point at, which is why
-  this clause could not be written before), the door states the binding at open
-  (`finishes_on: [code_id…]`, refused by name for a code row nobody delivered), and
-  re-stating it is idempotent without moving the task's state. The completion write is
-  GRAVITY'S and it happens at the CALL SITE: the turn-start listing carries
-  `finishes_on` per task, `booth::tasks::bindings` turns it into one local
-  `code_id -> [task_id]` table per turn, a step that SUCCEEDS moves every task bound to
-  that code row to `done`, a failed or refused step writes nothing, and the tool result
-  reports `finished_tasks` beside the script's own document (under `result` — the
-  executor never edits the answer it is reporting on). §4's "with the projection it
-  already fetches" was wrong on the ground and is corrected in the ADR: the task listing
-  stays its own door (`GET /tasks/{scope}`), fetched ONCE per turn, and every in-turn
-  check reads the local table. Gates: gravity 79/0 (`a_bound_task_is_closed_by_the_call_that_finished_it`,
-  `a_failed_step_closes_nothing`, `a_done_task_needs_no_closing`, `one_code_row_may_finish_several_tasks`),
-  k10r 202/0 (`a_task_names_the_code_that_finishes_it`, `a_code_row_is_a_vertex_a_fact_can_reach`),
-  prism 64/0 (`turn_invoke_skill` now asserts the bound task is `done` after the turn
-  without any `move_task`), clippy 0.
-- [ ] Phase 3 — Compression as a parallel side branch: when the Krystallizer's fetched view carries a compression marker (watermark reached), Gravity fires TWO concurrent requests from the same immutable prefix — main branch `[H] + [U_n]` answers the user (critical path, normal streaming), side branch `[H] + [compression instruction]` produces the summary. Prefix KV is shared (same-prompt fork — inference servers natively reuse concurrent prefix requests); the side branch pays only its delta. Summary lands before U_{n+1}: the session swaps to `[S] + [recent tail]` at the typing gap — zero user-perceived latency, no mixed-turn. Idle/no-turn triggers (cache TTL cooldown): the side branch is fired standalone (CLI idle tick / Prism timer / Aura `@cron` booth) — off every critical path, pure cost decision. Memory-tool extraction runs on the same branch pattern (past-oriented read branch, output to external state). **Seam half LANDED 2026-10-20:** `SessionProjection.compress` carries k10r's verdict through BOTH surfaces (the in-process one runs the same engine, so they agree), and the checkpoint door now takes the SUMMARY only — k10r derives the coverage point from the verdict it served. What is left is this phase's turn-loop half: firing the side branch and handing the text back. **Turn-loop half LANDED 2026-10-26 (k10r ADR-0017):** the branch fires from
-`start_tails`, which reads k10r's `tails` verdict off the projection and opens one
-`Tail` per requested operation (`compress`, and the review behind it) over the same
-numbered prefix the main branch reads; the provider pulls interleave with the
-answer's own stream, and every branch failure is swallowed — an unlanded
-compression leaves k10r's node open, which is its "compressing" marker. What is
-left of this phase is the STANDALONE trigger: no idle/no-turn tick exists
-(`grep idle` finds nothing in the tree), so a conversation that stops talking
-never reaches its compression point.
-  **AND the branch's OWNER (open, 2026-10-31).** The design says the summary lands
-  at the typing gap — i.e. a compression slower than the answer does not hold the
-  turn. Today it does: the pull loop IS the turn's call stack, so `drain_tails`
-  finishes the branch before the handler returns (up to 64 pulls). The stream is
-  not the obstacle — `iterate` streams live until `dispose` or eviction, and the
-  carrier does not reclaim them when an entry returns. The obstacle is that a pull
-  stream makes no progress without a puller. So the decision this phase owes is
-  WHO pulls after the turn: a resident driver inside the booth (its own loop or
-  clock, the `@cron` shape), the NEXT turn picking the branch up, or nobody —
-  leave k10r's open node as the marker and let the following read re-decide.
-  Two prerequisites, in order:
-  1. one process must be able to serve two requests at once, or a resident driver
-     is blocked by the very pull it is driving. Today it cannot: the host's
-     supervise loop routes inline (`induction-host/src/supervise.rs`) and the
-     guest reads "the next frame" as its reply — the `id` field exists on both
-     sides and neither uses it. That is induction ADR-0002 (Proposed), steps 1–3.
-  2. then the provider's shape follows: one call carrying the requests that go
-     together (the turn's own, plus each tail operation's), N SSE connections
-     opened at once, pulls addressed by `stream_id` — not one process per
-     operation key, which is only today's workaround for a single-slot guest.
-`tails` (the operation table — an unknown name is skipped with a log, since the
-store's list can grow before a deployed guest) and the records are NUMBERED, so
-the pass can name the cut it would have chosen; `read_products` takes the JSON
-(`{summary, cut}`, fenced or not) and falls back to the whole text as the summary
-when the model ignored the format — compression is necessary, its product is not
-to be lost over a shape slip. The cut is resolved to a pointer HERE (this turn
-built the messages, so this turn is the only one that can), and it lands beside
-the summary through the checkpoint door, which validates it against the span.
-STILL OWED in this phase: the idle/no-turn trigger (a standalone branch off every
-critical path).
-  TURN-LOOP HALF LANDED 2026-10-26: the turn guest opens the branch from the verdict it was served — the SAME prefix (head + summary + history, without this turn's message) with k10r's `prompt` appended — as its OWN stream on its OWN THREAD, so the branch advances whether or not the answer's loop is pulling (`gravity_core::llm::live`, no shared slot and no instance to key). The main loop polls the branch's channel for a product between pulls (the summary is produced beside the answer, never in front of it), and the terminal round POSTs `{summary}` to the checkpoint door; the coverage point stays k10r's to derive. Failures are swallowed BY DESIGN: a branch that cannot open, pulls an error, or yields nothing leaves k10r's open node as its "compressing" marker (the state the engine already skips) and the turn goes on — maintenance must never cost the user an answer. One RULING taken here: a branch still live when the answer ends is DRAINED before `done` (cap 64 pulls), because the carrier releases the turn's stream at `done` and the guest's state goes with it; the cost is the summary's tail on the turn's end, and the no-wait shape is exactly the scheduled/idle trigger this phase already names below. That trigger and the memory-tool extraction branch stay open. Gates: gravity 25/0 — `the_compression_branch_lands_the_served_summary` streams the answer from one stub (which answers the branch differently, keyed on the tail prompt in the request) and then reads the session back: `summary == "compressed span"` and `coverage_ts == 2000`, the split k10r proposed; clippy 0.
+## Milestone B — distributed execution
 
-## Milestone B — Distributed execution
+- [x] 4 — The booth binding: one turn event, one execution — 2026-10-10
+- [x] 4.1 — The guest re-landed on induction: pure Rust, no embedded interpreter — 2026-10-13
+  - [x] no pull face: a turn is one handler call — 2026-10-30
+  - [x] the deployment facts move into the field (`settings` / `models` rows) and the management view — 2026-10-30, screen 2026-10-31 — ADR-0007
+  - [x] two renderings (`protocol: data | fluxen`); an event-routed turn says its own end — 2026-10-29 … 2026-10-31 — ADR-0009
+  - [x] the speaker comes from the venue's envelope, never from a form — 2026-11-04 … 2026-11-05
+  - [x] the shell declares the platform's `auth` region; auth rides the route declaration — 2026-11-06
+- [ ] 4.5 — The unified call model: hot and cold behind one await — no ADR yet
+  - [ ] what a VALUE-shaped caller receives when the target is cold (the tier exists in aura; nothing reaches it from a tool call)
+  - [ ] what the caller writes down when it ends its entry — the open question in 2.5
+  - [ ] re-entry: the result arrives as an ordinary dispatch carrying the minimal replay set
+- [x] 4.6 — The execution surface is the runner mount; `invoke_skill`, `write_code`, `run` — 2026-10-26 … 2026-11-09 — ADR-0001, ADR-0004, ADR-0011
+- [ ] 5 — Skill pull-through and the weight write-back — ADR-0003 §5, ADR-0004
+  - [x] the counters at the call: attempt before a node runs anything, success after, on both rows — 2026-10-26
+  - [x] the proposal write side: a walk that grew files the composition it walked — 2026-10-26
+  - [x] the task tools, `write_code` / `read_code` — 2026-10-27 … 2026-10-31
+  - [ ] the line's original target sentence predates the runner mount; what remains of it is not restated here
+- [x] 6 — The CLI is a client of the venue, kubectl-shaped, no second driver — 2026-10-26 — ADR-0002
 
-- [x] Phase 4 — Aura Booth binding (`crates/booth`): the same execution function registered as a Booth type; one turn event = one execution. CLI becomes a for-loop over the same function; Booth is its single call. — the second half of that line is SUPERSEDED (ADR-0002, 2026-10-26): the CLI is a CLIENT of the venue, not a second driver over the same function, and the for-loop left `crates/cli` with its `gravity-core` dependency. The booth landed in 4.1 and the carrier ruling below, so nothing in this phase remains open.
-  LANDED 2026-10-10 (second cut — the turn is FULLY in the booth, streaming end to end): two python booths — the provider (`httpx.stream` SSE → generator, `yield` per token, key custody via `key_env` name, the value never in the module or args) and the turn (`turn` handler is a GENERATOR: fetch the projection from mem-server over HTTP → assemble the prompt → `ctx.iterate` the provider yielding each token straight through → append the one-ts-two-subs exchange AFTER the stream ends). The streaming residual is CLOSED by this cut: per-token deltas cross as envelope items while the stream is live — prism's `turn.delta` contract rides it unchanged. Booths hold no connection state: store_url/endpoint/model/key_env ride the turn args (deployment facts the caller supplies per call). Test recipe then: `PYTHONPATH=<nix-python lib-dynload>:<site-packages> RUSTFLAGS="-L <nix-python libdir>" cargo test -p gravity-booth --features python`.
-  SUPERSEDED 2026-10-13 (carrier ruling — gravity is a pure-Rust project; no embedded interpreter): the python carrier cut is retired. Both booths are Rust guest processes speaking the induction pipe protocol (`~/world/induction`; frame vocabulary per ADR-0034's `{item, done}` envelope — single-call and stream share the one envelope shape, `done: true` closes the boundary). The turn booth is an `induction-guest` binary: streaming state lives in the guest process (the process IS the stream state — the old "Rust body carries no stream state" note named the in-process `Body::Rust` closure arm, whose only limitation is lacking resident state to hold an iterator; a resident child process has exactly that), and since the provider was folded in, that includes the LLM streams themselves (`gravity_core::llm::live`, one per thread). `crates/booth` registers ONE type via a `BoothType` process spec (`language = "induction"`), same interface_schema contract (auth block on `turn`), same envelope semantics over the wire — prism's `turn.delta` contract unchanged.
-- [x] Phase 4.1 — Re-land the booth crate on induction-guest (supersedes the python cut above): two guest binaries (`gravity-turn`, `gravity-provider`) + registration; the provider's SSE parse stands in for the real endpoint first (fixture stream), then wire OpenAI SSE in Phase 1.
-  LANDED 2026-10-13 (gravity `34dd5e5` + `72886a5` + `08ec0c3`; induction `1358e64` + `0c3ab86`; prism `3ccb070`): the turn guest speaks the induction pipe (CBOR codec — the self-delimited document form skips the per-frame JSON quoting overhead). Each guest has a Start handler `.on(name)` (the realm addresses the stream by the handler name — `stream` / `turn`) plus the reserved `.producer()` pull face; a plain `.producer()`-only guest never opens (the Start falls into "no such handler" → terminal-wrapped error → no stream). SUPERSEDED 2026-10-30: the turn declares no producer binding at all (see NO PULL FACE below) — a turn is a handler call, and the streams it opens are pulled by the code that opened them, on its own thread. The turn's stream IS the turn: Start fetches the projection, opens the provider stream through the guest Ctx's NEW iterate consumer arms (`ctx.iterate_start/next/dispose` — the induction face of ADR-0034's pull loop, closing the Phase 4.21 residual), re-emits deltas, and the terminal round appends the one-ts-two-subs exchange (turn args captured in process state — the pull handler only sees the guard's `{stream_id, round}`). The SSE wire decoder has ONE home (`gravity-core llm::sse`, feed/decode protocol; the provider guest and any streaming consumer share it). The turn declares `.auth({turn:true})` — the induction schema's auth pass-through restores prism's gate (fail-open without it, found by turn_e2e). Spawn specs overridable per deployment (`GRAVITY_PROVIDER_BIN`/`GRAVITY_TURN_BIN` — prism's turn_e2e points at gravity's workspace build). prism's `register_executor` delegates to `gravity_booth::register` (no carrier feature gate, no PYTHONHOME/PYTHONPATH for this plane).
-  Gates: gravity 3/0 booth contract tests (streaming round trip, append after done, failed provider appends nothing) + workspace 10/0, clippy 0, **no python in gravity's own graph**; induction 33/0 + clippy 0 (auth pass-through); prism turn_e2e 5/5 (auth gate, streaming, cancel, duplicate-submit refusal).
-  - OUTPUT FORMAT IS A CALL ARGUMENT (2026-10-29, prism Phase 1.10; gravity ADR-0001's
-    "the producer decides" applied to the stream): the turn's args carry `protocol` —
-    `data` (default: the raw item/delta stream every non-UI consumer already gets) or
-    `fluxen` (the turn emits VIEW frames: `append`/`set` against the slot the layout
-    declares, so the renderer stays generic and no slot name is compiled into a bundle).
-    The slot name and what accumulates there are the CALLER's declaration (prism reads
-    them from its layout), never a gravity constant; an unknown protocol value is an
-    error value naming the argument, not a silent fallback to `data`.
-  - NO PULL FACE (2026-10-30): `turn` is ONE handler — the venue's own trigger drives it
-    and the booth draws. The `.producer()` binding, the round-0/pull split, and the five
-    statics that carried one turn across call boundaries (`PROVIDER_STREAM`, `TURN_ARGS`,
-    `REPLY_PARTS`, `WALKED`, `TAILS`) are gone: the projection fetch, the prompt, the tool
-    rounds, the answer stream and the side branches all live on one call stack, so a
-    resident guest cannot leak one turn's state into the next. Each chunk leaves as
-    `ctx.emit(<event>, {name, channel_id, data})` — `name` is the recipient event (a
-    compiled view body is not told which event fired, so the emitter states it),
-    `channel_id` is the ADDRESS the envelope arrived with, and the frames hang off `data`
-    because a payload with `args` and no `data` is what the venue reads as a REQUEST. Frame
-    turns emit on `view:turn` (the frames carry their own slots) and close with
-    `view:turn.done` / `view:turn.error`; a delta consumer names its own event in the args
-    (`event`) because gravity mints no venue names, and `protocol: fluxen` without `slots`
-    is refused by name. Why the pull face had to go: aura opens a stream for any Start that
-    answers non-terminal (ADR-0036), and the only puller was prism's `run_turn` — a booth
-    that is told what happened cannot depend on someone else pulling its own turn. `turn`
-    is still a Start-reachable handler (a sibling booth or a test may call it directly and
-    read the terminal `{reply}`), it just never answers `done: false`. Gates: booth 13/0
-    (the venue route: subscription → frames addressed to the envelope's `channel_id` →
-    `view:turn.done`; plus the nine data/streaming/tool/tail contract tests),
-    workspace 71/0, clippy 0. prism's half — deleting `turns.rs` and its `turn.submit`
-    verb — is prism Phase 1.10's next step, not this one's.
-  - THE FACTS MOVE INTO THE FIELD (2026-10-30, ADR-0007): the turn's deployment facts —
-    store URL, memory scope, endpoint, model, `key_env` — stop being prism's (`turns.rs`'s
-    `TurnConfig::from_env`) and become gravity's own rows in aura, read through `ctx.store`
-    at the start of a turn; prism passes only what the page knows (conversation, text,
-    output shape). This REPLACES the reading in which prism injects the facts while routing
-    `view:turn.submit`: a gateway keeps no model vocabulary at all. Not built yet: gravity's
-    booth declares no `storage` block (the mechanism exists — `register` persists a script
-    booth's introspected schema and allocates its ns, and the realm builds the plan from
-    that copy; what is unproven is the induction carrier's half, since no induction guest in
-    the tree has declared storage yet) — LANDED 2026-10-30: the turn guest declares `.storage(...)`
-    with two collections, `settings` (key `[kind=1, id=1]`: store_url, memory_scope, memory_format,
-    default_model) and `models` (key `[kind=2, id]`: alias, endpoint, model, key_env, weight,
-    enabled), and `turn()` reads them through `ctx.store` before anything else. THE ARGS SHRANK to
-    what the page knows (conversation, text, output shape, mounts); a fresh deployment has no rows
-    and the turn fails with a NAMED error listing the keys (no env fallback). The trap found on the
-    way is recorded in ADR-0007: a type owns ONE ns, so collections inside it need a `kind` in the
-    key — without it `models` id 1 and `settings` id 1 were the same row and the read returned one
-    table's fields under the other's name. Gates: booth 14/14 (one new case, the missing-settings
-    refusal), workspace green, clippy 0. ADR-0007 also fixes HOW the rows are managed: the face
-    is a VIEW (`view:gravity-model` → gravity emits a management layout → its buttons emit
-    ordinary events), the stack's general interaction pattern, driveable by an AI too — not an
-    admin verb and not a config file. The pool's selection rule is the one item left open.
-  - CANCELLATION IS A MARKER (2026-10-30, ADR-0008): no stream to dispose, so cancel writes a
-    flag the turn reads at its own boundaries (per chunk / per N / per round — a policy, not a
-    constant), a tool call in flight completes and is discarded, and a cancelled turn appends
-    nothing while saying why on the same wire. Killing the booth is rejected (it loses the
-    trace), and so is a cancel EVENT (the busy instance's own queue delivers it after the turn).
-    Owed: where the marker lives so a BUSY turn can read it and an idle component can write it
-    — a field-store row (write needs a path into that ns) or `ctx.queue_depth` read as a level.
-  - TWO RENDERINGS ARE RULED (2026-10-30, ADR-0009): `protocol` selects frames (`fluxen`, Accrete
-    operations against the slots the caller declared) or raw deltas (the caller names its event);
-    the names are the caller's in both modes, the two shapes are NOT isomorphic (view carries the
-    drawing of the answer, raw carries its text), and both consumers — a web surface and the CLI —
-    are clients of the venue rather than two implementations. This shape landed WITH the turn
-    rewrite, so the record is the one artifact of it.
-  - THE CONNECTION LIFECYCLE IS PRISM'S EVENT STREAM (2026-10-30, prism `docs/MODELING.md`):
-    `view:connect` / `view:login` / `view:logout` / `view:disconnect`, named as the FACTS they are.
-    gravity declares none of them and answers none: a turn is opened by a page's own event
-    (`view:turn.submit`), and an application that wants to re-render on login subscribes with a
-    booth of its own rather than inheriting a lifecycle hook here.
-  - TWO WIRE DRIFTS prism OWES under its own ADRs, to land with the turn deletion: (a) the
-    uplink payload is `{…, data}`, not `{…, args}` (ADR-0017 §Update 2026-10-29) — gravity now
-    reads `data`, so prism must SEND `data`; (b) `channel_id` leaves the wire and the address is
-    a DEVICE (ADR-0018) — gravity now keys its instance on the envelope's `device`, emits its
-    own frames with `device` and no `sender` (the venue drops a sender from its own fan-out),
-    so prism's `forward` must stop reading `channel_id`. The layout needs NO change: a page's
-    uplink/downlink never carry the prefix, prism adds it on the way in and strips it on the way
-    out — handoff step 2's `dest: view:turn.submit` was a misreading and is NOT to be applied.
-- [ ] Phase 4.5 — Unified call model adoption: tool calls go through `ctx.invoke()` (Aura CallSlot) — target = user namespace + node alias + capability (e.g. `probe:home-pc:read_file`); two-tier waiting handled by the runtime behind one `await` per call-site (hot: park on oneshot; cold: entry-split — no park, transcript flush, task ends, re-entry on result). Retention-window residency: executor stays in memory between calls/turns of the same session, session persisted at turn end or expiry; crash within window rebuilds from event stream. Multi-machine orchestration (e.g. "send the file from home PC to office PC") = two invokes composed in the turn loop — no remote/local branching in Gravity code.
-  **The seam this phase must cut (stated from the code, 2026-10-31):** "behind one `await`" does not survive contact with the pipe — the cold tier is not something the runtime can hide there, because neither side can express "I did not wait".
-  - induction's guest frame `Arm::Invoke` is a request/reply pair (`induction-host/src/ops.rs:121`: `ops.invoke(&call).await` → `Reply`); the guest blocks in `read_host_reply`. That is CORRECT and stays: the frame carries a call, not a scheduling policy — whether a target is hot or cold is its own declaration in the realm, and a guest that stated it would be stating someone else's deployment fact. What the frame cannot do is answer anything but a value or an error, and that is the gap.
-  - gravity's invoke lands in aura's `dispatch_call`, whose answer type is a VALUE: a cold slot is refused — `Waited::Pending(id) => Err("cold target cannot return a value to a parked caller (call {id}); emit instead")` (aura `crates/realm/src/lib.rs:137`).
-  So the tier machinery is all there (aura `CallSlot::{Hot,Cold}`, `pending_calls` keyed by `CallId`, `PendingEntry.session` naming the transcript to wake, `resolve_call`, the deadline sweep) and nothing can reach it from a tool call. What this phase has to rule, in order:
-  1. what a VALUE-SHAPED caller receives when the target is cold: the realm answering a pending handle as a value (`{pending: call-N}`) so the guest can decide what to do with it, or gravity not asking a value-shaped question at all for work that finishes later (a job opened in k10r's task sheet, or fire-and-forget plus re-entry). This is an answer shape, not a frame field — induction's vocabulary does not change either way.
-  2. what the caller does with it: end the entry, and what it writes down (this is the open question in Phase 2.5 — a row for a call the turn has not resolved yet).
-  3. re-entry: the result arrives as a call INTO the booth's own entry (the guest is event-driven, so re-entry is an ordinary dispatch, not a resumed stack), carrying the minimal replay set the turn left behind.
-  Until 1 lands, a `human`-nature call can only be awaited as a value (today's behaviour) — which is why Phase 2.5's cold half stops at compaction.
-- [x] Phase 4.6 — The execution surface is the runner mount (ADR-0001): every machine (the control plane's included) runs an effector node; each (node alias × operation language) gets ONE `Remote` mount whose source is a fixed deployment artifact (a runner: interpreter or dispatcher, installed with the node and declared in its manifest); the LLM-selected operation's script is fetched from k10r by gravity and travels as a call ARGUMENT (`invoke(mount, key, entry, args{code, args})`), so a skill — or a skill version — never mints a type, a ns, a route, or a definition row. Work: prism's mount-registration face (node manifest → idempotent registration per boot — `Remote` definitions are not persisted; the dial-in `Frame::Register` already supplies alias + carriers), the runner artifact + node manifest, and gravity's run call plus the fixed tool list (skill search + run). aura and effector: NO change (existing surfaces; the runner is a definition per ADR-0027, the script is an argument, so there is no per-call code form and no errata). Forecloses: gravity running standalone with execution ability; any local privileged execution path. Node language surface: nu (systems) + python (business logic) are the required installs — steel is in-binary; no shell carrier and no bash fallback (OS operations route to nu mounts); one runner per language, entry `execute`. A COMPOSED operation (a glue script that encodes a branch and calls sibling steps — ADR-0003) can only ride a mount whose carrier is `induction`: the one-shot `exec` carrier has no channel (one JSON in, one out; no frames, no ctx bridge), so the manifest's `carrier` axis is what states which mounts can host glue. **THE GLUE SENTENCE IS SUPERSEDED 2026-11-16 BY ADR-0011**: there is no glue tier — a step is one call with arguments, so it may ride a one-shot `exec` carrier, and the `carrier` axis no longer constrains composition.
-  THE WALK LANDED 2026-10-26 (ADR-0004 §3): `invoke_skill` closes the loop — the model resolves, picks a candidate, and names a step; gravity reads the skill, fetches that step's code row, matches the row's `language` against the deployment's mount table (prism reads its own `PRISM_MOUNTS` — both axes were already declared — and passes `mounts` in the turn args), and calls the mount with the script as an ANSWER: `ctx.invoke(mount, session, "execute", {code, args})`. ONE step per call: ordering, retry and feeding one step's output into the next stay Phase 5's, and the sequence is the model's to drive. Residency key = the conversation (`channel-{c}-member-{m}`), so a step script's own state survives the turns of one conversation and nothing else. The two door kinds meet in `crates/booth/src/tools.rs`'s `Doors` trait (k10r over HTTP, a mount over the ctx); the turn implements it, the list stays testable without a realm. Proven on the real stack by `../prism/crates/prism/tests/turn_invoke_skill.rs`: real mem-server, real gateway, real effector node, real `runner_py`, and the model's own round-1 request body carrying `{"sum":7}` that a python child computed from the arguments gravity passed. The argument check landed the same day: `check_arguments` enforces the JSON Schema subset a code row DECLARES (`required`, `properties.*.type`, `additionalProperties: false`) before a node is asked to run anything, names the offending key, and hands the contract back so the model repairs its call in one round — a row that declares nothing constrains nothing (ADR-0004's consequence). NOT built at the time: the multi-step body (ADR-0005 ruled what it is — code, not a DSL; **ADR-0011 superseded that on 2026-11-16**: the composition is a graph of steps held in the skill node, executed by a scheduler, with code as a leaf). Gates: gravity 38/0, prism `turn_invoke_skill` 1/1, `turn_e2e` 5/5, k10r 163/0.
-  WRITE_CODE LANDED 2026-10-31 (ADR-0004's ninth tool, k10r ADR-0023): the writing
-  half of execution — `write_code({language, source, description?, parameters?,
-  code_id?})` delivers a script or appends a revision of one, and answers
-  `{code_id, rev}`; `read_code({code_id, rev?})` is the read face beside it (the
-  current version by default, one exact version when `rev` names it), because a
-  model that revises blind is revising a script it cannot see — and the version
-  chain only makes that mistake recoverable, not harmless. Before it, a skill's steps were prose the deployment could not
-  carry out: `invoke_skill` needs a `code_id` and nothing created one outside a
-  test fixture. A revision keeps the address (skills, `finishes_on` edges and
-  counters keep pointing at the same script) while the version that ran stays
-  readable — the chain is the store's (ADR-0023's Update), not gravity's.
-  Where it RUNS is counted too: the step now records an invocation on BOTH rows —
-  the skill (this procedure was tried) and the script (this code ran), attempt
-  before the mount and success after it. A script is not owned by its caller: one
-  `generate-pdf` row can be a step in several skills and reachable from more than
-  one tool, so the script's count belongs to the script, and neither count is
-  derivable from the other. Best effort by contract: a counter that cannot be
-  written never fails the step (k10r ADR-0018 / ADR-0023's second Update).
-  Gate: gravity 35/0 lib, k10r 210/0.
-  LANDED 2026-10-14 (prism `d6d385f` + uncommitted work tree; effector `7e06a0f` + uncommitted work tree): the mount-registration face (`prism/src/mounts.rs` — `MountDecl`/`PRISM_MOUNTS`/`register_all`, replayed at boot because `Remote` definitions do not persist; a declaration now names BOTH axes — `carrier` for the node facility the call runs in, `language` for the operation language a skill is matched on — so the route to a mount is a match, not a name sniff) + the three runner artifacts (`effector/deploy/runners/runner_nu.nu`, `runner_py.py`, `runner_py_guest.py`) + the **ctx bridge OUT of a remote induction guest**, proven end to end: a delivered script calls a sibling mount through the host realm and gets its value back, on a session that has already served two calls (`prism/crates/prism/tests/runner_mount.rs`). Three located breaks were fixed to get there, one per layer: ① the guest's protocol frames rode `sys.stdout`, which the delivered-script wrapper redirects into the result capture buffer — the frame landed in the capture buffer and the call deadlocked to its deadline (the wire fds are now pinned at import); ② a resident session kept the bridge of its cold-start call, so later calls carried a call id nobody was waiting on (the bridge is per-call data: `ResidentSession::set_host`, re-armed by the dispatch seam on every call); ③ the dial-in reader loop resolved host calls inline and parked on a hot realm call whose Result frame only that loop can read — a self-deadlock whenever the ctx target lives on the same node (the resolution is now spawned; both dial-in homes, `prism/src/effectors.rs` and `aura crates/engine/src/effectors.rs`). CLOSED 2026-11-09: gravity's `run` call — the door for a script that belongs to no skill — landed (tools.rs: `run` spec + dispatch, `prepare` shared with `invoke_skill`, four unit tests, and the end-to-end proof in prism's `turn_invoke_skill` where one turn walks a skill step AND runs a bare row on a real node). Both former blockers are gone — `GET /code/{scope}/{id}` answers the current version, `write_code` delivers one, and the language question is settled by requiring `language` of the writer (ADR-0001's Update: a default would be gravity choosing someone else's mount). So what is missing is the tool itself: a way to execute a code row that no skill names. The node's containment half of the manifest has since been carried on the effector side (2026-10-14, effector ADR-0001): the jail is built from the node's own `CapabilitySurface` (`fs_scope` = write scope, `deny_read`, `cwd`), `config.sandbox` is the switch, and a claim with no enforcement point fails the startup — domain allowlists, seccomp and a `command_exec` grant stay unwired.
-- [ ] Phase 5 — Skill pull-through: on each tool call, fetch skill spec from Krystallizer via the pull-through path (Probe → Gravity → Krystallizer, never direct); view processing + `tool_invoke_count` weight write-back at this data gate. The write-back is a COUNTER (data, additive and reversible); no execution path rewrites the graph's topology — a recurring composition is proposed for promotion, never self-parented (ADR-0003 §5).
-  FIVE TOOLS, AND COUNTING AT THE CALL 2026-10-26 (k10r ADR-0018): `create_skill` is
-  the fifth entry — the model's act, symmetric with `commit_memory`, posting to k10r's
-  declaration door with the step-shaped parts converted array→JSON TEXT HERE (the store
-  parses none of it). And `invoke_skill` now counts each call where it happens: `attempt`
-  before the node is asked to run anything, `success` when the answer comes back, both
-  through `POST /skills/{scope}/{id}/touch` and both ignored on failure — a counter that
-  cannot be written never fails the step the model asked for.
-  TAIL LANDING ARMS SPLIT BY OPERATION 2026-10-26 (k10r ADR-0017 §4/§7): the turn lands
-  each tail product at the door its operation owns — `compress` at the checkpoint door,
-  `review` at the MEMORY door (`POST /memories/{scope}`), an unknown name logged and
-  dropped, never guessed. Two structural faults surfaced and were fixed on the way, both
-  invisible while one operation existed: (a) the live branches were a single slot, so a
-  second operation silently displaced the first and its product never landed (k10r kept
-  reporting an open node); they are a LIST now. (b) every branch shared one stream — two
-  branches fought over it and a summary arrived half-read. A branch therefore opens its
-  own `Live` on its own thread, and its stream dies with that thread. A review whose answer
-  is not a fact array saves NOTHING: there is no usable prose version of a fact list.
-  Gate: `the_review_branch_writes_the_facts_it_found` (a node the conversation never
-  named appears in the graph), workspace 32/0, clippy clean.
-  PROPOSAL WRITE SIDE LANDED 2026-10-26 (k10r ADR-0016, amended the same day): the
-  turn reports what it walked. `tools::call` takes a recorder beside the `Doors`,
-  `invoke_skill` appends each code row it RAN (id + description, and only on
-  success — a failed step is not part of a run worth proposing), and the DISPATCH
-  files the composition the moment the walk grows to two DIFFERENT rows — not at
-  turn end, so the record rides the step rather than the reply and survives a turn
-  that dies before its terminal round. `tools::should_file(before, after, walk)`
-  is the rule in one place: only a walk that GREW files (a retry cannot count the
-  same walk twice). A three-step walk files its prefix too (`a+b`, then `a+b+c`) —
-  both were walked. The key is the walker's spelling — ids in execution order —
-  because k10r does not parse `steps`. Filing is best effort and never fails a
-  turn. No new tool name; nothing promotes itself; `resolve` keeps showing only
-  real skills.
-  Proven by prism's `tests/turn_invoke_skill.rs` (two code rows in one turn → one
-  proposal row, count 1, and the resolver unchanged), not by a unit test alone.
-  TASK TOOLS LANDED 2026-10-27 (gravity ADR-0004 amended; k10r ADR-0021): the
-  fixed list grew from five to eight — `open_task`, `move_task`, `list_tasks` — and
-  a turn now OPENS by listing every task it still OWES — any state but `done`
-  (`open_tasks()` fetches, `booth::tasks::render_owed` renders, best effort: a store
-  that cannot answer does not fail the turn). Filtering the fetch by `state=open` was
-  the first version and it hid the work in progress: a task moved to `doing` fell out
-  of the next turn's view. Prism's `tests/turn_tasks.rs` drives three turns through
-  the real stack to hold that line — opened in turn 1, in the prompt in turn 2, still
-  there after the move to `doing`.
-  The division the tools encode: a task is an ordinary vertex of the fact graph, so
-  dependencies, parents, tags and references are `commit_memory` facts — there is no
-  dependency tool, because one graph does not need a second edge vocabulary.
-  Gates: booth 25/0 lib (4 of them the task block's renderer) + 6 + 10, workspace
-  green, clippy clean.
-  COMPOSITION RULED 2026-10-26 (ADR-0005) — **SUPERSEDED 2026-11-16 BY ADR-0011** (composition is a graph held in the skill node, a step's code is a leaf, and `invoke_skill` starts a run rather than walking one step per call): a multi-step skill's body is CODE in an
-  existing language (steel or python), never an invented DSL and never a JSON step
-  graph — an invented step language ends as a poor lisp dialect with a hand-written
-  evaluator, and JSON expresses nothing but a fixed sequence. The step edges are
-  DERIVED from the body (parsed), which is the graph representation of the same
-  composition. Consequence for this repo: nothing. `invoke_skill` never changes — a
-  composed body is ONE step, so one-step-per-call stops being a limitation rather
-  than being worked around. k10r's `steps` JSON list becomes the interim shape
-  (ADR-0015 §3 amended). Outstanding check before a steel body can EXECUTE: steel
-  must evaluate a delivered string (python does, nu measured not to, steel
-  unverified — the same blocker class as ADR-0001 §8), and a steel body that runs
-  in-process on a node is an explicit acceptance of the sandbox clause ADR-0001 §2
-  rejected for generated code.
-- [x] Phase 6 — CLI over Prism WS (ADR-0002): the CLI is a client of the venue speaking the existing turn verbs — kubectl-shaped (one command = one call, stdin/stdout, meaningful exit codes, machine-readable output, batch input first-class), no REPL, no local session state, no second driver ("local CLI direct to Krystallizer" is retired: a local memory store is a deployment fact). Priority sits BELOW the web front end — the CLI is the automation interface, the web is the human one.
-  LANDED 2026-10-26: `crates/cli` is a WS client of prism and nothing else — no `gravity-core` dependency, so the local for-loop is gone with it (the turn function's ONE home is the booth; `gravity-core::turn` stays as the reference implementation the booth's contract tests ride). It sends `login` and falls back to `signup` once (a fresh venue has no account; the password is the same secret either way), then `turn.submit` per positional argument (`-` reads stdin as ONE turn), streams `turn.delta`…`turn.done`, and maps the four failure classes to ADR-0002's exit codes: 0 done, 2 usage/config, 3 auth, 4 turn failed, 5 venue unreachable. Ctrl-C and `--cancel-after-ms` both send `turn.cancel` — the venue's own verb — instead of leaving a turn running behind a dead socket. Deployment facts ride a new `venue { url, username, password_env }` config node (the password in the env var that field NAMES); the LLM fields became optional because a client config has no endpoint of its own. Residual, narrowed 2026-10-26: the CLI has been driven against a stub venue (its own test) and prism's `turn_e2e` covers the real server side; the gap between those two — the SHIPPED binary on a SHIPPED gateway — is now `scripts/smoke-venue.sh`, which boots a stub provider, k10r's mem-server, prism and the CLI, then asserts both the reply on stdout and the message pair k10r recorded (`["hi", "hello world"]`, read back over the HTTP door). It closes the "does the built thing work" question; what stays open is running it as a GATE: it needs the three repos built and three fixed ports, which no `cargo test` can assume, so CI wiring is still named-work. Gates: gravity 30/0 (5 new CLI tests: two turns from two arguments, exit 3/4/5, the cancel verb), clippy 0 for the touched crates.
-LANDED 2026-10-29 (the guest half): `protocol` rides the turn's args. Absent or `data` = the
-raw deltas every non-UI consumer reads (unchanged). `fluxen` = Accrete view frames, and the
-CALLER declares the slots (`slots: {rack, text}`) because the booth has no layout and must
-not invent names for one. Round 0 sends one batch — the user's line, the text region (`set`),
-the answer bubble reading that region, and the first chunk; every later round is one `patch`
-into the region. The envelope's `item` carries `frames` instead of `delta`, so a consumer
-that cannot draw sees a shape it did not ask for rather than a silently empty string.
-`turn.frames` is what prism's renderer leg forwards.
+## Open items
 
-Deferred gates:
+- [ ] A duplicated patch frame: one patch delivered N times per page, multiplicity growing per turn — measured 2026-11-05, not fixed. The bubbles are addressed per turn, so this is not the shared-region defect; the suspicion is one delivery per `/channel` connection (prism's fan-out). Measure in a clean venue with one tab — the probe that found it had six
+- [ ] `scripts/smoke-venue.sh` is not a gate: no workflow references it, and wiring it needs the three repos built on three fixed ports
+- [ ] ADR-0007's model row promises `affinity` and the declared row has no such field (`docs/adr/0007-model-configuration-is-gravitys.md:26` vs `crates/booth/src/bin/turn.rs:126-135`) — add the cold field or amend the ADR
+- [x] Cancellation is a marker the turn polls at its chunk boundary — 2026-11-09 — ADR-0008, aura ADR-0047, effector's `Frame::Interrupt`
+- [x] `run` for a script that belongs to no skill — 2026-11-09
 
-- FaaS driver: same execution function on serverless platforms — only after the Aura Booth path is stable; no new code, just another driver of the function.
-- Multi-model routing: model selection per turn/session — after the single-model path is proven; LLM identity stays Gravity-side (cache binding), Krystallizer never learns it.
+## Deferred
 
-THE UI MARKER IS `ui:` 2026-10-31 (prism ADR-0017's Update is the record): the turn booth declares `ui:turn.submit` and emits `ui:turn.done` / `ui:turn.error`; the auth map names `ui:turn.submit`. The rule did not change, only the word — `view` named three different things in this stack. Any `view:<name>` in this repo's ADRs and in the entries above reads `ui:<name>`.
-THE TASK LOOP LIVES HERE 2026-10-31: `turn_booth.rs::a_task_opened_in_one_turn_is_the_next_turns_starting_point` — three turns in one session, a model stub that opens a task once and then REFUSES to answer unless its prompt already carries the work (a task named `open` and one moved to `doing`), so the assertion is on the model's own body rather than on a store read. Moved from prism, whose copy hung on the venue's deleted `turn.submit` verb.
-
-AN EVENT-ROUTED TURN SAYS ITS END 2026-10-31 (ADR-0009's Update): `run()` used to emit `ui:turn.done` / `ui:turn.error` only for the drawing protocol, because the data protocol's terminal was the handler's return value — true for an iterate call, false for the path a page and a CLI take. The condition is the DELIVERY now: an envelope carrying `name` means nobody can read a return value, so the end is emitted in both modes; a flat-args direct caller is unchanged.
-
-THE CLI SPEAKS THE VENUE'S WIRE 2026-10-31: `crates/cli` emitted the retired `turn.submit` and read a `value.reply` that no longer exists — it was the last thing in this repo believing the verb survived. It now emits `ui:turn.submit` with the payload a page sends (`channel_id` from `--session`, `member_id` from the new `--member`, `user_message`, `event: ui:turn.delta`, and the venue's `mounts` table from the config's `venue` node — ADR-0001 §7, because gravity refuses to guess a language→type match), reads the deltas back under the stripped name, and takes its end from `turn.done` / `turn.error` (the latter's `detail`, falling back to the venue's `message`). A `--session` that is not a channel id is now a USAGE failure (exit 2) decided before a socket opens. `venue_client` 6/6 with the fake venue answering the real event names and asserting the payload, including that the mount table rides the call.
-
-WHAT THE SMOKE FOUND, AND STILL OWES: `scripts/smoke-venue.sh` still hands prism `GRAVITY_STORE_URL` / `GRAVITY_ENDPOINT` / `GRAVITY_MODEL` / `GRAVITY_KEY_ENV` / `GRAVITY_MEMORY_SCOPE`, which no longer exist — the deployment facts are ROWS (ADR-0007), and a fresh deployment now has NO way to write them from outside the process: the management face ADR-0007 rulings describe (`ui:gravity-model` → a layout → its buttons emit ordinary events) is not built, and this repo refuses an admin HTTP verb on principle. Until it exists the smoke cannot pass, because a turn on a fresh venue fails with "no settings row". Next unit: the management event (one door that writes `settings`/`models` for a bound user, behind prism's auth declaration) so a deployment can be configured the way the model says it is — or, if that is refused, the smoke script says plainly which rows it could not write.
-
-THE CONFIGURATION DOOR, AND THE SMOKE RUNS AGAIN 2026-10-31 (closing the entry above the same day): `ui:gravity-model.save` is declared beside the turn (`on_as` in `register`, handler `save` in the guest) with `{"ui:gravity-model.save": true}` in the auth map; payload `{collection: "settings"|"models", id, doc}`, answer `ui:gravity-model.saved` / `ui:gravity-model.error`, and a refusal NAMES the missing keys. `turn_booth::a_fresh_deployment_is_configured_through_its_own_door` proves the whole shape: a turn on an unconfigured deployment refuses with "no settings row", two saves make it work, a wrong collection and a partial document are refused by name, and both ends arrive as EVENTS. `scripts/smoke-venue.sh` now seeds through that door with a WS client (python `websockets`), passes no `GRAVITY_*` deployment variable to prism except the two spawn specs, and PASSES end to end: stub provider → mem-server → prism → door → the real CLI (`reply 'hello world'`) → k10r session `['hi', 'hello world']` → graph `['alice', 'github-issues', 'tea'] / ['likes']`. Still owed from ADR-0007 §4: the SCREEN (`ui:gravity-model` answering a layout whose buttons emit these events) — the vocabulary is fixed now, so the screen only has to draw it.
-
-THE SCREEN DRAWS 2026-10-31 (ADR-0007 §4's other half): `ui:gravity-model` (handler `screen`, `on_as("ui:gravity-model", "device", "screen")`, auth on) answers ONE batch of frames into the caller's `slots.rack` — a form per table, prefilled from the rows, submitting the BARE `gravity-model.save` (a page's uplink carries no marker; the venue adds `ui:`). `collection`/`id` ride as `text` nodes bound as form fields (the vocabulary has no hidden field), and the door now accepts fluxen's form payload `{field: {data, payload}}` beside the direct row, coercing the declared U64 fields (an input's text is a string, a `number` input a float, a row's width is 8 bytes). `turn_booth::the_screen_draws_the_forms_that_write_the_rows` proves it end to end inside the realm (empty forms → a click-shaped save → re-draw with the saved values → a turn runs), and `smoke-venue.sh` asks for the screen over the real venue and asserts the two forms and their destination before configuring anything. NOT verified, and owed: the browser RENDER — the frames match fluxen's `Accrete` model field by field, but no host page has drawn them; and a save does not re-draw by itself (the page asks again).
-
-THE SCREEN IS A TREE 2026-10-31 (the browser found what the realm test could not): pressing `manage` twice put a second pair of forms under the first — `append` is the only instruction that grows a list, and these rows carry no id (a config screen is two fixed forms, not a stream), so every answer stacked. Ids would not fix it either: the second append is a duplicate-row-id rejection. The screen now answers with `create` — the same root the shell draws on `ui:connect`, forms as children of its body case (`frame_root(forms)`) — so asking twice replaces the root and a screen is always exactly one screen. The rack, the `admin` slot and the `slots.rack` argument are gone with it: a click never could name a slot, and what a screen looks like is the booth's own business. Verified in a real browser (system chromium over CDP): connect → `manage` → two prefilled forms (settings shows the store URL the deployment holds) → edit the alias → save → ask again → same two forms, the new value, no third pair. `turn_booth::the_screen_draws_the_forms_that_write_the_rows` holds the same two things in the realm (one `create`, and a second ask that does not stack). The save/re-draw question CLOSED the same day as a non-goal: re-drawing would only paste back the values the person just typed and take the focus with it, so the screen stays as it is after a save (ask again to see the rows).
-
-THE REFUSAL IS VISIBLE 2026-10-31 (the hole the screen left open): a refused save was indistinguishable from nothing happening. `save` emitted `ui:gravity-model.error` with a `detail`, and the venue fed a non-list payload into a slot named after the event — no node binds it, and it could never have landed even if one did. The screen now carries a NOTICE AREA: a float holding a rack bound to the fixed slot `notice`, above the forms, taking no room while empty (`frame_notice`, `frame_root`). A refusal appends the same detail there as a row, so the line a program already got is a line a person can read.
-
-The area carries NO lifecycle in the frame — the 2026-10-31 ruling is that the venue says the message and the UI decides how long, how it enters, whether it rotates, and what holds it still. That decision lives in fluxen's rack `view` (fluxen ADR 0024): `exclusive` + `fade` + `scroll: none` + `play: rotate` + `pause: click`. Gravity's vocabulary gained exactly one event (`ui:gravity-model.notice`) and one slot name (`notice`); nothing about duration, order or animation crosses the wire. Rows are never removed by the renderer, so the slot keeps the history and the area simply stops showing what it has shown.
-
-Gates: `turn_booth::the_screen_draws_the_forms_that_write_the_rows` asserts the area exists (exclusive, rotate, no scrollbar) and `turn_booth::a_fresh_deployment_is_configured_through_its_own_door` asserts a refusal emits exactly one row into `notice`, with an id and the offending key named in the text. gravity 72/0, fluxen ui-core 10/0 + accrete `rack_view` 4/0, clippy 0. Browser-measured (chromium over CDP): no news → the area is 0px tall; a refusal → one readable line (`save: \`models\` needs endpoint, model, key_env`); it leaves after its turn; two refusals queue (first in, first read, the second waits behind it); a click holds the line and a second click lets the queue finish.
-
-THE PAGE CAN SPEAK, AND NOBODY TYPES THEIR OWN NAME 2026-11-04 (the composer, and the identity seam under it): the home page's conversation column gained the one part it never had — `frame_composer()`, a form whose uplink is the bare `turn.submit` and whose ONLY field is `user_message`, drawn under `frame_messages`. WHO is speaking and WHICH conversation are deliberately not fields: a page has nothing with which to claim another person, and a channel is the application's business (prism ADR-0018), not something a form fills in.
-
-The turn now takes the speaker from the venue, as prism ADR-0017 §7's amendment says it should: every page event arrives with `sender {device, user}` mounted, and k10r's member id IS the user's uuid (k10r ADR-0025), so `turn` reads `sender.user` and refuses BY NAME when the connection is anonymous. A DIRECT caller — the CLI, a sibling booth, the realm test seam — has no envelope to stamp and names `member_id` itself: that is the caller declaring its own identity, not a form claiming somebody else's. Both are one line of precedence, envelope first.
-
-WHICH conversation, when the caller is a page: `channel_id` in the args still wins (the CLI passes it), and with no arg the turn asks the store for the member's own channels (`GET /members/{id}/channels`) and takes the first. That is not a product concept reaching the booth: the STORE's `channel` is a container an application writes turns into (k10r's namespace), and a deployment serving one conversation names one and never shows it.
-
-There is no channel view to build here, and this booth has no channels in its core. A person talks to the model; when a person needs another person the MODEL speaks — it notifies, no meeting is scheduled, a proposal goes to whoever the topic's topology names, people answer or vote where they already are, and the system revises and pushes again until it converges (the wiki's 《液态化》; gravity ADR-0006 argues the plane-level half). Channel-shaped conversation is an application's choice that could be built on this stack later, and prism ADR-0018 §2–3, §5–6 record the split: the venue stamps who, the application owns which, the store holds the container.
-
-Two seams moved with it, both because the code was older than the stores it talks to. k10r's member ids are identities, not counters, so `gravity_core::surface` (trait, HTTP impl, `TurnInput`) carries `Uuid7` and the tests write as k10r's default member. And this repo's okm pin was behind the junction retirement (okm b996915: a many-to-many relation is a collection, no `0x5nnn`), so the storage schema's `junction_base` is gone and the lock is refreshed — gravity builds against the okm its store already uses instead of an older one.
-
-Gates: gravity 91/0 (`turn_booth` 20/20 still proves the envelope, the streaming round trip and the screen), clippy `--all-targets` 0. OWED: the browser render of the composer — the frames are the vocabulary the screen already uses, but no host page has drawn this one yet.
-
-THE COMPOSER DRAWS, AND THE PAGE'S OWN WORDS REACH THE STORE 2026-11-05 (the OWED render, and the two defects it existed to find): a real deployment — k10r, prism serving the renderer bundle, a chromium over CDP — typed into the composer and clicked its button, and the answer came back as bubbles. Getting there cost two fixes that no test could have named, because both live in the seam between what fluxen SENDS and what a booth READS.
-
-A form's uplink is `{field: {data, payload}}` (fluxen's message envelope), and `turn` read `args["user_message"].as_str()`, so every submit from a page died with `turn: missing user_message` while every direct caller was fine. `text_field` unwraps `data` — the same rule `write_row` already applied to the deployment forms, now stated once as a helper and used by both the gate and the opening bubble. A bare string still passes, which is what the CLI, a sibling booth and the realm test seam send.
-
-The page also could not name a `protocol`: a form's uplink carries its fields and nothing else, and the turn's default was the DATA protocol, so a page's submit was refused with `a delta consumer must name the event its chunks are spoken as`. The protocol is now decided in ONE place (`draws`), used by both the frames and the end: an explicit `protocol` wins; failing that a named `event` means the caller wants deltas (the CLI and prism's turn test send exactly that); with neither the turn DRAWS, because a renderer is the one caller that cannot say so. Two call sites computing this separately is what let the first version of the fix break twelve turn tests: they name `event` and no protocol.
-
-A fresh deployment still needs its two rows before any turn runs, and the refusal names them. They are written through the application's own door (`ui:gravity-model.save`, both shapes: the screen's fields and a direct `{collection, id, doc}`) — measured, not asserted: `models` 1 plus `settings` 1, then a turn.
-
-Gates: gravity 91/0 (`turn_booth` 20/20), clippy for the touched crate 0. Browser-measured end to end: real keystrokes and a click produced `turn.opened`/`turn.done` and left the pair in k10r (`user` "composer probe: does this reach the store?", `assistant` a stub model's reply), five turns deep by the end of the check.
-
-OPEN, measured, not fixed: in ONE page, the same patch frame is delivered more than once and the multiplicity GROWS with each turn (1× on the first turn of a page, 2×/3× on the third), so a second answer's text reads `Hello.Hello. The composer works: …` on screen. The bubbles are addressed per turn (`<turn>_<n>`), so this is not the constant-region defect; the standing suspicion is one delivery path per `/channel` connection (`ui_conns` is keyed by connection, and the fan-out matches by device). Measure in a clean venue with ONE tab: the probe that found it had six.
-
-THE SHELL DECLARES THE PLATFORM'S AUTH REGION 2026-11-06: prism's `auth` booth draws the login surface itself, so the shell's whole cost is one region and one door — a `placeholder` bound to the `auth` slot (the node that renders a data slot as a live node) inside a `float.auth`, plus a zero-field form in the navbar whose `dest` is `auth.request`. Both are content (a frame the shell emits on `ui:connect`), not logic: the shell still knows nothing about passwords, tokens or who is bound — it names a slot and a door, and the platform answers. Where the panel STANDS is prism's `assets/app.css` (fixed, centred, z 50), per the rule that a page's arrangement belongs to the page's host. Measured in headless chromium against the real stack: the door draws a two-field form, `{mode:"signup"}` three, and a filled submit lands on "signed in as … / sign out".
-
-AUTH RIDES THE ROUTE DECLARATION 2026-11-06: the turn booth's gated events are declared where the event is declared — `.on_as("ui:turn.submit", "device", "turn").gated()`, and the same for `ui:gravity-model.save` and `ui:gravity-model`. The guest binary no longer carries an auth table keyed by event (`.auth({...})` is deleted from `turn.rs`, and induction's `Schema.auth` with it): the guest names entries, the host names events, and the gate lives with the name that knows which event it is.
-
-
-## Open items, measured 2026-11-09 (no phase owns them yet)
-
-- **CANCELLATION IS A MARKER (ADR-0008) — LANDED 2026-11-09.** One `cancellations` collection in this type's own ns, addressed `(kind, channel, turn)`; `ui:turn.cancel` is declared KEY-LESS (`crates/booth/src/lib.rs`) so the event lands on the type's singleton instance — the only instance that is never mid-turn, because a delivery to the busy one waits behind it (measured: the same entry CALLED on that instance overlaps, an event does not). The handler refuses an unbound sender and records `{at, by, user}`; the turn reads the row at its chunk boundary — `stream_answer`'s loop, per chunk — and honours it only when `user` names its own member, so a stranger's row stops nothing. A cancelled turn appends nothing and closes no turn; its end rides `ui:turn.done` with `reason: "cancelled"` (no new vocabulary, no `cancelled: true` flag). Gate: `a_cancelled_turn_stops_and_closes_no_turn` (turn_booth.rs — venue route, both halves concurrent) and the suite 21/21. CARRIER RETIRED 2026-11-09 (ADR-0008 rewritten): the stored marker, its collection declaration and the key-less `ui:turn.cancel` route are GONE; the turn polls `ctx.stop.poll` at its chunk boundary (induction arm → effector bridge → aura's bit) and clears it when the turn ends, and the venue is what sets the bit (`Realm::stop_set`). `a_cancelled_turn_stops_and_closes_no_turn` now drives the door instead of an event. FORCED STAGE LANDED 2026-11-09 (aura ADR-0047 stage two + induction ADR-0003 + effector's `Frame::Interrupt`): the provider stream is no longer read on the turn's own thread — `Pump` owns `Live` on a worker and the turn waits with a 50 ms tick, so a stop ends a turn parked inside one pull instead of waiting for the provider. A stop before the first token ends the turn the same way (empty reply, `cancelled`, log kept OPEN), and the CONNECT is on the worker too: a provider that is slow before its first byte used to hold the turn for the whole header wait (measured 1.5 s) with nobody reading the token, because the worker started after the open. Gate: `a_cancelled_turn_stops_and_closes_no_turn` now asserts the clock as well as the ending — the same provider stalls 1.5 s and the turn ends inside a tick. Tail branches take the same call's token and stop at their next chunk: a cancelled turn drops their receivers, so a branch that kept pulling would write a summary nobody reads and pay the provider for it. They still open on their own threads — the branch is maintenance and nothing waits on it — but it no longer runs to the end of a summary for a turn that is already gone. and the CLI sends `{dest: "turn.cancel", data: {}}` — the venue's uplink shape, the one prism actually reads. PRISM SERVES IT (2026-11-09): its `/channel` uplink matches the name to `gravity_booth::CANCEL_EVENT` and calls `stop_set` + `stop_interrupt` on the sender's own instance (`ui_leg.rs::a_cancel_sets_the_stop_bit_on_the_senders_own_instance` locks the bit). The CLI's stub venue no longer answers a receipt: a cancel gets NO ANSWER, and what the client observes is the turn ending with `turn.done`/`reason: "cancelled"` — which is also what makes it exit 4, since a cancelled turn is not a completed one (`crates/cli/tests/venue_client.rs`, 6/6).
-- **No idle/no-turn compression trigger.** `STILL OWED` below in Phase 3; re-measured — a content search for `idle|cron|tick` finds only a comment (`crates/booth/src/bin/turn.rs:1858`) and a fixture field (`crates/booth/tests/turn_booth.rs:226`), and no declaration is clock-driven.
-- **`run` for a script that belongs to no skill — LANDED 2026-11-09.** The list carries eleven specs now; `run {code_id, arguments}` dispatches to `run_code`, which is `invoke` minus the skill: the row's own `language` picks the mount, the script rides the call as `args.code`, the row's declared `parameters` are enforced before a node is asked to run anything, and the row records its attempt/success (no skill row exists to count). The two doors share `prepare` — one definition of "ready to run", so neither can drift into running a script with arguments nobody checked. The walk records a bare run like any step ("this turn ran this row" is the same fact), and the composition rule filters singletons as before. Gates: gravity tools 39/39 lib + `turn_booth` 21/21; prism `turn_invoke_skill` 1/1 now drives BOTH doors in one turn — a skill step, then a row named directly — and asserts the skill counted once, the bare row once, and both values reached the model.
-- **ADR-0007's model row promises `affinity`; the declared row has no such field** (`docs/adr/0007-model-configuration-is-gravitys.md:26` vs `crates/booth/src/bin/turn.rs:126-135`, zero `affinity` hits in `crates/`). Either add the cold field or amend the ADR.
-- **The smoke script is not a gate.** `scripts/smoke-venue.sh` exists and no workflow references it (`docs/PLAN.md:343` says so); wiring it needs a job that builds the three repos on fixed ports.
-- **The duplicated patch frame.** `docs/PLAN.md:401` records "OPEN, measured, not fixed" — one patch delivered N times per page, multiplicity growing per turn; the emit path has no dedupe key (`crates/booth/src/bin/turn.rs:285-308`), and the suspicion is one delivery per `/channel` connection, i.e. prism's fan-out, not this repo's speech.
+- A FaaS driver — after the booth path is stable; another driver of the same function, not new code
+- Multi-model routing — after the single-model path is proven; LLM identity stays gravity's, k10r never learns it
