@@ -45,11 +45,29 @@ fn turn_bin() -> String {
 /// What the collector booth saw: the `data` payload of every `ui:` emit, in arrival
 /// order. The renderer's stand-in — a compiled body, because a script would need the frame
 /// vocabulary to say what it observed.
+///
+/// THE VENUE'S HALF OF THE WIRE (ADR-0013 §3). The turn booth declares CBOR
+/// (`register`'s `.encoded(…)`, exactly as production does), so its `data` arrives as
+/// `{"$cbor": "<base64>"}` — the shape the carrier forces on it, since every frame is
+/// decoded into a `serde_json::Value` and a `Value` has no byte string. prism's
+/// `ui::decode_content` unwraps that at its edge; this fixture does the same, so the
+/// assertions below read what a RENDERER finally gets rather than an encoding accident.
+/// A frame that arrives plain (the JSON path) is stored as it came.
 #[derive(Clone, Default)]
 struct Seen(Arc<std::sync::Mutex<Vec<Value>>>);
 
 impl Seen {
-    fn push(&self, value: Value) {
+    fn push(&self, mut value: Value) {
+        if let Some(bytes) = value.get("data").and_then(induction_guest::payload_bytes) {
+            match ciborium::from_reader::<Value, _>(bytes.as_slice()) {
+                Ok(decoded) => {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("data".to_string(), decoded);
+                    }
+                }
+                Err(e) => panic!("the turn emitted an undecodable CBOR payload: {e}"),
+            }
+        }
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1519,8 +1537,9 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
         "appearance is the layout's item template, chosen by selector — no class list here"
     );
     assert_eq!(
-        open[0]["data"]["children"][0]["bind"]["value"]["default"],
-        "hi"
+        open[0]["data"]["children"][0]["source"]["default"],
+        "hi",
+        "a text node's value IS its channel (`/source/default`); the per-node `bind` map is gone"
     );
     // The reply's bubble is created WITH the first chunk (an empty one would linger if the
     // turn failed), then patched BY ROW — so two turns in flight cannot interleave.
@@ -1545,8 +1564,9 @@ async fn the_venue_route_draws_a_turn_nobody_pulls() {
     );
 }
 
-/// The shell that answers `ui:connect` declares the CONVERSATION: one rack over `messages`
-/// whose item templates are the two bubbles, picked by the `selector` a row carries. Without
+/// The shell that answers `ui:connect` declares the CONVERSATION: one `tiles` over `messages`
+/// (the `tiles` is what the retired `rack` became) whose item templates are the two bubbles,
+/// picked by the `selector` a row carries. Without
 /// this the turn's frames name a slot nobody's layout has — and a slot name the layout never
 /// wrote is an error, not a new slot (fluxen ADR 0024's rule, from the other side).
 #[tokio::test]
@@ -1581,20 +1601,17 @@ async fn the_shell_declares_the_conversation() {
     let root = layout.expect("the shell answered the connection");
     let frames = root["data"].as_array().expect("the answer is an action list");
 
-    // Find the conversation rack anywhere in the tree: this test cares that it exists and is
-    // wired to the slot the turn writes, not where in the column it sits.
+    // Find the conversation TILES anywhere in the tree: the retired `rack` is a `tiles` over a
+    // list slot now, and this test cares that it exists and is wired to the slot the turn
+    // writes, not where in the column it sits.
     fn find(node: &Value) -> Option<&Value> {
-        if node["type"] == "rack"
-            && node["bind"]["value"]["source"] == "messages"
-        {
+        if node["type"] == "tiles" && node["source"]["slot"] == "messages" {
             return Some(node);
         }
-        for key in ["children", "item"] {
-            if let Some(list) = node[key].as_array() {
-                for child in list {
-                    if let Some(found) = find(child) {
-                        return Some(found);
-                    }
+        if let Some(list) = node["children"].as_array() {
+            for child in list {
+                if let Some(found) = find(child) {
+                    return Some(found);
                 }
             }
         }
@@ -1603,12 +1620,16 @@ async fn the_shell_declares_the_conversation() {
         }
         None
     }
-    let rack = frames
+    let messages = frames
         .iter()
         .find_map(find)
-        .expect("the layout declares a rack over `messages`");
+        .expect("the layout declares tiles over `messages`");
 
-    let items = rack["item"].as_array().expect("its item templates");
+    // The item templates are the tiles' CHILDREN — the field `item` is gone, and a template is
+    // matched on the row's own `selector`.
+    let items = messages["children"]
+        .as_array()
+        .expect("its item templates");
     assert_eq!(
         items[0]["attrs"]["selector"], "user",
         "the person's bubble is picked by selector, so the application sends rows and no class list"
@@ -1637,11 +1658,33 @@ async fn the_shell_declares_the_conversation() {
         "the bar switches pages from the tab rows: {bar:?}"
     );
     let pager = &column["children"][1];
-    assert_eq!(pager["type"], "pages");
     assert_eq!(
-        pager["display"], "dom",
-        "both pages stay mounted: a turn streams into `messages` while a form is being filled"
+        pager["type"], "tiles",
+        "the pager is the `tiles` that replaced the `pages` node"
     );
+    assert_eq!(
+        pager["attrs"]["window"]["size"], 1,
+        "one page on stage at a time — `window` replaced the `pages` node's `display`"
+    );
+    assert_eq!(
+        pager["attrs"]["step"]["slot"], "page",
+        "which page is on stage is a slot the bar writes and `step` reads: {pager:?}"
+    );
+    assert_eq!(
+        pager["source"]["slot"], "pages",
+        "both pages stay in the slot, staged or not: a turn streams into `messages` while a form is filled"
+    );
+
+    // The platform's region is a `panel` now (the `float` is retired): an overlay triggered by
+    // its slot being non-empty, its body bound to that same slot.
+    let auth = &column["children"][2];
+    assert_eq!(auth["type"], "panel", "the auth region is a panel: {auth:?}");
+    assert_eq!(auth["attrs"]["place"], "viewport");
+    assert_eq!(
+        auth["attrs"]["state"], "bound",
+        "non-empty means on screen — no trigger of its own"
+    );
+    assert_eq!(auth["source"]["slot"], "auth");
 
     let page = |id: &str| -> Value {
         all.iter()
@@ -1661,15 +1704,21 @@ async fn the_shell_declares_the_conversation() {
     let left: Vec<Value> = areas[0]["children"].as_array().unwrap().clone();
     assert_eq!(left[0]["type"], "forcegraph", "the scene is the field: {:?}", left[0]);
     assert_eq!(
-        left[0]["bind"]["value"]["source"], "scene",
+        left[0]["source"]["slot"], "scene",
         "and what it draws is data the deployment pushes, not a picture baked into the layout"
     );
+    assert_eq!(left[1]["type"], "tiles", "under it a menu, in tiles: {:?}", left[1]);
     assert_eq!(
-        left[1]["bind"]["value"]["source"], "menu",
-        "under it a menu, in a rack — where a channel list would sit in a conventional application"
+        left[1]["source"]["slot"], "menu",
+        "where a channel list would sit in a conventional application"
     );
     assert_eq!(
-        areas[1]["children"][0]["bind"]["value"]["source"], "messages",
+        areas[1]["children"][0]["type"], "tiles",
+        "the right area is the conversation, drawn as tiles over its slot: {:?}",
+        areas[1]
+    );
+    assert_eq!(
+        areas[1]["children"][0]["source"]["slot"], "messages",
         "the right area is the conversation: {:?}",
         areas[1]
     );
@@ -1999,7 +2048,7 @@ async fn a_fresh_deployment_is_configured_through_its_own_door() {
         said[0]["data"]["id"].as_str().is_some(),
         "a row without an id is a row the renderer refuses: {said:?}"
     );
-    let line = said[0]["data"]["children"][0]["bind"]["value"]["default"]
+    let line = said[0]["data"]["children"][0]["source"]["default"]
         .as_str()
         .unwrap_or_default();
     assert!(
@@ -2033,50 +2082,75 @@ fn screen_frames(seen: &Seen) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-/// The rack bound to a source, wherever a tree hides it — the notice area is a sibling of the forms,
-/// and a screen is a tree, so the test asks for the container by what it reads rather than by path.
-fn rack_reading(node: &Value, source: &str) -> Option<Value> {
+/// The `tiles` bound to a source slot, wherever a tree hides it — the notice area is a sibling
+/// of the forms, and a screen is a tree, so the test asks for the container by what it reads
+/// rather than by path. (`tiles` is what the retired `rack` became; a node reads a slot through
+/// its `source` now, not through a `bind` map.)
+fn tiles_reading(node: &Value, source: &str) -> Option<Value> {
     let reads = node
-        .get("bind")
-        .and_then(|b| b.get("value"))
-        .and_then(|v| v.get("source"))
+        .get("source")
+        .and_then(|v| v.get("slot"))
         .and_then(Value::as_str)
         == Some(source);
-    if node.get("type").and_then(Value::as_str) == Some("rack") && reads {
+    if node.get("type").and_then(Value::as_str) == Some("tiles") && reads {
         return Some(node.clone());
     }
     for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
-        if let Some(found) = rack_reading(child, source) {
+        if let Some(found) = tiles_reading(child, source) {
             return Some(found);
         }
     }
     None
 }
 
-/// Every `form` node under a tree, depth first: the screen nests its forms in a case, so the test
-/// asks for the forms rather than for a positional path into the layout.
-fn forms_in(node: &Value) -> Vec<Value> {
+/// Every `bundle` under a tree, depth first: the screen nests its forms in a page, so the test
+/// asks for the bundles rather than for a positional path into the layout. A `bundle` is what
+/// the retired `form` node became — it packs its fields into one object and owns the exit.
+fn bundles_in(node: &Value) -> Vec<Value> {
     let mut out = Vec::new();
-    if node.get("type").and_then(Value::as_str) == Some("form") {
+    if node.get("type").and_then(Value::as_str) == Some("bundle") {
         out.push(node.clone());
     }
     for child in node.get("children").and_then(Value::as_array).into_iter().flatten() {
-        out.extend(forms_in(child));
+        out.extend(bundles_in(child));
     }
     out
 }
 
-/// A form field's prefilled value: the form's children carry `bind.value.default` for its fields.
+/// A bundle field's prefilled value: the field is an `input` named by its own `tag`, and what it
+/// offers is its `source.default` (the per-field `{data, payload}` wrapper is gone).
 fn field_default(form: &Value, field: &str) -> Value {
     form["children"]
         .as_array()
         .and_then(|children| {
             children.iter().find(|child| {
-                child["bind"]["value"]["field"].as_str() == Some(field)
+                child["tag"].as_str() == Some(field)
             })
         })
-        .map(|child| child["bind"]["value"]["default"].clone())
+        .map(|child| child["source"]["default"].clone())
         .unwrap_or(Value::Null)
+}
+
+/// ONE CLICK, as the venue delivers it: the bundle's packed `{tag: value}` under `data`, and the
+/// bundle's own `id` in the envelope — `<collection>:<row>` is the address of the row, never a
+/// field. Returns nothing: a save's consequence is the rows, which the screen re-draws.
+async fn click_save(engine: &Engine, seen: &Seen, address: &str, values: Value) {
+    let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
+    Realm::emit(
+        &engine.realm,
+        None,
+        "ui:gravity-model.save",
+        json!({
+            "name": "ui:gravity-model.save",
+            "device": device,
+            "id": address,
+            "sender": { "device": device, "user": TEST_MEMBER },
+            "data": values,
+        }),
+    )
+    .await
+    .unwrap();
+    settle(seen).await;
 }
 
 #[tokio::test]
@@ -2103,28 +2177,48 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
     let pages: Vec<&Value> = frames.iter().filter(|f| f["slot"] == "pages").collect();
     assert_eq!(pages.len(), 2, "home and management: {pages:?}");
     assert!(pages.iter().all(|p| p["data"]["id"].is_string()));
-    // TWO forms, and not the header's: the control that ASKS for the screen is a form too, whose
-    // uplink is the request (`gravity-model`). The save forms are the ones with a row behind them.
-    // The forms live on the management PAGE now, so the search covers every frame's tree.
-    let forms: Vec<Value> = frames.iter().flat_map(|f| forms_in(&f["data"]))
-        .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
+    // TWO save forms, and not the header's: the control that ASKS for the screen is a bundle too,
+    // whose uplink is the request (`gravity-model`). The save bundles are the ones whose `sink`
+    // is the save event. They live on the management PAGE now, so the search covers every
+    // frame's tree.
+    let forms: Vec<Value> = frames.iter().flat_map(|f| bundles_in(&f["data"]))
+        .filter(|f| f["sink"]["slot"] == "gravity-model.save")
         .collect();
-    assert_eq!(forms.len(), 2, "one form per table: {forms:?}");
-    let notice = rack_reading(&frames[0]["data"], "notice")
-        .expect("the screen floats a notice area: a refusal has to reach a person, not only a log");
-    assert_eq!(notice["attrs"]["view"]["layout"], "exclusive", "{notice}");
-    assert_eq!(notice["attrs"]["view"]["play"], "rotate", "{notice}");
+    assert_eq!(forms.len(), 2, "one bundle per table: {forms:?}");
+    let notice = tiles_reading(&frames[0]["data"], "notice")
+        .expect("the screen draws a notice area: a refusal has to reach a person, not only a log");
     assert_eq!(
-        notice["attrs"]["view"]["scroll"], "none",
-        "an area with one line in it does not scroll: {notice}"
+        notice["attrs"]["window"]["size"], 1,
+        "one line on stage at a time — `window` replaced the rack's `view.layout`: {notice}"
+    );
+    assert_eq!(
+        notice["attrs"]["step"]["timer"], 6000,
+        "turned over on a clock — `step` replaced the rack's `view.play`/`every`: {notice}"
     );
     let (models, settings) = (&forms[0], &forms[1]);
-    assert_eq!(field_default(models, "collection"), "models");
-    assert_eq!(field_default(settings, "collection"), "settings");
+    // THE ADDRESS IS THE BUNDLE'S `id` (`<collection>:<row>`), so the pair that used to ride two
+    // `text` nodes bound as form fields now travels with the submission and cannot be retyped.
+    assert_eq!(models["id"], "models:1", "{models:?}");
     assert_eq!(
-        field_default(settings, "id"),
-        "1",
-        "settings is row 1 by construction"
+        settings["id"], "settings:1",
+        "settings is row 1 by construction: {settings:?}"
+    );
+    assert_eq!(
+        settings["attrs"]["submit"],
+        json!(["button"]),
+        "a settings form sends on the button, not on Enter: {settings:?}"
+    );
+    // The row's fields are the inputs, each named by its own `tag` — the name the bundle packs.
+    let tagged: Vec<&str> = models["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|child| child["tag"].as_str())
+        .collect();
+    assert_eq!(
+        tagged,
+        ["alias", "endpoint", "model", "key_env", "weight", "enabled"],
+        "the model form offers its row's keys, in order: {models:?}"
     );
     for field in ["endpoint", "model", "key_env"] {
         assert_ne!(
@@ -2134,40 +2228,41 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
         );
     }
 
-    // A CLICK SENDS THE FORM SHAPE, not the row shape: fluxen builds `{field: {data, payload}}`,
-    // and the door unwraps it (numbers included — an input's text is a string, a number input a
-    // float, and the declared width is 8 bytes).
-    drive(
+    // A CLICK SENDS THE BUNDLE'S PACK, not the row shape: `{tag: value}` under `data`, with the
+    // row's ADDRESS in the envelope's `id` (`models:1`). A number input sends a float and the
+    // declared width is 8 bytes, so the door coerces in one place.
+    click_save(
         &engine,
-        "save",
+        &seen,
+        "models:1",
         json!({
-            "collection": { "data": "models" },
-            "id": { "data": "1" },
-            "alias": { "data": "default" },
-            "endpoint": { "data": endpoint },
-            "model": { "data": "test-model" },
-            "key_env": { "data": "GRAVITY_TEST_KEY" },
-            "weight": { "data": 1.0 },
-            "enabled": { "data": 1 },
+            "alias": "default",
+            "endpoint": endpoint,
+            "model": "test-model",
+            "key_env": "GRAVITY_TEST_KEY",
+            "weight": 1.0,
+            "enabled": 1.0,
         }),
     )
-    .await
-    .expect("a form's payload writes the model row");
-
-    drive(
+    .await;
+    click_save(
         &engine,
-        "save",
+        &seen,
+        "settings:1",
         json!({
-            "collection": { "data": "settings" },
-            "id": { "data": "1" },
-            "store_url": { "data": store_url },
-            "memory_scope": { "data": 37.0 },
-            "memory_format": { "data": "plaintext" },
-            "default_model": { "data": "1" },
+            "store_url": store_url,
+            "memory_scope": 37.0,
+            "memory_format": "plaintext",
+            "default_model": 1.0,
         }),
     )
-    .await
-    .expect("a form's numbers reach a U64 field");
+    .await;
+    let saved = seen.all("ui:gravity-model.saved");
+    assert_eq!(
+        saved.len(),
+        2,
+        "both clicks were written, not refused: {saved:?}"
+    );
 
     // And the screen now shows what the rows hold: the same tree, the current values. Asking a
     // second time REPLACES the root, so this is also the regression guard against a screen that
@@ -2182,8 +2277,8 @@ async fn the_screen_draws_the_forms_that_write_the_rows() {
         1,
         "one tree per answer — the rest are the pages and the bar's items: {frames:?}"
     );
-    let redrawn: Vec<Value> = frames.iter().flat_map(|f| forms_in(&f["data"]))
-        .filter(|f| f["bind"]["value"]["dest"] == "gravity-model.save")
+    let redrawn: Vec<Value> = frames.iter().flat_map(|f| bundles_in(&f["data"]))
+        .filter(|f| f["sink"]["slot"] == "gravity-model.save")
         .collect();
     assert_eq!(redrawn.len(), 2, "the second ask did not stack a second pair: {redrawn:?}");
     let (models, settings) = (&redrawn[0], &redrawn[1]);

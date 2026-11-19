@@ -29,9 +29,10 @@
 //! closing record — its rows stay OPEN, working state the projection skips.
 //!
 //! Args (the envelope's `data`, or the flat call of a direct caller):
-//! `{"channel_id", "user_message", "store_url", "endpoint", "model",
-//! "key_env"}`, plus the output shape — `protocol: "fluxen"` with `slots {rack, text}`,
-//! or `event` naming the event raw deltas are spoken as. The envelope's OWN `channel_id`
+//! `{"channel_id", "member_id", "user_message"}` — the conversation, the speaker, the text,
+//! and nothing about the deployment, which is a row (ADR-0007) — plus the output shape:
+//! `protocol: "fluxen"` for frames into the slots the booth's own layout declares, or
+//! `event` naming the event raw deltas are spoken as. The envelope's OWN `channel_id`
 //! is an ADDRESS (a device, text) and is a different fact from the conversation's
 //! conversation's own ids inside `data`. The venue addresses DEVICES, never channels (prism
 //! ADR-0018: a channel is an application's business, the transport knows devices); the turn
@@ -39,6 +40,7 @@
 
 use anyhow::Context;
 use gravity_booth::tools::Doors;
+use gravity_booth::wire;
 use gravity_core::surface::{Kind, MemoryFormat, Role};
 use induction_guest::{Ctx, Guest};
 use serde_json::{json, Value};
@@ -59,6 +61,12 @@ fn main() -> anyhow::Result<()> {
         // subscription and the realm names the instance by the same address, so the
         // handler runs the turn to its end. There is no producer binding: a stream this
         // booth no longer owns is a stream nobody has to pull.
+        //
+        // NO CODEC IN THIS REGISTRATION: the codec is not per request. This booth declared
+        // one when it entered (`register`'s `.encoded(…)`, `wire::DECLARED`), the carrier
+        // echoed it back as `INDUCTION_ENCODING`, and every frame it emits is that codec.
+        // The venue transcodes for each client — codec is per LEG, never end-to-end
+        // (ADR-0013 §2).
         .on("turn", |ctx: &mut Ctx, args: Value| run(ctx, &args))
         // THE OTHER HANDLER: where a deployment is configured. The facts are rows in this type's
         // ns (below), so something outside the process has to be able to write them — and this
@@ -411,8 +419,8 @@ enum Out<'a> {
 /// that, an `event` is a request for deltas — a program that names the event its chunks are
 /// spoken as has already said which of the two it wants, and the CLI and prism's turn test send
 /// exactly that. With neither marker the turn DRAWS, because a page is the one caller that
-/// cannot say so: a form's uplink carries its fields and nothing else (fluxen builds
-/// `{field: {data, payload}}`), so demanding a protocol of it would mean a hidden field whose
+/// cannot say so: a bundle's uplink carries its packed fields and nothing else (fluxen builds
+/// `{tag: value}`), so demanding a protocol of it would mean a hidden field whose
 /// only job is to tell the application what kind of surface is looking at it.
 fn draws(args: &Value) -> bool {
     match args.get("protocol").and_then(Value::as_str) {
@@ -450,18 +458,21 @@ fn awaiting_of(value: &Value, args: &Value) -> Option<Value> {
     }))
 }
 
-/// The uplink a form's answer takes. A control's target is `dest` and never `event`
+/// The uplink a form's answer takes. A control's target is its `sink` and never `event`
 /// (acCrete ADR-0023: downlink writes a slot, uplink calls a handler, and the two are
 /// not symmetrical); the venue prefixes it, so this is `ui:run.answer` on the wire.
 const ANSWER_DEST: &str = "run.answer";
 
 /// A waiting run, as PAGE.
 ///
-/// One form per waiting step, and the form carries its ADDRESS in its own `id`
-/// (`<run>/<step>/<pass>/<attempt>`). Submitting sends
-/// `Outflow { dest, id, data }` — the address rides the answer itself, which is what
-/// makes a batch of answers and a second device ordinary traffic instead of a
-/// guessing game about which chat message meant what.
+/// One `bundle` per waiting step, and the bundle carries its ADDRESS in its own `id`
+/// (`<run>/<step>/<pass>/<attempt>`). Submitting sends `Outflow { dest, id, data }` — the
+/// address rides the answer itself, which is what makes a batch of answers and a second
+/// device ordinary traffic instead of a guessing game about which chat message meant what.
+///
+/// Two things moved in fluxen ADR 0032 and both are load-bearing here: a field is named by
+/// its own `tag` (the bundle packs `{tag: value}`; the field's `sink` is no longer its name),
+/// and the exit belongs to the bundle (`sink`), not to each field.
 fn request_forms(awaiting: &Value) -> Vec<Value> {
     let run_id = awaiting.get("run_id").and_then(Value::as_u64).unwrap_or(0);
     let empty = Vec::new();
@@ -485,61 +496,51 @@ fn request_forms(awaiting: &Value) -> Vec<Value> {
                 .unwrap_or(&empty_fields)
             {
                 let name = field.get("name").and_then(Value::as_str).unwrap_or("");
-                // The declared kind and its options ride `payload`: the field widget
-                // draws what the FORM said, not what gravity guesses. `type` is the
-                // WIDGET's (accrete's `JsType`), which is a smaller vocabulary than the
-                // plan's — `choice` has no form widget yet (a `select` reads its options
-                // from a list slot and writes a destination, not a form field), so it
-                // falls back to text rather than drawing something that cannot answer.
+                // The declared kind decides the WIDGET (`source.type`), which is accrete's
+                // vocabulary (`JsType`), smaller than the plan's. `choice` has no form
+                // widget: a `select` draws its rows from a LIST slot (`options`) and the
+                // plan's options live in its declaration, not in a slot — so a choice falls
+                // back to text rather than drawing a select nobody can pick from.
                 let declared = field.get("type").and_then(Value::as_str).unwrap_or("string");
-                // A choice is a SELECT, and its options are the plan's: fluxen reads
-                // them out of the field's own declaration (`payload.options`) when the
-                // binding is a form `field`, and writes the picked name into the form.
-                children.push(if declared == "choice" {
-                    json!({
-                        "type": "select",
-                        "id": name,
-                        "bind": { "value": {
-                            "kind": "field",
-                            "field": name,
-                            "payload": field.clone(),
-                        }},
-                    })
-                } else {
-                    let widget = match declared {
-                        "integer" | "number" => "number",
-                        "bool" => "bool",
-                        _ => "text",
-                    };
-                    json!({
-                        "type": "input",
-                        "id": name,
-                        "bind": { "value": {
-                            "kind": "field",
-                            "field": name,
-                            "payload": field.clone(),
-                            "type": widget,
-                        }},
-                    })
-                });
+                let (widget, blank) = match declared {
+                    "integer" | "number" => ("number", json!(0)),
+                    "bool" => ("bool", json!(false)),
+                    _ => ("text", json!("")),
+                };
+                children.push(json!({
+                    "type": "input",
+                    // THE FIELD'S NAME IS ITS TAG, not an address: this is the key the
+                    // bundle packs, and it is the only thing that makes the answer readable
+                    // (`{branch: "left"}`, not `{<slot>: "left"}`).
+                    "tag": name,
+                    "source": { "default": blank, "type": widget },
+                }));
             }
             children.push(json!({
                 "type": "button",
                 "attrs": { "oneshot": true },
-                "bind": { "value": { "kind": "submit", "default": "Send" } },
+                // A button's label is its `source`; its `sink` is what makes it the bundle's
+                // confirm key (a button with no sink is not drawn at all).
+                "source": { "default": "Send" },
+                "sink": {},
             }));
             json!({
                 // THE STREAM, not a region of our own: a form a person must answer is
-                // part of the conversation, and the rack already draws it (selector
+                // part of the conversation, and the tiles already draw it (selector
                 // `assistant`: the deployment is the one asking). No new slot, no new
                 // template — the message list is where an exchange belongs.
                 "action": "append",
                 "slot": MESSAGES_SLOT,
                 "data": {
-                    "type": "form",
+                    // A BUNDLE, not a `form`: it packs these fields into one object and
+                    // owns the exit. `id` is this submission (the address), never a field.
+                    "type": "bundle",
                     "id": address,
-                    "attrs": { "selector": "assistant" },
-                    "bind": { "value": { "kind": "dest", "dest": ANSWER_DEST } },
+                    // WHEN it leaves. Enter is the chat gesture and the button is the
+                    // visible one; a bundle that declared only `enter` would not DRAW the
+                    // button.
+                    "attrs": { "selector": "assistant", "submit": ["enter", "button"] },
+                    "sink": { "slot": ANSWER_DEST },
                     "children": children,
                 },
             })
@@ -605,7 +606,59 @@ fn emit(
         envelope["device"] = json!(device);
     }
     envelope["data"] = data;
-    ctx.emit(event, envelope)
+    emit_frame(ctx, event, envelope)
+}
+
+/// THE ONE PLACE A FINISHED FRAME IS HANDED TO THE GUEST — and therefore the one place the
+/// CONTENT CODEC applies (ADR-0013).
+///
+/// gravity has two content modes (text, accrete frames) and two encodings (JSON, CBOR);
+/// encoding is a transport axis, so it lives here rather than in either mode, and every
+/// caller of [`emit`] — both modes, every event — inherits the same answer. JSON is
+/// today's frame, unchanged; CBOR is the same content encoded once and handed over as
+/// bytes, which the receiving side recognizes by the payload's shape, never by
+/// configuration.
+///
+/// WHICH answer is the booth's DECLARATION ([`wire::declared`]): what this process told its
+/// venue it can produce. It is fixed for the process's life — a request does not renegotiate
+/// it, and nothing about a client's handshake reaches this line. The venue transcodes for
+/// whatever each client negotiated.
+fn emit_frame(ctx: &mut Ctx, event: &str, envelope: Value) -> anyhow::Result<()> {
+    ctx.emit(event, carried(envelope, wire::declared())?)
+}
+
+/// The frame as it goes on the venue wire: the JSON path hands the envelope over untouched;
+/// the CBOR path replaces `data` with `{"$cbor": "<base64>"}` and leaves everything else
+/// exactly as it was.
+///
+/// ONLY `data` IS ENCODED, and that is a contract with the venue, not an optimisation: the
+/// head (`name`, `island`, `turn`, `user`/`device`) is what prism ROUTES on, so it has to be
+/// readable without decoding content — a venue that had to unwrap a CBOR document to learn
+/// where a frame is addressed would be a venue with a codec dependency in its router.
+/// `data` is the only field whose value is content, so it is the only field the axis touches.
+///
+/// The wrapper is base64 inside JSON rather than a byte string because the payload is a
+/// `serde_json::Value` at every hop between here and prism — the carrier decodes every guest
+/// frame into one (`effector`'s `carrier/exec.rs`, the `Encoding::Cbor` read arm), and that
+/// type has no bytes variant. See ADR-0013 §3 for what real binary would take.
+fn carried(envelope: Value, codec: wire::Codec) -> anyhow::Result<Value> {
+    match codec {
+        wire::Codec::Json => Ok(envelope),
+        wire::Codec::Cbor => {
+            let mut frame = envelope;
+            let content = frame
+                .get_mut("data")
+                .map(Value::take)
+                .unwrap_or(Value::Null);
+            if let Some(head) = frame.as_object_mut() {
+                head.insert(
+                    "data".to_string(),
+                    induction_guest::cbor_payload(&codec.encode(&content)?),
+                );
+            }
+            Ok(frame)
+        }
+    }
 }
 
 
@@ -624,7 +677,7 @@ fn frame_message(id: &str, selector: &str, text: &str) -> Value {
             "attrs": { "selector": selector },
             "children": [{
                 "type": "text",
-                "bind": { "value": { "kind": "default", "default": text } },
+                "source": { "default": text },
             }],
         },
     })
@@ -632,12 +685,15 @@ fn frame_message(id: &str, selector: &str, text: &str) -> Value {
 
 /// One chunk into the bubble `id` — ADDRESSED BY ROW, not by a shared slot: two turns in
 /// flight patch their own bubbles and cannot interleave.
+///
+/// The pointer is the NODE's wire shape (fluxen ADR 0005): a channel's value IS the channel
+/// since ADR 0031, so the text child's value sits at `/source/default`, not under a `bind`.
 fn frame_chunk(id: &str, chunk: &str) -> Value {
     json!({
         "action": "patch",
         "slot": MESSAGES_SLOT,
         "id": id,
-        "path": "/children/0/bind/value/default",
+        "path": "/children/0/source/default",
         "op": "append",
         "value": chunk,
     })
@@ -676,8 +732,10 @@ fn frames_chunk(turn_id: &str, first: bool, chunk: &str) -> Vec<Value> {
 /// data under `data` and the speaker in `sender` (`{name, sender, data}` — prism ADR-0017's
 /// `ui:` envelope); a direct caller (a test, a sibling booth) sends the args flat. The
 /// hidden parameter is "who wrapped this", so unwrap once here instead of at every field.
-/// The answer's values: `{field: {data, payload}}` in, `{field: value}` out. A caller that
-/// sends bare values (a CLI, a test) is handed back as it came.
+/// The answer's values. A bundle packs `{tag: value}` (fluxen ADR 0032 — the per-field
+/// `{data, payload}` wrapper is gone), so a page's answer is already the values and this is the
+/// identity. A sender that still wraps a field in `{data: …}` is unwrapped: one rule, two
+/// shapes, and no second place that has to know which side of the wire it is on.
 fn answer_values(args: &Value) -> Value {
     let Some(map) = args.as_object() else {
         return args.clone();
@@ -699,11 +757,10 @@ fn payload(envelope: &Value) -> &Value {
         .unwrap_or(envelope)
 }
 
-/// ONE field, TWO shapes: a page's form sends every field as `{data, payload}` (fluxen's message
-/// envelope, the same shape `write_row` unwraps for the deployment forms), while a CLI, a sibling
-/// booth or a test sends the bare string. Unwrapping here is what lets the composer's own words
-/// reach a turn that a direct caller reaches by typing them — read this and the settings form's
-/// unwrap as the same rule, not two exceptions.
+/// ONE field, TWO shapes: a bundle packs its fields as bare values (`{user_message: "hi"}`,
+/// fluxen ADR 0032), while a sender that still wraps one in `{data, payload}` is unwrapped here —
+/// the same rule `write_row` follows for the deployment forms. Unwrapping here is what lets the
+/// composer's own words reach a turn that a direct caller reaches by typing them.
 fn text_field(args: &Value, name: &str) -> Option<String> {
     let value = args.get(name)?;
     match value.get("data").unwrap_or(value) {
@@ -1512,9 +1569,10 @@ const LAYOUT_EVENT: &str = "ui:layout";
 /// The shell: one `create` frame — a heading, the one control that opens management, the empty space
 /// a screen's forms fill, and the notice area that floats above both. A renderer's connection is the
 /// event this answers (prism says `ui:connect` and forwards whatever an application answers, ADR-0017
-/// §8 — the layout is data on the wire). fluxen renders a bare button as nothing (a button IS a
-/// form's submit), so the control is a form with no fields: clicking it submits `{}` to
-/// `gravity-model`, which the venue turns into `ui:gravity-model` with this device as the sender.
+/// §8 — the layout is data on the wire). fluxen draws a button only when it is a bundle's confirm key
+/// (a button with no `sink` is nothing), so the control is a bundle with ONE button and
+/// `submit: [button]`: clicking it sends `{}` to `gravity-model`, which the venue turns into
+/// `ui:gravity-model` with this device as the sender.
 /// Whether the venue drew a frame around this page (prism ADR-0019). The field rides every delivery
 /// the venue makes — top level, so one question has one place — and an OLD venue that does not say
 /// it gets the old behaviour: this booth draws the whole page.
@@ -1553,10 +1611,10 @@ fn shell(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// everything stacked in one column. Two pages live in the frame — home (the field and the
 /// conversation) and management (the model's forms) — and the bar switches between them.
 ///
-/// Management is its own page rather than a panel over the conversation, and the pager keeps
-/// every page MOUNTED (`display: dom`): a turn streams into `messages` while a person may be
-/// filling a form, and a pager that unmounted the home page would leave those frames naming a
-/// slot the layout no longer has.
+/// Management is its own page rather than a panel over the conversation, and the pager holds
+/// every page as a row of `pages` with a window of one: the row that is not on stage is still in
+/// the slot, so a turn streaming into `messages` while a person fills a form keeps landing in a
+/// slot the pager has, and coming back re-renders from it.
 fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
     // THE CONVERSATION PAGE: the split the example uses (examples/yaml/00.main.yaml) — a
     // horizontal case with `stage-split`, a `stage-graph` column on the left and a `stage-stream`
@@ -1576,8 +1634,8 @@ fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
     //     DOM);
     //   - our `home`/`manage` rows land in the HOST's `pages` slot, next to the rows it writes for
     //     its regions;
-    //   - and our own `pages` node bound that same slot, while the host's rows hold our whole tree
-    //     — so the tree contained itself and rendering recursed until the wasm stack died
+    //   - and our own pager bound that same slot, while the host's rows hold our whole tree —
+    //     so the tree contained itself and rendering recursed until the wasm stack died
     //     (`RangeError: Maximum call stack size exceeded`, reported far away in the navbar,
     //     because that is where the stack ran out, not where the loop was).
     //
@@ -1616,12 +1674,12 @@ fn frame_root(forms: Vec<Value>, hosted: bool) -> Vec<Value> {
         json!({ "action": "append", "slot": TABS_SLOT, "data": {
             "id": "home",
             "type": "text",
-            "bind": {"value": {"kind": "default", "default": "对话"}},
+            "source": { "default": "对话" },
         }}),
         json!({ "action": "append", "slot": TABS_SLOT, "data": {
             "id": "manage",
             "type": "text",
-            "bind": {"value": {"kind": "default", "default": "管理"}},
+            "source": { "default": "管理" },
         }}),
     ]
 }
@@ -1636,54 +1694,55 @@ fn frame_navbar() -> Value {
             {
                 "type": "text",
                 "attrs": {"class": ["nogrow"]},
-                "bind": {"value": {"kind": "default", "default": "this deployment"}},
+                "source": { "default": "this deployment" },
             },
             {
                 "type": "select",
                 "attrs": {"horizontal": true},
-                "bind": {
-                    "value": {
-                        "kind": "local",
-                        "slot": PAGE_SLOT,
-                        "path": "/data",
-                        "default": "home",
-                    },
-                    "options": {"kind": "source", "source": TABS_SLOT},
-                },
+                // ONE VALUE, TWO DIRECTIONS (ADR 0031 §2): `source` is the page this bar is
+                // showing, `sink` is the same page written back. Both are LOCAL — the pager
+                // reads the slot this writes, so a click costs no round trip — and the local
+                // write is wrapped as `{dest, id, data}`, which is why the read names a path.
+                "source": { "slot": PAGE_SLOT, "scope": "local", "path": "/data", "default": "home" },
+                "sink": { "slot": PAGE_SLOT, "scope": "local" },
+                "options": { "slot": TABS_SLOT },
             },
             // THE PLATFORM'S ONE CONTROL: it says only "open the region" — prism's auth booth draws
             // whatever goes in it, so the application never holds a login form (ADR-0017 §2).
             {
-                "type": "form",
-                "attrs": {"class": ["nogrow"]},
-                "bind": {"value": {"kind": "dest", "dest": "auth.request"}},
+                "type": "bundle",
+                "attrs": {"class": ["nogrow"], "submit": ["button"]},
+                "sink": { "slot": "auth.request" },
                 "children": [{
                     "type": "button",
                     "attrs": {"oneshot": true},
-                    "bind": {"value": {"kind": "submit", "default": "登录"}},
+                    "source": { "default": "登录" },
+                    "sink": {},
                 }],
             },
         ],
     })
 }
 
-/// The pager: every page stays mounted (`dom`), so a conversation being streamed into one page
-/// survives a look at another.
+/// The pager: every page is a row of `pages`, and a window of ONE shows the page the bar picked
+/// (`step` names the slot the selection lives in — that is what the retired `pages` node was).
+/// The rows stay in the slot whether or not they are staged, so a conversation streaming into
+/// one page keeps landing in it while a person looks at another.
 fn frame_pager() -> Value {
     json!({
-        "type": "pages",
-        "attrs": {"class": ["main", "shrink"]},
-        "bind": {
-            "value": {"kind": "source", "source": PAGES_SLOT},
-            "select": {"kind": "local", "slot": PAGE_SLOT, "path": "/data", "default": "home"},
+        "type": "tiles",
+        "attrs": {
+            "class": ["main", "shrink"],
+            "window": { "size": 1 },
+            "step": { "slot": PAGE_SLOT },
         },
-        "display": "dom",
+        "source": { "slot": PAGES_SLOT },
     })
 }
 
 /// THE LEFT AREA: the scene is a forcegraph, and what it draws is data the deployment pushes
 /// into `scene` as `{nodes, links, focus?}` (fluxen ADR 0018 — a native node, not a canvas
-/// module: the layout lives in wasm, no URL, no options bag). Below it a menu, in a rack, so
+/// module: the layout lives in wasm, no URL, no options bag). Below it a menu, in a tiles, so
 /// the same column that shows the field of things also lists the ways into them — the shape a
 /// channel list would take in a conventional application.
 fn frame_scene() -> Value {
@@ -1705,38 +1764,37 @@ fn frame_scene() -> Value {
                     "fit_padding_px": 56,
                     "link_shape": "straight",
                 },
-                "bind": {"value": {"kind": "source", "source": SCENE_SLOT}},
+                "source": { "slot": SCENE_SLOT },
             },
             frame_menu(),
         ],
     })
 }
 
-/// The menu under the scene: a rack over `menu`, rows appended by the deployment. Its row
+/// The menu under the scene: a tiles over `menu`, rows appended by the deployment. Its row
 /// template is a line of text for now — what a row DOES when clicked is a decision the
 /// deployment owns (an event name, a channel to open), and the shell will not invent one.
 fn frame_menu() -> Value {
     json!({
-        "type": "rack",
-        "attrs": {
-            "class": ["nogrow", "box", "border", "round", "gap"],
-            "view": {"layout": "adaptive", "scroll": "bar"},
-        },
-        "bind": {"value": {"kind": "source", "source": MENU_SLOT}},
-        "item": [{
+        "type": "tiles",
+        "attrs": { "class": ["nogrow", "box", "border", "round", "gap"] },
+        "source": { "slot": MENU_SLOT },
+        // The LAYOUT of a tile (the field `item` used to be): a template, matched on the
+        // row's own selector, with the row replacing its children.
+        "children": [{
             "type": "frame",
             "attrs": {"class": ["nogrow", "horizontal", "center", "gap"]},
             "children": [{
                 "type": "text",
-                "bind": {"value": {"kind": "default", "default": ""}},
+                "source": { "default": "" },
             }],
         }],
     })
 }
 
-/// THE CONVERSATION: a rack over `messages`, with the two bubbles declared ONCE as item
-/// templates. A row appended to `messages` carries a `selector` and the rack indexes these by
-/// it (fluxen rack.rs), so the application decides neither alignment nor accent — it sends rows
+/// THE CONVERSATION: `tiles` over `messages`, with the two bubbles declared ONCE as item
+/// templates. A row appended to `messages` carries a `selector` and the tiles index these by
+/// it, so the application decides neither alignment nor accent — it sends rows
 /// and says what each one IS. `user` is the accented, end-aligned bubble; the second template
 /// carries no selector and is the fallback, which is what the reply and anything else lands on.
 fn frame_stream() -> Value {
@@ -1747,26 +1805,37 @@ fn frame_stream() -> Value {
     })
 }
 
-/// THE COMPOSER: the one place a person's words enter. A form like any other — the uplink is
-/// the bare `turn.submit`, which the venue puts on the plane as `ui:turn.submit` — but with
-/// exactly ONE field: what was said. WHO said it and WHICH conversation it lands in are not the
-/// form's to claim (prism stamps the sender; the channel is the application's own fact), so a
-/// page has nothing with which to speak as somebody else or into somebody else's channel.
+/// THE COMPOSER: the one place a person's words enter. A `bundle` — it packs one field and
+/// owns the exit — whose uplink is the bare `turn.submit`, which the venue puts on the plane as
+/// `ui:turn.submit` and whose ONE field is what was said. WHO said it and WHICH conversation it
+/// lands in are not the form's to claim (prism stamps the sender; the channel is the
+/// application's own fact), so a page has nothing with which to speak as somebody else or into
+/// somebody else's channel.
+///
+/// `submit: [enter, button]` is what makes it a chat box: Enter sends, and the button is drawn
+/// BECAUSE the bundle declares `button` (a button the bundle did not declare is not drawn).
 fn frame_composer() -> Value {
     json!({
-        "type": "form",
-        "attrs": {"class": ["nogrow", "horizontal", "gap", "box", "border", "round"]},
-        "bind": {"value": {"kind": "dest", "dest": "turn.submit"}},
+        "type": "bundle",
+        "attrs": {
+            "class": ["nogrow", "horizontal", "gap", "box", "border", "round"],
+            "submit": ["enter", "button"],
+        },
+        "sink": { "slot": "turn.submit" },
         "children": [
             {
                 "type": "input",
                 "attrs": {"class": ["main"]},
-                "bind": {"value": {"kind": "field", "field": "user_message", "type": "text", "default": ""}},
+                // THE FIELD'S NAME: the bundle packs `{user_message: …}`. The field has no
+                // `sink` of its own — the bundle is the exit.
+                "tag": "user_message",
+                "source": { "type": "text", "default": "" },
             },
             {
                 "type": "button",
                 "attrs": {"oneshot": true, "class": ["nogrow"]},
-                "bind": {"value": {"kind": "submit", "default": "发送"}},
+                "source": { "default": "发送" },
+                "sink": {},
             },
         ],
     })
@@ -1774,13 +1843,10 @@ fn frame_composer() -> Value {
 
 fn frame_messages() -> Value {
     json!({
-        "type": "rack",
-        "attrs": {
-            "class": ["main", "box", "border", "round", "gap"],
-            "view": {"layout": "adaptive", "scroll": "bar"},
-        },
-        "bind": {"value": {"kind": "source", "source": MESSAGES_SLOT}},
-        "item": [
+        "type": "tiles",
+        "attrs": { "class": ["main", "box", "border", "round", "gap"] },
+        "source": { "slot": MESSAGES_SLOT },
+        "children": [
             {
                 "type": "frame",
                 "attrs": {
@@ -1797,9 +1863,9 @@ fn frame_messages() -> Value {
 }
 
 /// THE SLOT WHERE THE DEPLOYMENT SPEAKS TO THE PERSON: one line at a time, floating above the
-/// screen, gone when nobody is looking. The frame carries no lifetime — how long a line stays, how
-/// it enters, whether it turns over, and what holds it still are the RENDERER's business (rack's
-/// `view`, fluxen ADR 0024). The venue only says the line.
+/// screen, gone when nobody is looking. The frame names only the slot (`notice`); the tiles that
+/// draws it sets `window` and `step` (see `frame_notice`), and how a line enters and what holds it
+/// still are the RENDERER's business (fluxen ADR 0024). The venue only says the line.
 const NOTICE_SLOT: &str = "notice";
 
 /// THE SLOT THE DEPLOYMENT DRAWS ITS SCENE IN: whatever the left area shows is content the
@@ -1823,39 +1889,40 @@ const MENU_SLOT: &str = "menu";
 /// region — and knows nothing else about login, which is what keeps the form reusable.
 const AUTH_SLOT: &str = "auth";
 
-/// THE PLATFORM'S REGION, AS AN OVERLAY. A `frame` bound to a source RENDERS the node tree that
-/// slot holds (that is what "frame" means since fluxen ADR 0027 — the old split between a static
-/// `case` and a slot-rendering `placeholder` is gone), so the auth booth's `set` lands here and the
-/// renderer fades it in. The shell names the slot and nothing else — the form, the fields and the
-/// verb behind them are the platform's.
+/// THE PLATFORM'S REGION, AS AN OVERLAY. A `panel` at the viewport, shown while the auth slot
+/// holds anything (`state: bound` — non-empty means on screen), and the body is a `frame` bound
+/// to that slot: whatever the auth booth `set`s there is rendered. (This was a `float`, which
+/// ADR 0031 §3 deleted: it was this panel with no trigger and no mask.) The shell names the slot
+/// and nothing else — the form, the fields and the verb behind them are the platform's.
 fn frame_auth() -> Value {
     json!({
-        "type": "float",
-        "attrs": {"class": ["auth"]},
+        "type": "panel",
+        "attrs": {"class": ["auth"], "place": "viewport", "state": "bound"},
+        "source": { "slot": AUTH_SLOT },
         "children": [{
             "type": "frame",
             "id": "auth-region",
             "attrs": {"class": ["--auth"]},
-            "bind": {"value": {"kind": "source", "source": AUTH_SLOT}},
+            "source": { "slot": AUTH_SLOT },
         }],
     })
 }
 
+/// THE NOTICE AREA: a list slot drawn as tiles, one line on stage at a time, turning over on a
+/// clock (`window: {size: 1}` + `step: {timer}` — the two attributes that replaced the rack's
+/// `view.play`/`every`). The frame carries no lifetime of its own, and it needs no "hide while
+/// empty" rule either: an empty list draws nothing, and an empty box says nothing (ADR 0031 §3).
 fn frame_notice() -> Value {
     json!({
-        "type": "float",
+        "type": "frame",
         "attrs": {"class": ["toast"]},
         "children": [{
-            "type": "rack",
-            "attrs": {"view": {
-                "layout": "exclusive",
-                "enter": "fade",
-                "scroll": "none",
-                "play": "rotate",
-                "every": 6000,
-                "pause": "click",
-            }},
-            "bind": {"value": {"kind": "source", "source": NOTICE_SLOT}},
+            "type": "tiles",
+            "attrs": {
+                "window": { "size": 1 },
+                "step": { "timer": 6000 },
+            },
+            "source": { "slot": NOTICE_SLOT },
         }],
     })
 }
@@ -1877,7 +1944,7 @@ fn say_notice(rows: &mut Vec<Value>, message: &str) -> anyhow::Result<()> {
             "attrs": {"class": ["box", "border", "round", "shadow", "gap"]},
             "children": [{
                 "type": "text",
-                "bind": {"value": {"kind": "default", "default": message}},
+                "source": { "default": message },
             }],
         },
     }));
@@ -1973,9 +2040,13 @@ enum FieldKind {
 }
 
 
-/// One form. `collection` and `id` are TEXT NODES bound as form fields — static labels that travel
-/// with the submit, because a form has no other way to say which row it writes (and an id the
-/// operator could retype would be a way to write the wrong row).
+/// One form. `collection` and `id` are the ROW'S ADDRESS, and they ride the bundle's `id` as
+/// `<collection>:<row>` — the submission's instance, which the venue hands back beside the
+/// payload (`Outflow {dest, id, data}`, the same place a run answer's address travels), so the
+/// pair cannot be retyped and no field has to carry it. fluxen ADR 0032 ended the other way of
+/// saying this: only an `input`/`select` can be a packed field (named by its `tag`), and a
+/// `text` node cannot — so the old "text nodes bound as form fields" is gone, and the two
+/// labels below are labels, not fields.
 fn frame_form(
     collection: &str,
     id: &str,
@@ -1983,9 +2054,9 @@ fn frame_form(
     fields: &[(&str, &str, FieldKind, &Value)],
 ) -> Value {
     let mut children = vec![
-        json!({"type": "text", "bind": {"value": {"kind": "default", "default": heading}}}),
-        json!({"type": "text", "bind": {"value": {"kind": "field", "field": "collection", "default": collection}}}),
-        json!({"type": "text", "bind": {"value": {"kind": "field", "field": "id", "default": id}}}),
+        json!({"type": "text", "source": { "default": heading }}),
+        json!({"type": "text", "source": { "default": collection }}),
+        json!({"type": "text", "source": { "default": id }}),
     ];
     for (name, hint, kind, row) in fields {
         // PREFILL: what the row holds, else the hint the operator reads as an example. A number
@@ -1999,25 +2070,35 @@ fn frame_form(
         };
         children.push(json!({
             "type": "input",
-            "bind": {"value": {
-                "kind": "field",
-                "field": name,
+            // THE FIELD'S NAME IS ITS TAG: the bundle packs `{name: value}`, which is exactly
+            // the row document `write_row` validates.
+            "tag": name,
+            "source": {
                 "type": if *kind == FieldKind::Number { "number" } else { "text" },
                 "default": default,
-            }},
+            },
         }));
     }
     children.push(json!({
         "type": "button",
         "attrs": {"oneshot": true},
-        "bind": {"value": {"kind": "submit", "default": "save"}},
+        "source": { "default": "save" },
+        "sink": {},
     }));
     json!({
-        "type": "form",
-        // The form's own bind is the uplink: the BARE event name, because a page's uplink carries no
-        // marker (prism adds `ui:` on the way in — MODELING's rule).
-        "attrs": {"class": ["box", "border", "round", "shadow"]},
-        "bind": {"value": {"kind": "dest", "dest": "gravity-model.save"}},
+        "type": "bundle",
+        // THE ADDRESS OF THIS SUBMISSION (`<collection>:<row>`), read back by `write_row` from
+        // the uplink's `id`. A bundle's `id` never names a field.
+        "id": format!("{collection}:{id}"),
+        "attrs": {
+            "class": ["box", "border", "round", "shadow"],
+            // A settings form sends on the BUTTON, not on Enter: nothing here is a chat box,
+            // and a stray Enter in a row of numbers should not write the deployment.
+            "submit": ["button"],
+        },
+        // The form's own sink is the uplink: the BARE event name, because a page's uplink
+        // carries no marker (prism adds `ui:` on the way in — MODELING's rule).
+        "sink": { "slot": "gravity-model.save" },
         "children": children,
     })
 }
@@ -2063,12 +2144,10 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
         .or_else(|| envelope.get("id").and_then(Value::as_str))
         .context("answer: neither the envelope nor the payload names the step — a form's id IS its address")?;
     let (run_id, step, pass, attempt) = parse_address(address)?;
-    // WHAT THE PERSON SAID, as values. A form uplink's payload is the field map itself
-    // (`{field: {data, payload}}` — fluxen's Message envelope, where `payload` is the field's
-    // own declaration and `data` is the answer). The run records the answer alone: a plan reads
-    // `$.ask.side`, not `$.ask.side.data`, and nothing downstream has to know the wire's
-    // envelope. Unwrapping a second `data` here read a key the venue never sends, which is why
-    // the first answer in a real browser landed in the log as `null`.
+    // WHAT THE PERSON SAID, as values. A bundle uplink's payload is the packed object itself
+    // (`{tag: value}` — fluxen ADR 0032 §5, no per-field wrapper), which is exactly what a plan
+    // reads (`$.ask.side`). The unwrap stays for a sender that still wraps one field in `{data}`;
+    // the answer's address is the bundle's `id`, read off the envelope below.
     let output = answer_values(args);
     let mounts = mounts_of_settings(&settings, &json!({}));
     // A finished call closes the tasks bound to the code row that ran (ADR-0003 §3) — the
@@ -2154,11 +2233,31 @@ fn parse_address(address: &str) -> anyhow::Result<(u64, String, u32, u32)> {
     ))
 }
 
+/// `<collection>:<row>` — the address a deployment screen's bundle carries as its `id`.
+///
+/// One bundle, one submission, one address; the pack underneath is the row document. The
+/// separator is `:` so it cannot be confused with a run answer's four-part `/` address.
+fn parse_save_address(address: Option<&str>) -> anyhow::Result<(String, u64)> {
+    let address = address.context(
+        "save: the payload names neither `collection` nor `id`, and the delivery carried no \
+         bundle id to read them from",
+    )?;
+    let (collection, id) = address
+        .split_once(':')
+        .with_context(|| format!("save: the bundle's id is `<collection>:<row>`, got {address:?}"))?;
+    Ok((
+        collection.to_string(),
+        id.trim()
+            .parse()
+            .with_context(|| format!("save: the row in {address:?} is not a number"))?,
+    ))
+}
+
 fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     let device = device_of(envelope);
     let user = sender_user(envelope);
     let args = payload(envelope);
-    match write_row(ctx, args) {
+    match write_row(ctx, args, envelope.get("id").and_then(Value::as_str)) {
         Ok(saved) => {
             emit(ctx, SAVED_EVENT, to(user.as_deref(), device.as_deref()), None, saved)?;
             Ok(json!({ "done": true }))
@@ -2188,32 +2287,40 @@ fn save(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
 /// row); `models` takes whatever id the caller names, so a deployment can hold several recipes.
 ///
 /// TWO SHAPES, ONE RULE: a caller hands the row directly (`{collection, id, doc}` — a script, a
-/// test, an AI), or the SCREEN hands the form's own payload, which fluxen builds as
-/// `{field: {data, payload}}`. Unwrapping the second here keeps that difference out of the
-/// validation and out of every future caller.
-fn write_row(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
+/// test, an AI), or the SCREEN hands the bundle's pack, which is `{tag: value}` (fluxen ADR
+/// 0032) — the row document itself, minus the address, which rides the bundle's `id`
+/// (`<collection>:<row>`, handed back as the uplink's `id`).
+fn write_row(ctx: &mut Ctx, args: &Value, address: Option<&str>) -> anyhow::Result<Value> {
     let mut row = args
         .as_object()
         .context("save: the payload is a row document or a form's fields")?
         .clone();
     let explicit = row.remove("doc");
     if explicit.is_none() {
-        // The form's shape: every value is a `{data, payload}` message.
+        // An older/other sender's shape: every value is a `{data, payload}` message. Kept
+        // because it costs one check and a sender that still wraps is not worth refusing.
         for value in row.values_mut() {
             if let Some(data) = value.get("data").cloned() {
                 *value = data;
             }
         }
     }
-    let collection = row
-        .get("collection")
-        .and_then(Value::as_str)
-        .context("save: `collection` is `settings` or `models`")?
-        .to_string();
-    let id = row
-        .get("id")
-        .and_then(|id| id.as_u64().or_else(|| id.as_str().and_then(|s| s.trim().parse().ok())))
-        .context("save: `id` is the row's number (`settings` is 1)")?;
+    // WHERE THE ROW IS: stated by a program, or read off the bundle's id by a screen. Never a
+    // field — a field is a name the pack carries, and the address is not one.
+    let stated = row.contains_key("collection") || row.contains_key("id");
+    let (collection, id) = if stated {
+        let collection = row
+            .remove("collection")
+            .and_then(|c| c.as_str().map(str::to_string))
+            .context("save: `collection` is `settings` or `models`")?;
+        let id = row
+            .remove("id")
+            .and_then(|id| id.as_u64().or_else(|| id.as_str().and_then(|s| s.trim().parse().ok())))
+            .context("save: `id` is the row's number (`settings` is 1)")?;
+        (collection, id)
+    } else {
+        parse_save_address(address)?
+    };
     let kind = match collection.as_str() {
         "settings" => KIND_SETTINGS,
         "models" => KIND_MODELS,
@@ -2221,14 +2328,10 @@ fn write_row(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
             "save: `{other}` is not a collection a deployment configures (`settings`, `models`)"
         ),
     };
-    // A direct caller's `doc` is used as given; a form's fields ARE the doc, minus the address.
+    // A direct caller's `doc` is used as given; a form's pack IS the doc.
     let mut doc = match explicit {
         Some(doc) => doc,
-        None => {
-            row.remove("collection");
-            row.remove("id");
-            Value::Object(row)
-        }
+        None => Value::Object(row),
     };
     if !doc.is_object() {
         anyhow::bail!("save: `doc` is the row's fields, as an object");
@@ -3103,9 +3206,11 @@ mod tests {
     }
 
     /// The form a waiting run sends IS the answer's address: the row lands in the
-    /// conversation, its `id` is the step it answers, and its uplink names the door.
+    /// conversation, its `id` is the step it answers, and its `sink` names the door. The
+    /// fields are named by their own `tag` — not by the slot they land in, and not by the
+    /// bundle's id (fluxen ADR 0032 §2).
     #[test]
-    fn a_waiting_run_is_drawn_as_an_addressed_form_in_the_stream() {
+    fn a_waiting_run_is_drawn_as_an_addressed_bundle_in_the_stream() {
         let waiting = json!({
             "run_id": 17,
             "requests": [{
@@ -3123,46 +3228,354 @@ mod tests {
         let frame = &frames[0];
         assert_eq!(frame["action"], "append");
         assert_eq!(frame["slot"], MESSAGES_SLOT, "the form is a message, not a region");
-        let form = &frame["data"];
-        assert_eq!(form["type"], "form", "accrete's own Form, not ours");
-        assert_eq!(form["id"], "17/ask/0/0", "the address the answer comes back on");
-        assert_eq!(form["attrs"]["selector"], "assistant");
-        assert_eq!(form["bind"]["value"]["dest"], "run.answer");
-        // The widget follows the DECLARED kind, in accrete's smaller vocabulary.
-        let kinds: Vec<&str> = form["children"]
-            .as_array()
-            .unwrap()
+        let bundle = &frame["data"];
+        assert_eq!(bundle["type"], "bundle", "accrete's own bundle, not a form");
+        assert_eq!(bundle["id"], "17/ask/0/0", "the address the answer comes back on");
+        assert_eq!(bundle["attrs"]["selector"], "assistant");
+        // WHEN it leaves, and it is the button it drew: a bundle that declared only `enter`
+        // would not draw a button at all.
+        assert_eq!(
+            bundle["attrs"]["submit"],
+            json!(["enter", "button"]),
+            "enter sends and the button is the one the bundle declared: {bundle}"
+        );
+        // THE EXIT IS THE BUNDLE'S (ADR 0032 §1), and `remote` is the default so it stays off
+        // the wire.
+        assert_eq!(bundle["sink"], json!({ "slot": "run.answer" }), "{bundle}");
+        // The widgets follow the DECLARED kind, in accrete's smaller vocabulary. A choice has
+        // no form widget (a select reads its rows from a list slot), so it is a text field
+        // rather than a select nobody could pick from.
+        let children = bundle["children"].as_array().unwrap();
+        let kinds: Vec<&str> = children
             .iter()
             .map(|child| child["type"].as_str().unwrap_or(""))
             .collect();
-        assert_eq!(kinds, vec!["input", "input", "input", "select", "button"], "{form}");
-        let widgets: Vec<&str> = form["children"]
-            .as_array()
-            .unwrap()
+        assert_eq!(kinds, vec!["input", "input", "input", "input", "button"], "{bundle}");
+        let tags: Vec<&str> = children
             .iter()
-            .filter_map(|child| child["bind"]["value"]["type"].as_str())
+            .filter_map(|child| child["tag"].as_str())
             .collect();
-        assert_eq!(widgets, vec!["text", "number", "bool"], "{form}");
         assert_eq!(
-            form["children"][3]["bind"]["value"]["payload"]["options"][0],
-            "left",
-            "the choice carries its options to the widget: {form}"
+            tags,
+            vec!["branch", "count", "sure", "side"],
+            "a field is named by its tag: {bundle}"
         );
+        let widgets: Vec<&str> = children
+            .iter()
+            .filter_map(|child| child["source"]["type"].as_str())
+            .collect();
+        assert_eq!(widgets, vec!["text", "number", "bool", "text"], "{bundle}");
+        // No field borrows an exit: the pack's shape is `{tag: value}`. (The BUTTON's `sink` is
+        // not an exit for a value — it is what makes it the confirm key.)
+        assert!(
+            children
+                .iter()
+                .filter(|child| child["type"] != "button")
+                .all(|child| child.get("sink").is_none()),
+            "an inner field has no exit of its own: {bundle}"
+        );
+        let button = children.last().unwrap();
         assert_eq!(
-            form["children"][0]["bind"]["value"]["payload"]["type"],
-            "string",
-            "the plan's own declaration rides with the field"
+            button["sink"],
+            json!({}),
+            "a sink is what makes a button the bundle's confirm key"
         );
-        let button = form["children"].as_array().unwrap().last().unwrap();
-        assert_eq!(button["bind"]["value"]["kind"], "submit");
-        assert_eq!(button["bind"]["value"]["default"], "Send", "a label, not a type");
+        assert_eq!(button["source"]["default"], "Send", "a label, not a type");
         assert_eq!(button["attrs"]["oneshot"], true);
 
         assert_eq!(parse_address("17/ask/0/0").unwrap(), (17, "ask".into(), 0, 0));
         assert!(parse_address("17/ask").is_err(), "an address is four parts");
     }
 
+    /// The composer: one tagged field, an exit on the bundle, and BOTH timings — the wire shape
+    /// the chat box depends on. A field that borrowed a slot name as its key, or a button
+    /// without a `sink`, would draw something that cannot send.
+    #[test]
+    fn the_composer_packs_one_tagged_field() {
+        let composer = frame_composer();
+        assert_eq!(composer["type"], "bundle");
+        assert_eq!(composer["sink"], json!({ "slot": "turn.submit" }));
+        assert_eq!(composer["attrs"]["submit"], json!(["enter", "button"]));
+        let field = &composer["children"][0];
+        assert_eq!(field["tag"], "user_message", "the field names itself");
+        assert_eq!(field["source"]["default"], "");
+        assert!(
+            field.get("sink").is_none(),
+            "the field keeps no exit — the bundle is the exit"
+        );
+        let button = &composer["children"][1];
+        assert_eq!(button["sink"], json!({}), "a button with no sink is not drawn");
+        assert_eq!(button["source"]["default"], "发送");
+    }
+
+    /// The chunk pointer names the text child's value where it now lives — `/source/default`,
+    /// with no `bind` map around it (ADR 0031 §2). A pointer one key off is a stream that
+    /// silently appends nowhere.
+    #[test]
+    fn a_chunk_is_patched_into_the_text_childs_source() {
+        let bubble = frame_message("9_1", "assistant", "");
+        assert_eq!(bubble["data"]["children"][0]["source"]["default"], "");
+        let chunk = frame_chunk("9_1", "hi");
+        assert_eq!(chunk["path"], "/children/0/source/default");
+        assert_eq!(chunk["slot"], MESSAGES_SLOT);
+        assert_eq!(chunk["id"], "9_1", "addressed by row, never by a shared slot");
+    }
+
     use super::*;
+
+    /// Every node `type` a frame tree carries, and a refusal of the retired `bind` map,
+    /// wherever either hides. A key that a decoder DROPS (no `deny_unknown_fields`) is the
+    /// failure mode this catches: the frame parses and draws nothing.
+    ///
+    /// A `type` is a NODE's only when the object is one: a channel carries `type` too
+    /// (`source.type` is the widget's `JsType`), and reading that as a node name would make
+    /// this check lie.
+    fn walk(node: &Value, kinds: &mut Vec<String>) {
+        match node {
+            Value::Object(map) => {
+                let is_node = ["attrs", "children", "source", "sink", "tag", "style"]
+                    .iter()
+                    .any(|key| map.contains_key(*key));
+                if is_node {
+                    if let Some(kind) = map.get("type").and_then(Value::as_str) {
+                        kinds.push(kind.to_string());
+                    }
+                }
+                assert!(
+                    !map.contains_key("bind"),
+                    "the `bind` map is retired (ADR 0031 §2): {node}"
+                );
+                for value in map.values() {
+                    walk(value, kinds);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, kinds);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// THE REPRESENTATIVE FRAME SET: one turn's whole surface as one action list (a form, the
+    /// person's line, a chunk, a run's request forms, a notice, and the hosts + settings
+    /// bundle) — the ~10 frames a real answer draws, not a hand-picked scalar. Both the dump
+    /// below and the size measurement use it, so the numbers in ADR-0013 are this set's.
+    fn sample_frames() -> Vec<Value> {
+        let mut frames = frame_root(
+            vec![frame_form(
+                "models",
+                "1",
+                "the model this deployment answers with",
+                &[("alias", "default", FieldKind::Text, &Value::Null)],
+            )],
+            false,
+        );
+        frames.push(frame_message("9_0", "user", "hi"));
+        frames.push(frame_chunk("9_1", "there"));
+        frames.extend(request_forms(&json!({
+            "run_id": 17,
+            "requests": [{
+                "step": "ask", "pass": 0, "attempt": 0,
+                "form": { "fields": [
+                    { "name": "branch", "type": "string" },
+                    { "name": "count", "type": "integer" },
+                    { "name": "sure", "type": "bool" },
+                    { "name": "side", "type": "choice", "options": ["left", "right"] },
+                ]},
+            }],
+        })));
+        frames.push(json!({ "action": "append", "slot": NOTICE_SLOT, "data": {
+            "id": "notice-1", "type": "frame", "attrs": {"class": ["box"]},
+            "children": [{ "type": "text", "source": { "default": "saved" } }],
+        }}));
+
+        // The hosts and the settings bundle are in the list too, so the sample covers what a
+        // person actually walks: shell → hosted region → form → answer.
+        frames.push(json!({ "action": "set", "slot": "", "data": frame_root(vec![], true)[0]["data"] }));
+        frames
+    }
+
+    /// THE WHOLE SURFACE IN ONE ACTION LIST, written where fluxen's own decoder can judge it:
+    ///
+    ///     cd ../fluxen && ./target/debug/stage tojson <printed path>
+    ///
+    /// The assertions here are the cheap half — every node name is one the model still has,
+    /// and no frame carries the retired `bind` map. The model is the half that cannot drift,
+    /// because it is the thing that refuses.
+    #[test]
+    fn the_frames_are_written_for_the_model_to_take_or_refuse() {
+        let frames = sample_frames();
+
+        const CURRENT: &[&str] = &[
+            "frame", "canvas", "forcegraph", "panel", "bundle", "svg", "path", "tiles", "entry",
+            "button", "image", "input", "select", "text", "stamp",
+        ];
+        let mut kinds = Vec::new();
+        for frame in &frames {
+            walk(frame, &mut kinds);
+        }
+        for kind in &kinds {
+            assert!(
+                CURRENT.contains(&kind.as_str()),
+                "`{kind}` is not a node any more: {kinds:?}"
+            );
+        }
+        // Belt and braces for the words that moved rather than vanished.
+        assert!(!kinds.iter().any(|k| k == "rack"), "rack is `tiles`");
+        assert!(!kinds.iter().any(|k| k == "form"), "form is `bundle`");
+        assert!(!kinds.iter().any(|k| k == "pages"), "pages is `tiles` + a window/step");
+        assert!(!kinds.iter().any(|k| k == "float"), "float is `panel` / a frame");
+        assert!(
+            kinds.iter().filter(|k| *k == "bundle").count() >= 3,
+            "the settings form, the composer and the run answer: {kinds:?}"
+        );
+
+        let path = std::env::var("GRAVITY_FRAMES_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join("gravity-accrete-frames.json"));
+        // THE DUMP FOLLOWS THE CONTENT CODEC TOO (ADR-0013): in JSON mode this is the file it
+        // has always been, byte for byte; in CBOR mode it is the SAME list, one CBOR
+        // document — which is what lets the verification decode it back to JSON and hand
+        // the result to `stage tojson` unchanged. A test runs outside a carrier, so nothing
+        // declared a codec: this reads the SERVICE DEFAULT (`GRAVITY_WIRE`), which is what
+        // that variable still means.
+        let codec = wire::declared();
+        let bytes = match codec {
+            wire::Codec::Json => serde_json::to_string_pretty(&frames)
+                .expect("the frame list serializes")
+                .into_bytes(),
+            wire::Codec::Cbor => codec.encode(&Value::Array(frames.clone()))
+                .expect("the frame list encodes as one CBOR document"),
+        };
+        std::fs::write(&path, bytes).unwrap();
+        println!(
+            "accrete frames ({}) → {}",
+            codec.as_str(),
+            path.display()
+        );
+    }
+
+    /// THE WIRE CONTRACT OF THE FUNNEL, both encodings: JSON is the envelope that went in,
+/// field for field (the regression that matters), and CBOR changes exactly ONE field —
+/// `data` — leaving the head readable so the venue can route without decoding content.
+    #[test]
+    fn the_funnel_encodes_only_the_content_and_leaves_the_head_readable() {
+        let envelope = json!({
+            "name": "ui:turn.chunk",
+            "island": "gravity-model",
+            "turn": "7",
+            "device": "d-1",
+            "data": [{ "action": "patch", "slot": "messages", "id": "7_1",
+                       "path": "/children/0/source/default", "op": "append", "value": "!" }],
+        });
+
+        // JSON: untouched. This is today's wire, byte for byte.
+        assert_eq!(
+            carried(envelope.clone(), wire::Codec::Json).unwrap(),
+            envelope
+        );
+
+        // CBOR: the head is the same, `data` is the same CONTENT after one unwrap, and no
+        // field was added or lost.
+        let cbor = carried(envelope.clone(), wire::Codec::Cbor).unwrap();
+        for head in ["name", "island", "turn", "device"] {
+            assert_eq!(cbor[head], envelope[head], "the routing head stays plain: {head}");
+        }
+        assert_eq!(
+            cbor.as_object().map(serde_json::Map::len),
+            envelope.as_object().map(serde_json::Map::len),
+            "the axis swaps one value, it does not reshape the frame"
+        );
+        let bytes =
+            induction_guest::payload_bytes(&cbor["data"]).expect("the carried data is tagged");
+        assert_eq!(
+            ciborium::from_reader::<Value, _>(bytes.as_slice()).expect("decodes"),
+            envelope["data"],
+            "what the venue gets back is what the JSON path sends"
+        );
+    }
+
+    /// THE FOUR SIZES OF ONE FRAME SET, measured rather than asserted — the numbers the
+    /// decision to keep the CBOR path rests on (ADR-0013, "is it worth it"), re-taken with the
+    /// BYTE PATH in place.
+    ///
+    /// The four are one frame at four points, in the order it travels:
+    ///
+    /// (a) pretty JSON, (b) compact JSON — the content as `data`, no codec (today's debug wire);
+    /// (c) the frame AT THE REALM SEAM: the carrier lifted the byte string and re-spelled it as
+    ///     `{"$cbor": base64}` because the host fn it hands frames to takes a `serde_json::Value`;
+    /// (d) the frame ON THE PIPE, before that seam: one CBOR document whose `data` is a real
+    ///     byte string (`0x5a …`), which is what `Ctx::emit_bytes` writes and the carrier reads.
+    ///
+    /// (d) is the one that used to be impossible to measure here — the doc comment on this test
+    /// said a `Value`-typed hop could not carry bytes, so (c) stood in for it. The pipe CAN
+    /// carry them now (`induction_protocol::split_bytes` lifts the byte string out of the tree
+    /// instead of failing); the hop that re-spells it is the REALM SEAM (aura's `dyn_to_json`,
+    /// the `Fn(&Ctx, Value)` bridge), and (c) − (d) is exactly what that seam costs.
+    ///
+    ///     cargo test -p gravity-booth --bin gravity-turn the_four_payload_sizes -- --nocapture
+    #[test]
+    fn the_four_payload_sizes() {
+        let frames = sample_frames();
+        let set = Value::Array(frames.clone());
+
+        let pretty = serde_json::to_string_pretty(&set).expect("pretty").len();
+        let compact = serde_json::to_vec(&set).expect("compact").len();
+        // The content as the booth's declared codec encodes it: this is the document the guest
+        // hands over, at every hop below. (Not "the payload" — the CARRIER of it differs.)
+        let content = wire::Codec::Cbor.encode(&set).expect("cbor");
+
+        // THE FRAME THE GUEST WRITES: `emit_bytes`' own shape — the JSON mapping, which
+        // `CborWriter` resolves into a byte string in the document it puts on stdout.
+        let crossing = json!({
+            "host": { "type": "emit", "args": {
+                "event": "ui:turn.done",
+                "data": induction_guest::cbor_payload(&content),
+            }},
+        });
+        // (d) ON THE PIPE: the same frame as one CBOR document, the payload a byte string.
+        let doc = induction_protocol::cbor_frame(&crossing).expect("frame encodes");
+        let mut pipe = Vec::new();
+        ciborium::into_writer(&doc, &mut pipe).expect("write");
+        let raw_cbor = pipe.len();
+
+        // (c) AT THE SEAM: the carrier's two steps, run for real — lift the byte string out of
+        // the tree (`split_bytes`, the read loop) and put the JSON mapping back where it sat
+        // (`FrameBytes::embed`, the `Value`-typed host's fallback in `emit_bytes`).
+        let (mut at_seam, lifted) = induction_protocol::split_bytes(doc.clone()).expect("splits");
+        let lifted = lifted.expect("the frame carried bytes");
+        assert!(lifted.embed(&mut at_seam), "the payload goes back where it sat");
+        let on_wire = serde_json::to_vec(&at_seam).expect("seam frame").len();
+        let b64 = at_seam["host"]["args"]["data"][induction_guest::CBOR_PAYLOAD_KEY]
+            .as_str()
+            .expect("the wrapper holds base64 text")
+            .len();
+
+        println!(
+            "accrete frame set: {} frames · content {} B · \
+             (a) pretty JSON {pretty} B · \
+             (b) compact JSON {compact} B · \
+             (c) frame at the realm seam ({{\"$cbor\": base64}}) {on_wire} B (base64 alone {b64} B) · \
+             (d) frame on the pipe, raw CBOR with a byte string {raw_cbor} B",
+            frames.len(),
+            content.len(),
+        );
+
+        // The relationships that make the numbers a DECISION rather than trivia: CBOR is
+        // smaller than compact JSON, the pipe carries it as bytes, and the seam's base64 is
+        // where the 4/3 comes back — a property of the SEAM, not of the codec.
+        assert!(raw_cbor < compact, "raw cbor {raw_cbor} < compact json {compact}");
+        assert!(
+            on_wire > raw_cbor,
+            "base64 costs: seam {on_wire} > pipe {raw_cbor}"
+        );
+        // The payload there is a real byte string, not the mapping, and what crossed is the
+        // content BYTE FOR BYTE: the lift above found bytes (not text), and they are the same
+        // document the codec produced. That is the difference the byte path bought.
+        assert_eq!(lifted.bytes, content, "the pipe carried the content itself");
+    }
 
     /// The model hears the outcome, not the ledger: an answer that names every ready
     /// step and every ran one makes the conversation grow with the engine's bookkeeping.

@@ -26,6 +26,21 @@
 pub mod tasks;
 pub mod tools;
 
+/// The content encoding on the way out (ADR-0013): JSON or CBOR, DECLARED by this booth
+/// ([`wire::DECLARED`]) when it registers. Not a process switch and not a per-request
+/// negotiation: the venue transcodes for each client, so codec is per LEG.
+pub mod wire;
+
+/// WHAT THIS BOOTH SPEAKS, for the venue that has to read it (ADR-0013 §2).
+///
+/// A venue has to know what a leg produces to translate between legs, and the declaration is
+/// a fact of the REGISTRATION — `.encoded(…)` in [`register`], built from [`wire::DECLARED`]
+/// — which aura does not expose back to a caller. So the constant is published here instead:
+/// one source, three readers (spawn spec, guest env, venue).
+pub fn content_codec() -> wire::Codec {
+    wire::DECLARED
+}
+
 /// The turn booth's type name.
 pub const TURN_TYPE: &str = "gravity_turn";
 
@@ -57,14 +72,22 @@ pub fn turn_spec() -> String {
 /// Register the turn booth on an engine. The spawn spec names the guest binary
 /// (a deployment installs it on PATH or beside the engine's cwd — the spec is
 /// argv, resolved by the carrier's spawn; `GRAVITY_TURN_BIN` overrides for
-/// non-PATH installs and tests); the codec is the executor's declared one, CBOR
-/// here (high-frequency small token frames — the self-delimited document form
-/// skips the per-frame JSON quoting overhead).
+/// non-PATH installs and tests).
+///
+/// THE CODEC DECLARATION LIVES HERE (ADR-0013 §2), once: `.encoded(…)` is built from
+/// [`wire::DECLARED`], the same constant the venue reads through [`content_codec`]. The
+/// declaration travels three ways and never forks — the spawn spec (`Body::Script::encoding`),
+/// the carrier's `INDUCTION_ENCODING` for the guest, and [`content_codec`] for prism — so a
+/// deployment cannot end up with a booth that says one thing and emits another.
 pub async fn register(engine: &aura_engine::Engine) -> anyhow::Result<()> {
+    let declared = match wire::DECLARED {
+        wire::Codec::Json => aura_booth::Encoding::Json,
+        wire::Codec::Cbor => aura_booth::Encoding::Cbor,
+    };
     engine
         .register(
             aura_booth::BoothType::script(TURN_TYPE, "induction", turn_spec())
-                .encoded(aura_booth::Encoding::Cbor)
+                .encoded(declared)
                 // The venue's own word for "run a turn", declared here rather than special-cased
                 // in the host: the entry is `turn` (the guest's handler), the key is the envelope's
                 // address, so one device has one turn instance.

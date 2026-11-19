@@ -21,6 +21,7 @@ induction-guest = { path = "../../../induction/crates/induction-guest" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ciborium.workspace = true
 ureq = { version = "2", features = ["json"] }
 
 [dev-dependencies]

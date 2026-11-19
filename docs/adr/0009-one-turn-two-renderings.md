@@ -9,7 +9,7 @@
 
 A turn produces text one chunk at a time, and the consumers of that text are not alike. A web surface draws: it wants Accrete operations against slots it declared, because everything else on its page is such an operation and it has no business parsing a model's output. A program (the CLI) reads: it wants the deltas themselves, in order, and whatever it does with them is its own.
 
-The tempting shapes are both wrong. Two turn implementations — one "for the UI", one "for the CLI" — is two places for the append rule, the tool loop and the tail branches to drift apart. A UI-shaped output with a parser on the program's side pushes the drawing vocabulary into a consumer that does not draw; the program would need to understand `patch /bind/value/default` to read a sentence.
+The tempting shapes are both wrong. Two turn implementations — one "for the UI", one "for the CLI" — is two places for the append rule, the tool loop and the tail branches to drift apart. A UI-shaped output with a parser on the program's side pushes the drawing vocabulary into a consumer that does not draw; the program would need to understand `patch /source/default` to read a sentence.
 
 The turn's behaviour does not change with its audience: it fetches the projection, runs the model and its tools, appends the exchange. Only the shape of what leaves changes.
 
