@@ -264,11 +264,11 @@ async def main():
         first = await frame(ws)
         if first.get("ev") != "connected":
             raise SystemExit(f"FAIL: the venue did not greet: {first}")
-        await ws.send(json.dumps({"ev": "login", "args": {"username": "smoke", "password": PASSWORD}}))
+        await ws.send(json.dumps({"ev": "login", "args": {"login_name": "smoke", "password": PASSWORD}}))
         answer = await frame(ws)
         if answer.get("ev") != "login.result":
             await ws.send(
-                json.dumps({"ev": "signup", "args": {"username": "smoke", "password": PASSWORD}})
+                json.dumps({"ev": "signup", "args": {"login_name": "smoke", "password": PASSWORD}})
             )
             answer = await frame(ws)
             if answer.get("ev") != "signup.result":
@@ -324,7 +324,17 @@ if value.get("session") != "1":
 print(f"ok: reply {value['reply']!r} on session {value['session']}")
 PY
 
-curl -sf "http://127.0.0.1:$MEM_PORT/channels/1/members/1/session" >"$ROOT/session.json" || fail "k10r session read failed"
+# WHICH MEMBER: k10r's member ids are uuids (identity, not a counter), so `1` is not one.
+# Ask the channel who is in it rather than pinning the seed's id — the default member is a
+# constant today, and a read-back that hardcodes it would follow the constant's change silently.
+MEMBER=$(curl -s "http://127.0.0.1:$MEM_PORT/channels/1/members" \
+    | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0]["member_id"])' \
+    || fail "k10r members read failed")
+# The status AND the body: a bare `curl -sf` turns "404 with k10r's own words" into
+# "k10r session read failed", which is how this step hid its reason the first time.
+code=$(curl -s -o "$ROOT/session.json" -w '%{http_code}' \
+    "http://127.0.0.1:$MEM_PORT/channels/1/members/$MEMBER/session")
+[ "$code" = "200" ] || fail "k10r session read failed ($code): $(cat "$ROOT/session.json")"
 python3 - "$ROOT/session.json" "$EXPECTED" <<'PY' || exit 1
 import json
 import sys
@@ -332,16 +342,25 @@ import sys
 session = json.load(open(sys.argv[1]))
 expected = sys.argv[2]
 contents = [row["content"] for row in session["increment"]]
-if contents != ["hi", expected]:
-    raise SystemExit(f"FAIL: k10r holds {contents!r}, expected ['hi', {expected!r}]")
-print("ok: k10r recorded the turn:", contents)
+# The turn's NET EFFECT, not its transcript: the ask, one row per round that called a tool, and
+# the answer (k10r ADR-0024). The number of rounds is the model's business, so the assertion is
+# the SHAPE: the ask first, the answer last, and nothing between them that is not a call.
+if not contents or contents[0] != "hi":
+    raise SystemExit(f"FAIL: the session does not open with the ask: {contents!r}")
+if contents[-1] != expected:
+    raise SystemExit(f"FAIL: the session does not close with the answer: {contents!r}")
+stray = [row for row in contents[1:-1] if not row.startswith("[tool] ")]
+if stray:
+    raise SystemExit(f"FAIL: a row that is neither a call nor the answer: {stray!r}")
+print("ok: k10r recorded the turn:", len(contents), "rows,", len(contents) - 2, "of them calls")
 PY
 
 # The TOOL path, through the whole stack: the stub asked for `commit_memory`
 # on its first inference round, so the fact must be in k10r's graph now. A
 # reply alone proves nothing — the model can answer without ever reaching a
 # tool — which is why this reads the graph instead of the transcript.
-curl -sf "http://127.0.0.1:$MEM_PORT/graph/37" >"$ROOT/graph.json" || fail "k10r graph read failed"
+code=$(curl -s -o "$ROOT/graph.json" -w '%{http_code}' "http://127.0.0.1:$MEM_PORT/graph/37")
+[ "$code" = "200" ] || fail "k10r graph read failed ($code): $(cat "$ROOT/graph.json")"
 python3 - "$ROOT/graph.json" <<'PY' || exit 1
 import json
 import sys

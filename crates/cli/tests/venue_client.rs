@@ -143,6 +143,16 @@ async fn serve(
             continue;
         }
         let ev = frame["ev"].as_str().unwrap_or_default().to_string();
+        // THE VENUE'S RULE, in the venue's words (prism's auth surface reads `login_name`). This
+        // stub used to accept any credential frame, which is how this client came to send its own
+        // word for the field and still pass its tests — the smoke script, not the stub, is what
+        // found it.
+        if matches!(ev.as_str(), "login" | "signup")
+            && frame["args"]["login_name"].as_str().is_none()
+        {
+            send(&mut ws, error("auth `register` needs `login_name`")).await?;
+            continue;
+        }
         match ev.as_str() {
             // A fresh venue: no account yet. The CLI's fallback is signup.
             "login" => send(&mut ws, error("no account for that name")).await?,

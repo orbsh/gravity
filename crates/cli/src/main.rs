@@ -339,10 +339,17 @@ async fn expect(ws: &mut Ws, ev: &str) -> Result<Value, Failure> {
 /// asking the operator to run a second command for that buys nothing (the
 /// password is the same secret either way). A signup that also fails is the
 /// auth failure.
+///
+/// The credential's field name is the VENUE's, not this config's: prism's auth
+/// surface asks for `login_name`, and a client that sends its own word for it
+/// (`username`) is refused with "auth `register` needs `login_name`" — which is
+/// what the smoke script found, because the stub venue in this crate's tests
+/// accepted anything. The config keeps `username` (it is a person, not a field);
+/// the wire says what the venue reads.
 async fn authenticate(ws: &mut Ws, username: &str, password: &str) -> Result<(), Failure> {
     send(
         ws,
-        &json!({ "ev": "login", "args": { "username": username, "password": password } }),
+        &json!({ "ev": "login", "args": { "login_name": username, "password": password } }),
     )
     .await?;
     let first = next_frame(ws).await?;
@@ -351,7 +358,7 @@ async fn authenticate(ws: &mut Ws, username: &str, password: &str) -> Result<(),
         Some("error") => {
             send(
                 ws,
-                &json!({ "ev": "signup", "args": { "username": username, "password": password } }),
+                &json!({ "ev": "signup", "args": { "login_name": username, "password": password } }),
             )
             .await?;
             let second = next_frame(ws).await?;
