@@ -47,6 +47,14 @@ Config (`GRAVITY_CONFIG`, default `./gravity.json`) needs a `venue` node:
 The password lives in the env var that field NAMES (never in the file). The
 CLI logs in, falls back to signup once on a fresh venue, then submits.
 
+WHO it speaks as is a uuid, because k10r's member id is the user's uuid and not a
+counter: `member_id` beside the config, minted once on the first run (the run says so
+on stderr and names the file), then read from there by every later run. It is plain
+text on purpose — the real answer is the account's uuid from prism, pasted in, and
+`--member <uuid>` overrides the file for one invocation. A client that minted per run
+would be a new person to the store every time, with its own sessions and its own
+executor in every mount.
+
 No mount table in that file, and none on the wire from this client: THE BOOTH
 reads the venue's `GET /admin/mounts` for the turn it is running, because the
 booth is the party that lives inside the venue (prism publishes its own origin as

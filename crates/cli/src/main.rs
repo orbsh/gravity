@@ -32,7 +32,9 @@ usage: gravity [--json] [--session <id>] [--venue <ws-url>] [--cancel-after-ms <
                       readable form streams the deltas as they arrive
   --session <id>      the conversation this call speaks in (k10r's channel id,
                       a number; default 1 — the client keeps no state, ADR-0002 §3)
-  --member <id>       who is speaking in it (k10r's member id; default 1)
+  --member <uuid>     who is speaking (k10r's member id IS the user's uuid). Default:
+                      the id in `member_id` beside the config, minted once on first
+                      run — replace that file with your own id from prism
   --venue <ws-url>    override the configured venue URL
   --cancel-after-ms   send `ui:turn.cancel` after n ms (the automation form of
                       Ctrl-C; Ctrl-C does the same at any moment)
@@ -90,7 +92,9 @@ struct Cli {
     /// The same value as a channel id: k10r's channel is a NUMBER, so a session that is not one is
     /// a usage failure, refused before a socket is opened.
     channel: u64,
-    member: u64,
+    /// `None` = take it from the file beside the config (minting one on first run); a value here
+    /// is the operator saying who they are, which always wins.
+    member: Option<String>,
     venue: Option<String>,
     cancel_after_ms: Option<u64>,
     turns: Vec<String>,
@@ -99,7 +103,7 @@ struct Cli {
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Failure> {
     let mut json = false;
     let mut session = "1".to_string();
-    let mut member = 1u64;
+    let mut member: Option<String> = None;
     let mut venue = None;
     let mut cancel_after_ms = None;
     let mut turns = Vec::new();
@@ -113,12 +117,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Failure> {
                     .ok_or_else(|| Failure::Usage("--session needs an id".into()))?;
             }
             "--member" => {
-                let raw = args
-                    .next()
-                    .ok_or_else(|| Failure::Usage("--member needs an id".into()))?;
-                member = raw
-                    .parse()
-                    .map_err(|_| Failure::Usage(format!("--member: `{raw}` is not a number")))?;
+                member = Some(
+                    args.next()
+                        .ok_or_else(|| Failure::Usage("--member needs an id".into()))?,
+                );
             }
             "--venue" => {
                 venue = Some(
@@ -179,6 +181,9 @@ fn read_stdin() -> Result<String, Failure> {
 
 async fn run(cli: Cli) -> Result<(), Failure> {
     let config = load_config()?;
+    // Resolved before a socket is opened: who this client is belongs to the invocation, not to
+    // the reply, and a first run that minted an id should say so once rather than per turn.
+    let member = resolve_member(cli.member.as_deref())?;
     let venue = resolve_venue(&config, cli.venue.as_deref())?;
     let password = std::env::var(&venue.password_env).map_err(|_| {
         Failure::Auth(format!(
@@ -195,7 +200,7 @@ async fn run(cli: Cli) -> Result<(), Failure> {
     authenticate(&mut ws, &venue.username, &password).await?;
 
     for text in &cli.turns {
-        let reply = submit(&mut ws, &cli, text).await?;
+        let reply = submit(&mut ws, &cli, &member, text).await?;
         if cli.json {
             println!("{}", json!({ "session": cli.session, "reply": reply }));
         }
@@ -204,8 +209,83 @@ async fn run(cli: Cli) -> Result<(), Failure> {
     Ok(())
 }
 
+fn config_path() -> String {
+    std::env::var("GRAVITY_CONFIG").unwrap_or_else(|_| "gravity.json".into())
+}
+
+/// The file the member id lives in: beside the config, because that is the directory the
+/// deployment was installed into and the one an operator already knows.
+fn member_file() -> String {
+    match std::path::Path::new(&config_path()).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => {
+            dir.join("member_id").to_string_lossy().into_owned()
+        }
+        _ => "member_id".to_string(),
+    }
+}
+
+/// WHO this client speaks as. k10r's member id IS the user's uuid (k10r ADR-0025), and it has to
+/// be stable across runs: a fresh id per invocation would make every command a different person
+/// to the store, with its own sessions and its own executor in every mount.
+///
+/// So: `--member` wins; otherwise the file; otherwise one uuid minted ONCE and written there. The
+/// file is plain text on purpose — the real answer is the account's uuid, which an operator reads
+/// out of prism and pastes in, and this binary should not own an identity it cannot know.
+fn resolve_member(flag: Option<&str>) -> Result<String, Failure> {
+    if let Some(id) = flag {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Failure::Usage("--member: empty id".into()));
+        }
+        return Ok(id.to_string());
+    }
+    let path = member_file();
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        let id = raw.trim();
+        if !id.is_empty() {
+            return Ok(id.to_string());
+        }
+    }
+    let id = mint_uuid()?;
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| Failure::Usage(format!("creating {}: {e}", dir.display())))?;
+        }
+    }
+    std::fs::write(&path, format!("{id}\n"))
+        .map_err(|e| Failure::Usage(format!("writing {path}: {e}")))?;
+    eprintln!(
+        "gravity: this client speaks as `{id}` — first run, written to {path}.\n\
+         Replace that file with your own member id (prism shows it on the account), \
+         or pass --member."
+    );
+    Ok(id)
+}
+
+/// A v4 uuid from the OS. A crate for one function is not worth a dependency here: 16 bytes from
+/// `/dev/urandom`, the version and variant bits set, the usual 8-4-4-4-12 text.
+fn mint_uuid() -> Result<String, Failure> {
+    use std::io::Read;
+    let mut bytes = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|e| Failure::Usage(format!("minting a member id from /dev/urandom: {e}")))?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
+}
+
 fn load_config() -> Result<GravityConfig, Failure> {
-    let path = std::env::var("GRAVITY_CONFIG").unwrap_or_else(|_| "gravity.json".into());
+    let path = config_path();
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| Failure::Usage(format!("reading config {path}: {e}")))?;
     serde_json::from_str(&raw).map_err(|e| Failure::Usage(format!("parsing config {path}: {e}")))
@@ -294,7 +374,7 @@ async fn authenticate(ws: &mut Ws, username: &str, password: &str) -> Result<(),
 /// `ui:turn.submit` — so there is no answer to read; the end arrives as `turn.done` (a booth that
 /// is reached by an event says its end, gravity ADR-0009's Update), and the reply is the deltas
 /// this client already assembled.
-async fn submit(ws: &mut Ws, cli: &Cli, content: &str) -> Result<String, Failure> {
+async fn submit(ws: &mut Ws, cli: &Cli, member: &str, content: &str) -> Result<String, Failure> {
     // `channel_id` is the conversation the application keeps its memory in and `member_id` who is
     // speaking — nothing else. The mount table is NOT here any more: the booth reads it from the
     // venue it runs inside (ADR-0001 §7, amended 2026-11-20), so a page-driven turn and this one
@@ -307,7 +387,7 @@ async fn submit(ws: &mut Ws, cli: &Cli, content: &str) -> Result<String, Failure
             "ev": "ui:turn.submit",
             "args": {
                 "channel_id": cli.channel,
-                "member_id": cli.member,
+                "member_id": member,
                 "user_message": content,
                 "event": "ui:turn.delta",
             }

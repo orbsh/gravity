@@ -221,7 +221,13 @@ fn error(message: &str) -> Value {
 /// Run the CLI against `venue_url` with a config file of its own.
 fn run_cli(venue_url: &str, args: &[&str]) -> Output {
     let dir = tempfile::TempDir::new().unwrap();
-    let config = dir.path().join("gravity.json");
+    run_cli_in(dir.path(), venue_url, args)
+}
+
+/// The same, in an installation the caller keeps: the member id lives beside the config, so two
+/// invocations share it only if they share the directory.
+fn run_cli_in(dir: &std::path::Path, venue_url: &str, args: &[&str]) -> Output {
+    let config = dir.join("gravity.json");
     std::fs::write(
         &config,
         serde_json::to_string(&json!({
@@ -271,7 +277,13 @@ fn one_command_is_one_turn_per_argument() {
     // sees the same table a CLI turn does.
     let args = &submits[0]["args"];
     assert_eq!(args["channel_id"], 1, "the default channel: {args}");
-    assert_eq!(args["member_id"], 1, "{args}");
+    // WHO this client is: a uuid, not a number — k10r's member id IS the user's uuid, and the
+    // client mints one on first run and keeps it (a fresh id per invocation would make every
+    // command a different person to the store). The shape is asserted, not a value: the id is the
+    // deployment's, and the test's temp dir is a fresh installation.
+    let member = args["member_id"].as_str().expect("member_id is a string uuid");
+    assert_eq!(member.len(), 36, "uuid text: {member}");
+    assert_eq!(member.matches('-').count(), 4, "uuid text: {member}");
     assert_eq!(args["user_message"], "hello", "{args}");
     assert_eq!(args["event"], "ui:turn.delta", "{args}");
     assert!(
@@ -285,12 +297,74 @@ fn one_command_is_one_turn_per_argument() {
     );
 }
 
+/// THE MEMBER ID IS AN IDENTITY, so it is minted once and kept: the first run writes one beside
+/// the config and says so, later runs read it, and an operator who pastes the account's uuid out
+/// of prism changes who the client speaks as without touching a flag.
+#[test]
+fn the_member_id_is_minted_once_kept_beside_the_config_and_editable() {
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let (first_url, first_seen) = venue(Mode::Happy);
+    let first = run_cli_in(dir.path(), &first_url, &["hi"]);
+    assert!(first.status.success(), "exit: {:?}", first.status);
+    let path = dir.path().join("member_id");
+    let minted = std::fs::read_to_string(&path).expect("the id was written beside the config")
+        .trim()
+        .to_string();
+    assert_eq!(minted.len(), 36, "uuid text: {minted}");
+    let stderr = String::from_utf8(first.stderr).unwrap();
+    assert!(stderr.contains("first run"), "a first run says so: {stderr}");
+    let used = first_seen.lock().unwrap().clone();
+    let submit = used
+        .iter()
+        .find(|f| f["ev"] == "ui:turn.submit")
+        .expect("one submit")
+        .clone();
+    assert_eq!(submit["args"]["member_id"], minted.as_str(), "{submit}");
+
+    // A second run in the same installation reads the file instead of minting: same person, no
+    // second notice, and the file untouched.
+    let (second_url, second_seen) = venue(Mode::Happy);
+    let second = run_cli_in(dir.path(), &second_url, &["hi"]);
+    assert!(second.status.success(), "exit: {:?}", second.status);
+    let stderr = String::from_utf8(second.stderr).unwrap();
+    assert!(!stderr.contains("first run"), "no second notice: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap().trim(),
+        minted,
+        "the file is the identity, not a per-run default"
+    );
+    let used = second_seen.lock().unwrap().clone();
+    let submit = used
+        .iter()
+        .find(|f| f["ev"] == "ui:turn.submit")
+        .expect("one submit")
+        .clone();
+    assert_eq!(submit["args"]["member_id"], minted.as_str(), "{submit}");
+
+    // The file is plain text for a reason: the real answer is the account's uuid from prism.
+    std::fs::write(&path, "6f1d3d0e-0000-4000-8000-000000000001\n").unwrap();
+    let (third_url, third_seen) = venue(Mode::Happy);
+    let third = run_cli_in(dir.path(), &third_url, &["hi"]);
+    assert!(third.status.success(), "exit: {:?}", third.status);
+    let used = third_seen.lock().unwrap().clone();
+    let submit = used
+        .iter()
+        .find(|f| f["ev"] == "ui:turn.submit")
+        .expect("one submit")
+        .clone();
+    assert_eq!(
+        submit["args"]["member_id"], "6f1d3d0e-0000-4000-8000-000000000001",
+        "editing the file changes who the client is: {submit}"
+    );
+}
+
 /// `--session` is the conversation and `--member` is who speaks in it: both ride the call, and a
 /// session that is not a channel id is refused before anything is sent.
 #[test]
 fn the_conversation_and_the_speaker_ride_the_call() {
     let (url, seen) = venue(Mode::Happy);
-    let out = run_cli(&url, &["--session", "9", "--member", "3", "hi"]);
+    let out = run_cli(&url, &["--session", "9", "--member", "alice's-own-id", "hi"]);
     assert!(out.status.success(), "exit: {:?}", out.status);
     let frames = seen.lock().unwrap().clone();
     let submit = frames
@@ -298,7 +372,10 @@ fn the_conversation_and_the_speaker_ride_the_call() {
         .find(|f| f["ev"] == "ui:turn.submit")
         .expect("one submit");
     assert_eq!(submit["args"]["channel_id"], 9, "{submit}");
-    assert_eq!(submit["args"]["member_id"], 3, "{submit}");
+    assert_eq!(
+        submit["args"]["member_id"], "alice's-own-id",
+        "--member wins over the file, verbatim: {submit}"
+    );
 
     // A session that is not a channel id never reaches the socket: usage failure, exit 2.
     let (url, seen) = venue(Mode::Happy);

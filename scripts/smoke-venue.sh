@@ -577,6 +577,8 @@ PY
 MEMBER=$(curl -s "http://127.0.0.1:$MEM_PORT/channels/1/members" \
     | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0]["member_id"])' \
     || fail "k10r members read failed")
+# The CLI reads its identity from `member_id` beside the config (minted on first run, editable):
+# writing the channel's member here makes later invocations speak as the same person.
 echo "$MEMBER" >"$ROOT/member_id"
 # The status AND the body: a bare `curl -sf` turns "404 with k10r's own words" into
 # "k10r session read failed", which is how this step hid its reason the first time.
