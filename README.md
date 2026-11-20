@@ -57,9 +57,23 @@ carries no arguments of its own, so a table riding the call reached no browser
 (prism ADR-0021, gravity ADR-0001 §7 as amended 2026-11-20).
 
 `scripts/smoke-venue.sh` puts this binary on a real gateway — stub provider,
-k10r's mem-server, prism, a real `effector` node, then `gravity --json hi` — and asserts both the reply
-on stdout and the message pair k10r recorded. It is a script and not a test
-because it wants three repos built and three fixed ports.
+k10r's mem-server, prism, a real `effector` node, then `gravity --json hi` — and
+asserts the reply on stdout, the message pair k10r recorded, the code row that ran
+on the node and the graph it left behind. It is a script and not a test because it
+wants four repos built and four fixed ports.
+
+Two optional legs, each proving something the default cannot:
+
+- `SMOKE_PAGE=1` drives the same turn from a page's `/channel` socket — one tab,
+  two turns, nothing but the text submitted — and counts the frames the renderer
+  receives (one per emit; N copies means N connections, never a growing fan-out).
+- `SMOKE_PY=1` adds the RESIDENT leg: an `induction` python mount served by
+  effector's guest runner (`deploy/runners/runner_py_guest.py`), which the node keeps
+  alive across calls. One python row is called twice inside one turn and the second
+  answer must be the first plus one — the row ran in a process that remembered — and
+  the guest must still be exactly one live child of the node afterwards. The `nu`
+  mounts stay what they are: one-shot `exec`, a process per call, no child left, so
+  the two legs assert opposite shapes of the same fact (ADR-0014 §5).
 
 ## Memory connection (Phase 0)
 

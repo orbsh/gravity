@@ -41,6 +41,10 @@ fail() {
 [ -x "$K10R_REPO/target/debug/krystallizer" ] || fail "build krystallizer first"
 [ -x "$EFFECTOR_REPO/target/debug/effector" ] || fail "build effector first (cargo build -p effector-runtime)"
 NU_RUNNER="$EFFECTOR_REPO/deploy/runners/runner_nu.nu"
+# The RESIDENT form (SMOKE_PY=1): the same role, loaded once by the node's embedded
+# python carrier instead of spawned per call — the one shape in which a tool call can be
+# warm (gravity ADR-0014 §5).
+PY_RUNNER="$EFFECTOR_REPO/deploy/runners/runner_py_guest.py"
 [ -f "$NU_RUNNER" ] || fail "no nu runner at $NU_RUNNER"
 
 MODEL_DIR=${KRYSTALLIZER_MODEL_DIR:-$HOME/.local/share/krystallizer/models/bge-small-zh-v1.5}
@@ -95,6 +99,65 @@ def code_id() -> int:
         return int(handle.read())
 
 
+# The RESIDENT leg (SMOKE_PY=1): a python row the turn calls TWICE, so the second answer can only
+# be right if the row's own globals survived between the calls (gravity ADR-0014 §5). Absent file
+# = the leg is off.
+PY_CODE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "py_code_id")
+
+
+def py_code_id():
+    if not os.path.exists(PY_CODE_FILE):
+        return None
+    with open(PY_CODE_FILE) as handle:
+        return int(handle.read())
+
+
+# The `seen` counters the provider has been shown, in order. Each ROUND carries only the latest
+# tool exchange, so the two answers of one turn are never in one request — the memory has to be
+# here, and what it checks is the same thing: consecutive, i.e. the row's globals survived.
+SEEN_VALUES = []
+# What the node COMPUTED, recorded as it passes through: the check cannot read it off the final
+# request, because a later round's replay carries only the LATEST tool exchange.
+TOTALS = []
+
+
+def _numbers(doc, key, out):
+    """Every `key: <number>` anywhere in the request, tool-message strings included.
+
+    A tool answer arrives as a JSON string INSIDE the request, so its quotes are escaped
+    and a byte-pattern search for `"seen":` finds nothing. Walking the parsed document —
+    and re-parsing a string that looks like JSON — is the only reading that is not a
+    guess about quoting.
+    """
+    if isinstance(doc, dict):
+        for name, value in doc.items():
+            if name == key and isinstance(value, (int, float)) and not isinstance(value, bool):
+                out.append(int(value))
+            else:
+                _numbers(value, key, out)
+    elif isinstance(doc, list):
+        for item in doc:
+            _numbers(item, key, out)
+    elif isinstance(doc, str) and doc.strip()[:1] in ("{", "["):
+        try:
+            _numbers(json.loads(doc), key, out)
+        except Exception:
+            pass
+
+
+def note_seen(body):
+    try:
+        doc = json.loads(body)
+    except Exception:
+        return
+    found = []
+    _numbers(doc, "seen", found)
+    for number in found:
+        if not SEEN_VALUES or SEEN_VALUES[-1] != number:
+            SEEN_VALUES.append(number)
+    _numbers(doc, "total", TOTALS)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -121,6 +184,7 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             round_index = ROUNDS
             ROUNDS += 1
+        note_seen(body)
         # round 1's check needs the body, and a refusal must not start a 200.
         if round_index == 1 and b"github-issues" not in body:
             self.send_response(500)
@@ -176,12 +240,57 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                 }
             )
-        elif round_index == 3:
+        elif round_index == 3 and py_code_id() is not None:
+            # THE SAME ROW, TWICE. A one-shot runner would answer 1 and 1; a resident one answers
+            # consecutive numbers, because the row is not recompiled and its namespace is kept.
+            event(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "c4",
+                            "function": {
+                                "name": "run",
+                                "arguments": json.dumps(
+                                    {"code_id": py_code_id(), "arguments": {"by": 1}}
+                                ),
+                            },
+                        }
+                    ]
+                }
+            )
+        elif round_index == 4 and py_code_id() is not None:
+            event(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "c5",
+                            "function": {
+                                "name": "run",
+                                "arguments": json.dumps(
+                                    {"code_id": py_code_id(), "arguments": {"by": 1}}
+                                ),
+                            },
+                        }
+                    ]
+                }
+            )
+        elif round_index == (5 if py_code_id() is not None else 3):
             # What the node COMPUTED has to be in this request as the tool message: a turn that
             # answered without it would look identical from the outside. A refusal keeps the
             # request on disk, because "the model did not use the tool" and "the call failed with
             # words" look the same in a 500.
-            if b"total" not in body or b"7" not in body:
+            if py_code_id() is not None and (
+                len(SEEN_VALUES) < 2 or SEEN_VALUES[-1] != SEEN_VALUES[-2] + 1
+            ):
+                print(f"resident leg: seen={SEEN_VALUES} totals={TOTALS}", flush=True)
+                with open(os.path.join(os.path.dirname(CODE_FILE), "round5.json"), "wb") as out:
+                    out.write(body)
+                self.send_response(500)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                return
+            if 7 not in TOTALS:
+                print(f"node leg: totals={TOTALS}", flush=True)
                 with open(os.path.join(os.path.dirname(CODE_FILE), "round3.json"), "wb") as out:
                     out.write(body)
                 self.send_response(500)
@@ -266,6 +375,20 @@ python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code_id"])' "$R
     || fail "the code row answered no id: $(cat "$ROOT/code.json")"
 echo "ok: a code row is declared for the mount to run (id $(cat "$ROOT/code_id"))"
 
+# THE RESIDENT ROW (SMOKE_PY=1): it accumulates in a module global, so its SECOND call proves
+# whether the node kept the compiled row or compiled it again (gravity ADR-0014 §5).
+if [ "${SMOKE_PY:-0}" = 1 ]; then
+    # SAME SCOPE as the nu row (the path segment is the scope, not an id — the turn reads
+    # `/code/<scope>/<id>`, so a row seeded under another scope is invisible to it).
+    curl -sf -X POST "http://127.0.0.1:$MEM_PORT/code/37" \
+        -H 'content-type: application/json' \
+        -d '{"language":"python","description":"count the calls it has seen","parameters":"{\"type\":\"object\",\"properties\":{\"by\":{\"type\":\"number\"}},\"required\":[\"by\"]}","source":"STATE[\"seen\"] = STATE.get(\"seen\", 0) + ARGS.get(\"by\", 1)\nprint(json.dumps({\"seen\": STATE[\"seen\"]}))\n"}' \
+        >"$ROOT/py_code.json" || fail "declaring the python code row failed"
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code_id"])' "$ROOT/py_code.json" >"$ROOT/py_code_id" \
+        || fail "the python code row answered no id: $(cat "$ROOT/py_code.json")"
+    echo "ok: a python code row is declared for the resident leg (id $(cat "$ROOT/py_code_id"))"
+fi
+
 curl -sf -X POST "http://127.0.0.1:$MEM_PORT/skills/37" \
     -H 'content-type: application/json' \
     -d '{"name":"github-issues","title":"issues","content":"Lists the open issues of a GitHub repository.","steps":"[{\"code_id\":1}]"}' \
@@ -283,7 +406,23 @@ echo "ok: a skill is declared for the resolver to find"
 # `requires: host` because this node is BARE METAL (`class: host` below): the default is the
 # container, and a host node cannot become one on demand — the plane refuses in words rather than
 # quietly running unreviewed code in the wrong isolation (ADR-0001 §4).
-PRISM_LANGUAGES="[{\"language\":\"nu\",\"carrier\":\"exec\",\"runner\":\"nu $NU_RUNNER\",\"requires\":\"host\"}]" \
+if [ "${SMOKE_PY:-0}" = 1 ]; then
+    # The runner IS the source for an embedded carrier (prism ADR-0021: a mount's runner is
+    # a fixed artifact the deployment declares), so the module's TEXT is what the vocabulary
+    # carries — read from disk here rather than pasted into an env var.
+    PRISM_LANGUAGES=$(python3 - "$NU_RUNNER" "$PY_RUNNER" <<'PY'
+import json, sys
+nu, py = sys.argv[1], sys.argv[2]
+print(json.dumps([
+    {"language": "nu", "carrier": "exec", "runner": f"nu {nu}", "requires": "host"},
+    {"language": "python", "carrier": "induction", "runner": f"python3 {py}", "requires": "host"},
+]))
+PY
+)
+else
+    PRISM_LANGUAGES="[{\"language\":\"nu\",\"carrier\":\"exec\",\"runner\":\"nu $NU_RUNNER\",\"requires\":\"host\"}]"
+fi
+PRISM_LANGUAGES="$PRISM_LANGUAGES" \
 PRISM_ADDR="127.0.0.1:$PRISM_PORT" PRISM_IDENTITY=open PRISM_DATA="$ROOT/prism-data" \
 GRAVITY_PROVIDER_BIN="$GRAVITY_REPO/target/debug/gravity-provider" \
 GRAVITY_TURN_BIN="$GRAVITY_REPO/target/debug/gravity-turn" \
@@ -301,6 +440,7 @@ wait_for "$PRISM_PORT" "prism gateway" || exit 1
 curl -sf -X POST "http://127.0.0.1:$PRISM_PORT/admin/nodes" \
     -H 'content-type: application/json' -d '{"alias":"smoke-node"}' >"$ROOT/node.json" \
     || fail "minting a node token failed"
+if [ "${SMOKE_PY:-0}" = 1 ]; then NODE_CARRIERS='["exec","induction"]'; else NODE_CARRIERS='["exec"]'; fi
 NODE_TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' "$ROOT/node.json") \
     || fail "the mint answered no token: $(cat "$ROOT/node.json")"
 
@@ -309,7 +449,7 @@ cat > "$ROOT/effector.json" <<JSON
   "class": "host",
   "control_plane_url": "ws://127.0.0.1:$PRISM_PORT/effector/smoke-node",
   "token": "$NODE_TOKEN",
-  "capabilities": { "node_alias": "smoke-node", "carriers": ["exec"] },
+  "capabilities": { "node_alias": "smoke-node", "carriers": $NODE_CARRIERS },
   "lease": {}
 }
 JSON
@@ -576,11 +716,29 @@ fi
 # header), so the node must hold NO child once the calls are done. A resident child here
 # would mean the declaration and the wire disagree.
 runners=$(pgrep -P "$NODE_PID" | wc -l)
-if [ "$runners" -eq 0 ]; then
-    echo "ok: the one-shot runner left no child behind (exec: one process per call)"
+if [ "${SMOKE_PY:-0}" = 1 ]; then
+    # THE RESIDENT LEG, seen from the outside: the guest is a live child of the node, and it is
+    # still there after every call — one process serving many calls is the whole difference
+    # (gravity ADR-0014 §5). The one-shot `nu` mount adds nothing to this count.
+    # ONE GUEST PER CONVERSATION, and no more: the key is `{mount}/{session}` and a session is
+    # `channel-<id>-member-<id>`, so the CLI's turn is one conversation and the page's TWO turns
+    # are another (they share a channel and a member). A per-turn key would leave 3 here, and a
+    # per-call key 5 — this number is what says which one the node used.
+    if [ "${SMOKE_PAGE:-0}" = 1 ]; then expected=2; else expected=1; fi
+    guests=$(pgrep -aP "$NODE_PID" | grep -c 'runner_py_guest')
+    if [ "$guests" -eq "$expected" ] && [ "$runners" -eq "$expected" ]; then
+        echo "ok: $guests resident guest(s) for $expected conversation(s) — one process served every call in each"
+    else
+        pgrep -aP "$NODE_PID" | sed 's/^/  /'
+        fail "resident leg: expected $expected live guest(s), found $runners child(ren), $guests of them guests"
+    fi
 else
-    pgrep -aP "$NODE_PID" | sed 's/^/  /'
-    fail "the mount declares the one-shot carrier, but the node holds $runners child(ren)"
+    if [ "$runners" -eq 0 ]; then
+        echo "ok: the one-shot runner left no child behind (exec: one process per call)"
+    else
+        pgrep -aP "$NODE_PID" | sed 's/^/  /'
+        fail "the mount declares the one-shot carrier, but the node holds $runners child(ren)"
+    fi
 fi
 
 python3 - "$ROOT/graph.json" "$ROOT/code_id" <<'PY' || exit 1

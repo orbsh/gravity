@@ -78,8 +78,10 @@ existed before anything passed a session through it.
    every call is cold in the only sense that carrier has. That is a choice written
    into the mount rather than an accident — nushell cannot evaluate a delivered
    script in a resident process (no `eval`, and `source` wants a parse-time
-   constant), so a nu runner is one-shot by necessity and a warm leg needs a
-   carrier that can stay, which today means python.
+   constant), so a nu runner is one-shot by necessity. A warm leg needs both a
+   carrier that keeps its process AND a language that can run a delivered row inside
+   it: python has it (`exec` into a namespace the guest builds), and effector's guest
+   runner is the artifact that uses it.
 
 6. **Residency is not tracked on the plane.** A plane-side table of "which
    executors are warm" would drift from the children it describes, and the first
@@ -145,13 +147,15 @@ reconstructed afterwards.
   one sentence that says whose failure it is.
 - **gravity gains a pinned reason** for handing the session where the key goes, so
   that "optimization" cannot quietly turn a warm conversation cold.
-- **No tool call has ever been served by a warm executor.** gravity's runner
-  mounts declare `exec`, so the tier is reached and nothing is retained: three
-  calls, three processes. That is written down now and pinned from the outside (the
-  smoke asserts the node holds no child once the calls are done), and the warm path
-  through a tool call needs a resident runner that takes `args.code` — the python
-  guest (§5). Until then "hot" is a fact about a carrier, exercised only by
-  effector's own tests.
+- **Both shapes now exist and both are proven, in one script.** gravity's `nu`
+  runner is the one-shot `exec` form (a process per call — the smoke asserts the
+  node holds no child once the calls are done), and its python mount is the RESIDENT
+  form: effector's `deploy/runners/runner_py_guest.py`, a guest the node's
+  `induction` carrier keeps alive across calls, where a delivered row reads `ARGS`,
+  keeps what it wants in `STATE`, and prints one JSON document. The smoke's resident
+  leg calls ONE python row twice inside one turn, requires the second answer to be
+  the first plus one, and requires the guest to still be ONE live child of the node —
+  the inside and the outside of the same fact.
 - **PLAN 4.5 is corrected**: the tier is reached, and what remains open is the
   replay set's mechanism, not the residency rule.
 
@@ -165,10 +169,11 @@ Planned, not written:
   wording of a start failure.
 - aura — one test naming the key a mount call produces (`{type}/{key}` of the
   instance), so a refactor that changes what is shared fails at home.
-- `scripts/smoke-venue.sh` — the one-shot half, which is the half the deployment
-  actually runs: after the CLI's turn and the page's two, the node holds NO child,
-  because the mount declares `exec`. A resident child there would mean the
-  declaration and the wire disagree.
+- `scripts/smoke-venue.sh` (`SMOKE_PY=1` for the resident leg) — the one-shot half:
+  after the CLI's turn and the page's two, the node holds NO child, because the `nu`
+  mount declares `exec`. The resident half: one python row called twice, the second
+  answer the first plus one, the row in the graph, and exactly one live guest child —
+  warm state through a real tool call, on a real node.
 
 Written (effector `crates/runtime/tests/exec_carrier.rs`, on real children, pids
 read from inside the guest):
@@ -176,6 +181,9 @@ read from inside the guest):
 - `one_key_is_one_child_and_a_second_key_is_a_second_child`
 - `a_dead_child_is_evicted_and_the_next_call_starts_a_new_one`
 - `a_start_failure_names_the_start_not_the_code`
+
+The resident leg is asserted from BOTH sides in the smoke (`SMOKE_PY=1`): the answers
+must be consecutive, and the guest must still be one child of the node afterwards.
 
 ## Related records
 
