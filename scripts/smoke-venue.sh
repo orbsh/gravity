@@ -482,7 +482,7 @@ import sys
 
 import websockets
 
-PORT, MEMBER, TURNS = sys.argv[1], sys.argv[2], int(sys.argv[3])
+PORT, TURNS = sys.argv[1], int(sys.argv[2])
 
 
 def text_of(said):
@@ -517,9 +517,11 @@ async def settle(ws, ops, budget=25.0):
 
 async def main():
     async with websockets.connect(f"ws://127.0.0.1:{PORT}/channel") as ws:
+        # The SAME account the CLI used: one deployment serves one person, and the member
+        # identity a turn runs as comes from the venue's `sender`, not from the page.
         await ws.send(
             json.dumps(
-                {"dest": "signup", "data": {"login_name": "page", "password": "page-pw"}}
+                {"dest": "login", "data": {"login_name": "smoke", "password": "smoke-pw"}}
             )
         )
         # The first facts of a connection: token, connect. A page reads them and starts talking.
@@ -537,12 +539,11 @@ async def main():
                         # Sending the prefixed name makes the venue read it as a view event to
                         # paint, which "reaches no renderer" and is otherwise silent.
                         "dest": "turn.submit",
-                        "data": {
-                            "channel_id": 1,
-                            "member_id": MEMBER,
-                            "user_message": "hi",
-                            "event": "ui:turn.delta",
-                        },
+                        # A PAGE NAMES NOTHING BUT THE TEXT (gravity ADR-0007 §2, prism
+                        # ADR-0018): the venue stamps who is speaking, and the channel is the
+                        # member's own — the deployment serves one person. Handing ids here would
+                        # hide a page-leg break behind a client that knows too much.
+                        "data": {"user_message": "hi", "event": "ui:turn.delta"},
                     }
                 )
             )
@@ -566,7 +567,7 @@ async def main():
 asyncio.run(main())
 PAGE
     echo "--- the renderer leg: one tab, two turns ---"
-    python3 "$ROOT/page.py" "$PRISM_PORT" "$(cat "$ROOT/member_id")" 2 || fail "the page leg failed"
+    python3 "$ROOT/page.py" "$PRISM_PORT" 2 || fail "the page leg failed"
 fi
 
 python3 - "$ROOT/graph.json" "$ROOT/code_id" <<'PY' || exit 1
