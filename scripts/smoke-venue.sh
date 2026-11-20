@@ -111,6 +111,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("content-length", "0")
             self.end_headers()
             return
+        # A NEW TURN STARTS AT ROUND 0: the request carries the conversation, and a fresh turn is
+        # the one whose messages hold no tool answer yet. Without this the page's turn would fall
+        # into the tail of the CLI's round sequence and never call a tool — the smoke would pass
+        # while proving nothing about a page.
+        if b'"tool"' not in body:
+            with LOCK:
+                ROUNDS = 0
         with LOCK:
             round_index = ROUNDS
             ROUNDS += 1
@@ -497,11 +504,13 @@ async def settle(ws, ops, budget=25.0):
         budget -= loop.time() - started
         for op in json.loads(text_of(said)):
             ops.append(op)
-            # The end is a fact, not a quiet socket: `turn.done` (or `turn.error`) in its slot.
-            if op.get("name") in ("turn.done", "turn.error") or op.get("slot") in (
-                "turn.done",
-                "turn.error",
-            ):
+            slot = op.get("slot") or op.get("name") or ""
+            # The end is a fact, not a quiet socket. An ENDING IN ERROR IS A FAILURE of this leg:
+            # a page that can submit but cannot complete a turn looks the same from here otherwise.
+            if slot.endswith("turn.error"):
+                print(f"  turn.error: {json.dumps(op)[:400]}")
+                return False
+            if slot.endswith("turn.done"):
                 return True
     return False
 
@@ -548,6 +557,8 @@ async def main():
             ]
             dupes = [i for i, n in collections.Counter(ids).items() if i and n > 1]
             print(f"turn {turn + 1}: {len(ops)} actions, ended={ended}, slots={dict(by_slot)}")
+            if not ended:
+                raise SystemExit(f"FAIL: turn {turn + 1} did not finish on the renderer leg")
             if dupes:
                 print(f"  DUPLICATED ids: {dupes}")
 

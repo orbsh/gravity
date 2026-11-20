@@ -265,20 +265,18 @@ fn one_command_is_one_turn_per_argument() {
         .filter(|f| f["ev"] == "ui:turn.submit")
         .collect();
     assert_eq!(submits.len(), 2, "two submits");
-    // The payload a page would send: the conversation, who is speaking, the text, the event its
-    // chunks are spoken as on the PLANE, and the venue's mount table.
+    // The payload a page would send: the conversation, who is speaking, the text and the event its
+    // chunks are spoken as on the PLANE. NOT the mount table — that is the booth's to read from the
+    // venue it runs inside (ADR-0001 §7 as amended), so this client carries none and a page's turn
+    // sees the same table a CLI turn does.
     let args = &submits[0]["args"];
     assert_eq!(args["channel_id"], 1, "the default channel: {args}");
     assert_eq!(args["member_id"], 1, "{args}");
     assert_eq!(args["user_message"], "hello", "{args}");
     assert_eq!(args["event"], "ui:turn.delta", "{args}");
-    assert_eq!(
-        args["mounts"],
-        json!([
-            { "language": "python", "type": "srv.python" },
-            { "language": "python", "type": "mac.python" }
-        ]),
-        "the venue's page rides the call, connected mount first: {args}"
+    assert!(
+        args.get("mounts").is_none(),
+        "no copy of the venue's table rides the call: {args}"
     );
     assert_eq!(
         frames.iter().filter(|f| f["ev"] == "signup").count(),

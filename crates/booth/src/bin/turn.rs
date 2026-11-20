@@ -128,10 +128,9 @@ fn storage_schema() -> Value {
                     "cold_fields": [
                         {"name": "store_url", "ty": "Str", "width": 0, "offset": 0, "tag": 1},
                         {"name": "memory_format", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
-                        // THE MOUNT TABLE, where a deployment is configured: which operation
-                        // language a mount type serves. It is deployment knowledge, not
-                        // something a page should carry on every keystroke (layout v2).
-                        {"name": "mounts", "ty": "Str", "width": 0, "offset": 0, "tag": 3},
+                        // `tag 3` is RETIRED (layout v2): it held the mount table, which is read
+                        // from the venue now (ADR-0001 §7 as amended 2026-11-20). A row written by
+                        // an older deployment keeps the value; nothing reads it.
                     ],
                     "slots": slots.clone(),
                 },
@@ -171,10 +170,6 @@ struct Settings {
     memory_scope: u64,
     memory_format: String,
     default_model: u64,
-    /// The mount table as stored: a JSON array of `{language, type}`. Absent on a
-    /// deployment that never declared one — a turn then falls back to what its caller
-    /// carries, and a page's answer has nothing to run steps with.
-    mounts: Option<String>,
 }
 
 fn read_settings(ctx: &mut Ctx) -> anyhow::Result<Settings> {
@@ -204,7 +199,6 @@ fn read_settings(ctx: &mut Ctx) -> anyhow::Result<Settings> {
             .get("default_model")
             .and_then(Value::as_u64)
             .ok_or_else(|| anyhow::anyhow!("turn: `settings` id 1 is missing `default_model`"))?,
-        mounts: row.get("mounts").and_then(Value::as_str).map(str::to_string),
     })
 }
 
@@ -1511,29 +1505,40 @@ fn stream_answer(
 }
 
 
-/// The mount table, from the deployment's row first and the caller's list second.
+/// The mount table this turn may address, READ FROM THE VENUE (ADR-0001 §7, amended 2026-11-20).
 ///
-/// The row wins because it is where the deployment is configured; the argument stays for
-/// a direct caller (the CLI, a test seam) that has no row to read, and for a deployment
-/// that has not declared one yet. Both shapes are the same: `{language, type}`.
+/// Three shapes were possible and only this one is honest: a row in `settings` (a copy nobody
+/// updates, and the row is where deployments are configured, not where callability lives), the
+/// caller's list (the CLI fetched it — but a PAGE carries nothing, so a browser turn could not run
+/// a step at all), or the venue's own answer. The booth runs INSIDE the venue, so the venue tells
+/// it: `PRISM_VENUE_URL` is published by the venue for its guests, and `/admin/mounts` is the same
+/// page the CLI used to read.
+///
+/// `args.mounts` stays as an explicit override for a caller that has no venue (tests, an embedded
+/// deployment): when present and non-empty it wins, and nothing else in production passes it.
 fn mounts_of_settings(settings: &Settings, args: &Value) -> Vec<(String, String)> {
-    if let Some(text) = settings.mounts.as_deref() {
-        if let Ok(Value::Array(entries)) = serde_json::from_str::<Value>(text) {
-            let declared: Vec<(String, String)> = entries
-                .iter()
-                .filter_map(|entry| {
-                    Some((
-                        entry.get("language")?.as_str()?.to_string(),
-                        entry.get("type")?.as_str()?.to_string(),
-                    ))
-                })
-                .collect();
-            if !declared.is_empty() {
-                return declared;
-            }
-        }
+    let _ = settings;
+    let carried = mounts_of(args);
+    if !carried.is_empty() {
+        return carried;
     }
-    mounts_of(args)
+    match std::env::var("PRISM_VENUE_URL") {
+        Ok(url) => match gravity_config::fetch_mounts(&url) {
+            Ok((rows, refused)) => {
+                for line in refused {
+                    eprintln!("venue: {line}");
+                }
+                rows.iter()
+                    .map(|m| (m.language.clone(), m.type_name.clone()))
+                    .collect()
+            }
+            Err(e) => {
+                eprintln!("turn: the venue's mount table could not be read: {e:#}");
+                Vec::new()
+            }
+        },
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The mount table the deployment declares: operation language → the mount type serving

@@ -237,15 +237,23 @@ What the wire already provides (verified against the code, not assumed):
   fact has a home. What is not a file anywhere is the *node's* own manifest: the
   mount list is a compiled-in declaration, and the node's own half is its
   effector config.
-- **The mount table is read, not carried** (closed 2026-11-20). It still rides the
-  turn's args — the turn booth runs inside the venue and cannot enumerate the venue's
-  own `/admin` face — but the table it carries is the venue's ANSWER, fetched from
-  `GET /admin/mounts` at submit time (prism ADR-0021), not a copy the client keeps in
-  its config. A connected mount sorts first when two serve one language, so a job
-  does not spend a dispatch learning what the page already said. The config field is
-  gone: with it went the last client-side copy that could drift. The venue still does
-  not inject the table into an application's args — it would have to know the shape of
-  a payload it does not own (prism ADR-0021, rejected).
+- **The mount table is read, not carried** (closed 2026-11-20, amended the same day).
+  THE READER IS THE BOOTH, not the caller. The booth runs inside the venue, and the
+  venue publishes its own address to its guests (`PRISM_VENUE_URL`, inherited by the
+  spawned guest); the booth fetches `GET /admin/mounts` (prism ADR-0021) for the turn
+  it is running — one read per turn, after `args.mounts` found nothing. A connected
+  mount sorts first when two serve one language, so a job does not spend a dispatch
+  learning what the page already said.
+
+  The first shape had the CLI fetch the page and ride it in the turn's args, which
+  left the hole a browser fell into: a page carries no args of its own, so a
+  page-submitted turn had no table and no step could reach a node. It also kept one
+  more copy — the client's — of a fact that has exactly one owner. `settings.mounts`
+  (the row copy, `tag 3` of layout v2, retired) and the args copy are both gone from
+  production; `args.mounts` survives only as an explicit override for a caller with no
+  venue (tests, an embedded deployment). The venue still does not inject the table
+  into an application's args — it would have to know the shape of a payload it does
+  not own (prism ADR-0021, rejected).
 
 ## Related records
 

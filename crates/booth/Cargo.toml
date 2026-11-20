@@ -17,6 +17,9 @@ schematic = { path = "../../../schematic/crates/schematic" }
 aura-booth = { path = "../../../aura/crates/booth" }
 aura-engine = { path = "../../../aura/crates/engine", default-features = false }
 gravity-core = { path = "../core" }
+# The venue's mount table is one function shared with the CLI (gravity-config): two readers with
+# two shapes is the drift ADR-0001 §7 exists to end.
+gravity-config = { path = "../config" }
 induction-guest = { path = "../../../induction/crates/induction-guest" }
 anyhow.workspace = true
 serde.workspace = true

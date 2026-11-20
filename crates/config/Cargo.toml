@@ -7,6 +7,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+# The venue's `/admin/mounts` page is a small blocking GET, and BOTH readers (the CLI before a
+# turn, the turn booth for every turn) now go through one function here — ureq is what the booth
+# already used to reach k10r's doors.
+ureq = { version = "2", features = ["json"] }
+serde_json.workspace = true
 
 [lints]
 workspace = true

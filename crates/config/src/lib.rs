@@ -71,6 +71,64 @@ pub struct MountEntry {
     pub node_connected: bool,
 }
 
+/// THE VENUE'S MOUNT TABLE, read from the venue rather than kept anywhere (prism ADR-0021,
+/// gravity ADR-0001 §7). One function for both readers — the CLI before it submits a turn, and the
+/// turn booth for the turns a PAGE submits, which carry no table at all — because two readers with
+/// two copies is the drift this shape exists to end.
+///
+/// A `ws://` url is the same listener as `http://`: this reader has no TLS client, so a `wss://`
+/// venue must be reached through a local one, and that is said instead of failing obscurely.
+pub fn admin_base(venue_url: &str) -> anyhow::Result<String> {
+    if let Some(rest) = venue_url.strip_prefix("ws://") {
+        return Ok(format!("http://{rest}"));
+    }
+    // A venue that PUBLISHES this to its guests publishes the http origin (prism's
+    // `PRISM_VENUE_URL`): the same listener, already spelled the way `/admin` is read.
+    if venue_url.starts_with("http://") {
+        return Ok(venue_url.trim_end_matches('/').to_string());
+    }
+    anyhow::bail!(
+        "venue url `{venue_url}` is not plain `ws://`: the mount table is read over HTTP and this \
+         reader has no TLS client"
+    )
+}
+
+/// The mount table the venue publishes: `registered` rows only (a row that refused to register is
+/// not callable, whatever it says), and for one language the CONNECTED node first — a job that
+/// addresses the absent node spends a dispatch learning what the venue already said.
+///
+/// Returns the rows and the venue's own refusal lines: a caller that swallows those turns "the
+/// venue has no mounts" into a mystery.
+pub fn fetch_mounts(venue_url: &str) -> anyhow::Result<(Vec<MountEntry>, Vec<String>)> {
+    let url = format!("{}/admin/mounts", admin_base(venue_url)?);
+    let answer: serde_json::Value = ureq::get(&url)
+        .call()
+        .map_err(|e| anyhow::anyhow!("reading {url}: {e}"))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("{url} is not JSON: {e}"))?;
+    let mut entries: Vec<MountEntry> = answer
+        .get("mounts")
+        .cloned()
+        .map(|rows| serde_json::from_value(rows).unwrap_or_default())
+        .unwrap_or_default();
+    let refused: Vec<String> = answer
+        .get("refused")
+        .and_then(serde_json::Value::as_array)
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(|line| line.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.retain(|m| m.registered);
+    entries.sort_by(|a, b| {
+        (&a.language, !a.node_connected, &a.type_name)
+            .cmp(&(&b.language, !b.node_connected, &b.type_name))
+    });
+    Ok((entries, refused))
+}
+
 impl GravityConfig {
     /// Resolve the API key from the environment. The key crosses this
     /// boundary exactly once per call — it never lands in the config

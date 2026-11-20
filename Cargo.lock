@@ -1700,6 +1700,7 @@ dependencies = [
  "axum",
  "ciborium",
  "futures",
+ "gravity-config",
  "gravity-core",
  "induction-guest",
  "induction-host",
@@ -1733,6 +1734,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
+ "ureq",
 ]
 
 [[package]]
