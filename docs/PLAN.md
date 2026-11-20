@@ -39,7 +39,7 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
 
 ## Open items
 
-- [ ] A duplicated patch frame: one patch delivered N times per page, multiplicity growing per turn — measured 2026-11-05, not fixed. The bubbles are addressed per turn, so this is not the shared-region defect; the suspicion is one delivery per `/channel` connection (prism's fan-out). Measure in a clean venue with one tab — the probe that found it had six
+- [ ] A duplicated patch frame: one patch delivered N times per page — seen 2026-11-05 in a six-connection probe, re-measured 2026-11-20 in a clean venue with ONE tab (`SMOKE_PAGE=1 scripts/smoke-venue.sh`): turn 1 draws 2 deltas + `opened` + `done`, turn 2 draws 2 deltas + `done`, nothing twice and nothing carried over. prism's fan-out is one delivery per `/channel` CONNECTION (pinned by `ui_leg::one_emit_draws_exactly_one_frame_however_much_was_said_before`), so a frame that arrives N times means N connections for one screen — the page's connection management (reflux), not the venue. Parked here until a page can be driven for real
 - [ ] `scripts/smoke-venue.sh` is not a gate: it passes end to end (provider, k10r, prism, a real effector node, a code row run on that node) but no workflow references it, and this repo has no CI to reference it from
 - [ ] ADR-0007's model row promises `affinity` and the declared row has no such field (`docs/adr/0007-model-configuration-is-gravitys.md:26` vs `crates/booth/src/bin/turn.rs:126-135`) — add the cold field or amend the ADR
 - [x] Cancellation is a marker the turn polls at its chunk boundary — 2026-11-09 — ADR-0008, aura ADR-0047, effector's `Frame::Interrupt`

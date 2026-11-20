@@ -429,6 +429,7 @@ PY
 MEMBER=$(curl -s "http://127.0.0.1:$MEM_PORT/channels/1/members" \
     | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0]["member_id"])' \
     || fail "k10r members read failed")
+echo "$MEMBER" >"$ROOT/member_id"
 # The status AND the body: a bare `curl -sf` turns "404 with k10r's own words" into
 # "k10r session read failed", which is how this step hid its reason the first time.
 code=$(curl -s -o "$ROOT/session.json" -w '%{http_code}' \
@@ -460,6 +461,103 @@ PY
 # tool — which is why this reads the graph instead of the transcript.
 code=$(curl -s -o "$ROOT/graph.json" -w '%{http_code}' "http://127.0.0.1:$MEM_PORT/graph/37")
 [ "$code" = "200" ] || fail "k10r graph read failed ($code): $(cat "$ROOT/graph.json")"
+# THE RENDERER LEG (prism ADR-0017 §10, gravity ADR-0001): a page is a `/channel` client that
+# speaks `Outflow {dest, data}` and is answered with action lists. `SMOKE_PAGE=1` drives ONE
+# connection through two turns and counts what each turn draws — the measurement gravity's PLAN
+# asks for ("a duplicated patch frame ... measure in a clean venue with one tab"): with one tab, a
+# frame that arrives twice is the venue's, not a second window's.
+if [ "${SMOKE_PAGE:-0}" = "1" ]; then
+    cat > "$ROOT/page.py" <<'PAGE'
+import asyncio
+import collections
+import json
+import sys
+
+import websockets
+
+PORT, MEMBER, TURNS = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+
+def text_of(said):
+    """The wire carries JSON text; a binary frame is the same bytes (the venue transcodes the
+    booth's CBOR into the client's codec and may hand it back as binary)."""
+    return said.decode() if isinstance(said, (bytes, bytearray)) else said
+
+
+async def settle(ws, ops, budget=25.0):
+    """Read until the turn says it is over, collecting every action list."""
+    loop = asyncio.get_event_loop()
+    while budget > 0:
+        started = loop.time()
+        try:
+            said = await asyncio.wait_for(ws.recv(), timeout=min(budget, 5.0))
+        except asyncio.TimeoutError:
+            budget -= loop.time() - started
+            continue
+        budget -= loop.time() - started
+        for op in json.loads(text_of(said)):
+            ops.append(op)
+            # The end is a fact, not a quiet socket: `turn.done` (or `turn.error`) in its slot.
+            if op.get("name") in ("turn.done", "turn.error") or op.get("slot") in (
+                "turn.done",
+                "turn.error",
+            ):
+                return True
+    return False
+
+
+async def main():
+    async with websockets.connect(f"ws://127.0.0.1:{PORT}/channel") as ws:
+        await ws.send(
+            json.dumps(
+                {"dest": "signup", "data": {"login_name": "page", "password": "page-pw"}}
+            )
+        )
+        # The first facts of a connection: token, connect. A page reads them and starts talking.
+        for _ in range(6):
+            said = text_of(await ws.recv())
+            if "token" in said or "connect" in said:
+                break
+        for turn in range(TURNS):
+            ops = []
+            await ws.send(
+                json.dumps(
+                    {
+                        # BARE, no `ui:` marker: a page speaks the stripped vocabulary on both
+                        # sides (prism adds the marker on the way in, strips it on the way out).
+                        # Sending the prefixed name makes the venue read it as a view event to
+                        # paint, which "reaches no renderer" and is otherwise silent.
+                        "dest": "turn.submit",
+                        "data": {
+                            "channel_id": 1,
+                            "member_id": MEMBER,
+                            "user_message": "hi",
+                            "event": "ui:turn.delta",
+                        },
+                    }
+                )
+            )
+            ended = await settle(ws, ops)
+            by_slot = collections.Counter(
+                op.get("slot") or op.get("name") for op in ops
+            )
+            ids = [
+                op.get("data", {}).get("id")
+                for op in ops
+                if isinstance(op.get("data"), dict)
+            ]
+            dupes = [i for i, n in collections.Counter(ids).items() if i and n > 1]
+            print(f"turn {turn + 1}: {len(ops)} actions, ended={ended}, slots={dict(by_slot)}")
+            if dupes:
+                print(f"  DUPLICATED ids: {dupes}")
+
+
+asyncio.run(main())
+PAGE
+    echo "--- the renderer leg: one tab, two turns ---"
+    python3 "$ROOT/page.py" "$PRISM_PORT" "$(cat "$ROOT/member_id")" 2 || fail "the page leg failed"
+fi
+
 python3 - "$ROOT/graph.json" "$ROOT/code_id" <<'PY' || exit 1
 import json
 import sys
