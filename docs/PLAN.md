@@ -23,6 +23,10 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
   - [x] the deployment facts move into the field (`settings` / `models` rows) and the management view — 2026-10-30, screen 2026-10-31 — ADR-0007
   - [x] two renderings (`protocol: data | fluxen`); an event-routed turn says its own end — 2026-10-29 … 2026-10-31 — ADR-0009
   - [x] the speaker comes from the venue's envelope, never from a form — 2026-11-04 … 2026-11-05
+  - [x] a row NAMES its speaker (k10r `sender`), and a process may be an AGENT while it may never be a person — 2026-11-21, ADR-0015 §2
+  - [x] a context is the unit of work somebody can watch: `--context` derives the agent from the name, one invocation is one turn and the channel is the history, the agent picks its supervisors (`find_member` + `supervise`) — 2026-11-21, ADR-0015
+  - [x] the tasks block moves into the projection (`session.owed`, k10r ADR-0021): the booth renders what the store decided and keeps only the code-row→task bindings it needs to CLOSE work (behaviour, not prompt text) — 2026-11-21
+  - [x] a context's turn carries NO TRANSCRIPT, and the STORE decides that: k10r's projection withholds the increment for an AGENT reader and hands it to a person (their instructions move the context, so they need the record), so no caller assembles a prompt of its own — `a_person_reads_the_conversation_and_an_agent_reads_none_of_it` (k10r), and gravity's `a_context_turn_is_not_given_the_history_a_person_turn_is` end to end — 2026-11-21, ADR-0015 §3
   - [x] the shell declares the platform's `auth` region; auth rides the route declaration — 2026-11-06
 - [ ] 4.5 — The unified call model: hot and cold behind one await — ADR-0014 (Proposed; the tier itself already works, the record pins who owns what)
   - [x] 冷热 = the EXECUTOR's retention, not the machine's presence — the key is in the pool or it is not; "not connected" is a third thing, said separately (ADR-0014 §1)
@@ -49,6 +53,7 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
 - [x] ADR-0007's model row promised `affinity` with no such field — settled the other way (2026-11-20): the affinity key is the SESSION, so it is not a column, and the ADR no longer lists it
 - [x] Cancellation is a marker the turn polls at its chunk boundary — 2026-11-09 — ADR-0008, aura ADR-0047, effector's `Frame::Interrupt`
 - [x] `run` for a script that belongs to no skill — 2026-11-09
+- [ ] The CLI's credential is a PASSWORD ENV today (`venue.password_env`): it logs in on every invocation and holds no token, so a script that runs it in a loop logs in in a loop. A token — issued once, kept in a file beside the config like the member id, refreshed by the venue — is a separate mechanism and not this milestone's; recorded 2026-11-21 so the shape is not improvised later
 
 ## Deferred
 
