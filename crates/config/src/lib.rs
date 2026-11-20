@@ -51,14 +51,11 @@ pub struct VenueConfig {
     pub username: String,
     /// The env var NAME holding the password.
     pub password_env: String,
-    /// The venue's mount table (ADR-0001 §7): which mount type serves which operation language.
-    /// Optional — a client that runs no code omits it, and `invoke_skill` then refuses by name
-    /// ("no mount serves `python` here") instead of guessing.
-    #[serde(default)]
-    pub mounts: Option<Vec<MountEntry>>,
 }
 
-/// One entry of the venue's mount table, spelled as the turn carries it.
+/// One mount as `GET /admin/mounts` publishes it (prism ADR-0021). This is an ANSWER, not config:
+/// a client keeps no copy of the table, because two copies of one venue's mounts drift (gravity
+/// ADR-0001's open item, closed by reading).
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct MountEntry {
     /// The operation language the mount runs (`python`, `nushell`, …).
@@ -66,6 +63,12 @@ pub struct MountEntry {
     /// The mount's type name in the venue.
     #[serde(rename = "type")]
     pub type_name: String,
+    /// The venue minted the type (always true for a listed row that registered).
+    #[serde(default)]
+    pub registered: bool,
+    /// The node behind the mount is in the venue's pool right now.
+    #[serde(default)]
+    pub node_connected: bool,
 }
 
 impl GravityConfig {

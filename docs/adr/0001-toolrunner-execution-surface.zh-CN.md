@@ -175,9 +175,12 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
   相比（`prism/src/mounts.rs::dial_in_note`），"语言 ↔ 节点"这条事实因此有了落点。至今
   仍不是**文件**形态的是**节点自己的**清单：挂载清单是编译期声明，节点那一半是它的
   effector config。
-- **仍开：** mount 表随 turn 参数走，于是每个调用方都得自己带（CLI 从它的 venue 配置里
-  读）。prism 已经持有同一张表（现由 prism ADR-0021 在 `GET /admin/mounts` 公布，gravity 何时改为读它、不再自带一份是剩下的那一半），每多一个客户端多一份声明就是一个漂移
-  源；该不该由 venue 在路由 `ui:turn.submit` 时把表注入 turn 参数，尚未裁决。
+- **mount 表是读来的，不是自带的**（2026-11-20 闭合）。它仍随 turn 参数走 —— turn booth 跑在
+  场地里面，无法枚举场地自己的 `/admin` 面 —— 但它带的是场地的**答案**：提交时从
+  `GET /admin/mounts` 取（prism ADR-0021），不是客户端存在配置里的副本。一门语言有两个
+  mount 时，在场的那条排在前面，作业不必靠一次分派去学这一页已经说了的事。配置里的那个
+  字段已删：随之消失的是最后一份会漂的客户端副本。场地仍不把表注入应用的参数 —— 那要求它
+  知道一个不属于它的 payload 的形状（prism ADR-0021，已否决）。
 
 ## 相关记录
 

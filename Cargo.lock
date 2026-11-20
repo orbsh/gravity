@@ -350,7 +350,6 @@ dependencies = [
  "knus",
  "miette",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -379,8 +378,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aura-booth",
- "aura-config",
  "base64 0.22.1",
+ "ciborium",
  "effector-protocol",
  "effector-runtime",
  "futures-util",
@@ -2834,7 +2833,7 @@ dependencies = [
 [[package]]
 name = "okm-core"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "fjall",
  "getrandom 0.3.4",
@@ -2853,7 +2852,7 @@ dependencies = [
 [[package]]
 name = "okm-derive"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -2864,7 +2863,7 @@ dependencies = [
 [[package]]
 name = "okm-dynamic"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "arrow",
  "okm-core",
@@ -2874,7 +2873,7 @@ dependencies = [
 [[package]]
 name = "okm-entry"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "okm-core",
  "okm-dynamic",
@@ -2884,7 +2883,7 @@ dependencies = [
 [[package]]
 name = "okm-lake"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "arrow",
  "bytes",
@@ -2904,7 +2903,7 @@ dependencies = [
 [[package]]
 name = "okm-query"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "okm-core",
 ]
@@ -2912,7 +2911,7 @@ dependencies = [
 [[package]]
 name = "okm-steel"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "im-rc",
  "okm-core",
@@ -2926,7 +2925,7 @@ dependencies = [
 [[package]]
 name = "okm-value"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "indexmap 2.14.2",
  "serde",
@@ -2935,7 +2934,7 @@ dependencies = [
 [[package]]
 name = "okm-vector"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 dependencies = [
  "okm-core",
 ]
@@ -2943,7 +2942,7 @@ dependencies = [
 [[package]]
 name = "okm-wire"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#0f4a5b0a5691f98ff9d7f83128584df88cdca2ff"
+source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
 
 [[package]]
 name = "once_cell"
@@ -3031,6 +3030,7 @@ dependencies = [
  "num-traits",
  "seq-macro",
  "twox-hash",
+ "zstd",
 ]
 
 [[package]]
@@ -5128,3 +5128,31 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zstd"
+version = "0.14.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad5020ab8f27bfc0024ad0a07aed6bf022a16208f479686fbed4fdd0c85eb0b3"
+dependencies = [
+ "zstd-safe",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "8.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d"
+dependencies = [
+ "zstd-sys",
+]
+
+[[package]]
+name = "zstd-sys"
+version = "2.1.3+zstd.1.5.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
+dependencies = [
+ "cc",
+ "pkg-config",
+]

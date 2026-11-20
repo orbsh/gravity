@@ -235,18 +235,92 @@ type Ws = tokio_tungstenite::WebSocketStream<
     tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
 >;
 
-/// The venue's mount table as a turn carries it (ADR-0001 §7): operation language → the mount
-/// type that serves it. It rides the CALL because a client cannot enumerate a venue's mounts and
-/// gravity refuses to guess the match (a language no mount serves is refused by name).
-fn mounts_of(venue: &VenueConfig) -> Value {
-    let entries: Vec<Value> = venue
-        .mounts
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|entry| json!({ "language": entry.language, "type": entry.type_name }))
-        .collect();
-    Value::Array(entries)
+/// The venue's admin base: the same listener that serves the gateway's WS, read as HTTP
+/// (prism serves both on one port, and `/admin` is the operator's face — prism ADR-0017 §7).
+fn admin_base(url: &str) -> Result<String, Failure> {
+    if let Some(rest) = url.strip_prefix("ws://") {
+        return Ok(format!("http://{rest}"));
+    }
+    Err(Failure::Usage(format!(
+        "venue url `{url}` is not plain `ws://`: this client reads the mount table over HTTP and \
+         has no TLS client, so a `wss://` venue must be reached through a local `ws://` one"
+    )))
+}
+
+/// The venue's mount table, READ from the venue (prism ADR-0021) instead of carried in the config.
+/// gravity keeps no copy: two copies of one venue's mounts drift, and the copy in a client's file
+/// is the one nobody updates. It still rides the CALL (ADR-0001 §7) — the turn booth runs inside
+/// the venue and cannot enumerate what the venue's own `/admin` face knows.
+///
+/// Ordering puts a CONNECTED mount first for each language: when two nodes serve `python`, the one
+/// that is here is the one to address, and a job that picks the absent one spends a dispatch
+/// learning what this page already said.
+async fn venue_mounts(venue: &VenueConfig) -> Result<Value, Failure> {
+    let base = admin_base(&venue.url)?;
+    let page = http_get(&format!("{base}/admin/mounts")).await?;
+    let parsed: Value = serde_json::from_str(&page)
+        .map_err(|e| Failure::Link(format!("the venue's /admin/mounts is not JSON: {e}")))?;
+    let mut entries: Vec<gravity_config::MountEntry> = parsed
+        .get("mounts")
+        .cloned()
+        .map(|rows| serde_json::from_value(rows).unwrap_or_default())
+        .unwrap_or_default();
+    for line in parsed
+        .get("refused")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
+        if let Some(text) = line.as_str() {
+            eprintln!("venue: {text}");
+        }
+    }
+    entries.retain(|m| m.registered);
+    entries.sort_by(|a, b| {
+        (&a.language, !a.node_connected, &a.type_name)
+            .cmp(&(&b.language, !b.node_connected, &b.type_name))
+    });
+    Ok(Value::Array(
+        entries
+            .iter()
+            .map(|m| json!({ "language": m.language, "type": m.type_name }))
+            .collect(),
+    ))
+}
+
+/// One `GET` of a small JSON page: `/admin` answers a fixed body and closes, so this needs no
+/// client, no pool and no redirect handling — a request line, the headers, read to the end, split
+/// the body off.
+async fn http_get(url: &str) -> Result<String, Failure> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| Failure::Usage(format!("`{url}` is not an http:// URL")))?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let mut stream = tokio::net::TcpStream::connect(authority)
+        .await
+        .map_err(|e| Failure::Link(format!("connecting to {authority}: {e}")))?;
+    let request =
+        format!("GET /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| Failure::Link(format!("sending to {authority}: {e}")))?;
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .map_err(|e| Failure::Link(format!("reading from {authority}: {e}")))?;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| Failure::Link(format!("{authority} answered without a body: {text}")))?;
+    if !head.starts_with("HTTP/1.1 2") {
+        return Err(Failure::Link(format!(
+            "{authority} refused {}: {head}",
+            url.trim_start_matches("http://")
+        )));
+    }
+    Ok(body.to_string())
 }
 
 /// Read one frame and require its `ev`: the handshake and the auth answer are
@@ -308,9 +382,11 @@ async fn submit(
     content: &str,
 ) -> Result<String, Failure> {
     // `channel_id` is the conversation the application keeps its memory in, `member_id` who is
-    // speaking, and `mounts` is the venue's mount table as its manifest declares it (ADR-0001 §7) —
-    // gravity never guesses a language→type match. The `event` is the PLANE name for the chunks;
-    // the venue hands it back with the marker stripped, which is the `turn.delta` read below.
+    // speaking, and `mounts` is the venue's own answer (read from `/admin/mounts`, not from this
+    // client's config — ADR-0001 §7 as amended) — gravity never guesses a language→type match.
+    // The `event` is the PLANE name for the chunks; the venue hands it back with the marker
+    // stripped, which is the `turn.delta` read below.
+    let mounts = venue_mounts(venue).await?;
     send(
         ws,
         &json!({
@@ -320,7 +396,7 @@ async fn submit(
                 "member_id": cli.member,
                 "user_message": content,
                 "event": "ui:turn.delta",
-                "mounts": mounts_of(venue),
+                "mounts": mounts,
             }
         }),
     )

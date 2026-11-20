@@ -45,12 +45,74 @@ fn venue(mode: Mode) -> (String, Arc<Mutex<Vec<Value>>>) {
         runtime.block_on(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             addr_tx.send(listener.local_addr().unwrap()).unwrap();
-            let (stream, _) = listener.accept().await.unwrap();
-            serve(stream, mode, recorder).await.unwrap();
+            // Two faces on one port, like the venue itself: `/admin` answers plain HTTP and
+            // closes, everything else is the gateway's WS upgrade. The client reads the mount
+            // table from the first WHILE it holds a turn connection on the second, so the two
+            // are served concurrently and this loop runs until the turn connection ends.
+            let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+            loop {
+                tokio::select! {
+                    Some(()) = done_rx.recv() => return,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.unwrap();
+                        // BOTH faces open with `GET /`, so the request line cannot tell them
+                        // apart: the WS upgrade carries `Sec-WebSocket-Key` and the page does not.
+                        let mut head = vec![0u8; 2048];
+                        let mut request = String::new();
+                        for _ in 0..100 {
+                            let peeked = stream.peek(&mut head).await.unwrap();
+                            request = String::from_utf8_lossy(&head[..peeked]).to_ascii_lowercase();
+                            if request.contains("\r\n\r\n") {
+                                break;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                        if !request.contains("sec-websocket-key") {
+                            serve_admin(&mut stream).await.unwrap();
+                        } else {
+                            let recorder = recorder.clone();
+                            let done = done_tx.clone();
+                            tokio::spawn(async move {
+                                serve(stream, mode, recorder).await.unwrap();
+                                let _ = done.send(()).await;
+                            });
+                        }
+                    }
+                }
+            }
         });
     });
     let addr: SocketAddr = addr_rx.recv().unwrap();
     (format!("ws://{addr}"), seen)
+}
+
+/// The venue's own answer (prism ADR-0021). Two mounts for one language, the absent one first in
+/// the array: the client must put the CONNECTED one ahead, which is the only ordering fact worth
+/// pinning here.
+async fn serve_admin(stream: &mut TcpStream) -> anyhow::Result<()> {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut scratch = vec![0u8; 1024];
+    let _ = stream.read(&mut scratch).await?;
+    let body = json!({
+        "mounts": [
+            { "type": "mac.python", "alias": "mac", "language": "python", "carrier": "exec",
+              "runner": "/runners/runner_py_guest.py", "requires": "container", "encoding": "json",
+              "registered": true, "node_connected": false },
+            { "type": "srv.python", "alias": "srv", "language": "python", "carrier": "exec",
+              "runner": "/runners/runner_py_guest.py", "requires": "container", "encoding": "json",
+              "registered": true, "node_connected": true }
+        ],
+        "refused": ["mount [broken.nu] (alias mac) did not register: a refusal the client repeats"]
+    })
+    .to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await?;
+    Ok(())
 }
 
 async fn serve(
@@ -157,9 +219,8 @@ fn run_cli(venue_url: &str, args: &[&str]) -> Output {
                 "url": venue_url,
                 "username": "alice",
                 "password_env": "GRAVITY_TEST_PW",
-                // The venue's mount table, as its manifest declares it (ADR-0001 §7). It rides the
-                // call, so the fake venue can assert it arrived unchanged.
-                "mounts": [{ "language": "python", "type": "runner_py" }]
+                // No mount table here: the client reads the venue's `/admin/mounts` instead, so
+                // there is nothing to keep in sync (ADR-0001 §7 as amended, prism ADR-0021).
             }
         }))
         .unwrap(),
@@ -203,8 +264,11 @@ fn one_command_is_one_turn_per_argument() {
     assert_eq!(args["event"], "ui:turn.delta", "{args}");
     assert_eq!(
         args["mounts"],
-        json!([{ "language": "python", "type": "runner_py" }]),
-        "the mount table rides the call: {args}"
+        json!([
+            { "language": "python", "type": "srv.python" },
+            { "language": "python", "type": "mac.python" }
+        ]),
+        "the venue's page rides the call, connected mount first: {args}"
     );
     assert_eq!(
         frames.iter().filter(|f| f["ev"] == "signup").count(),

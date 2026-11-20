@@ -47,6 +47,13 @@ Config (`GRAVITY_CONFIG`, default `./gravity.json`) needs a `venue` node:
 The password lives in the env var that field NAMES (never in the file). The
 CLI logs in, falls back to signup once on a fresh venue, then submits.
 
+No mount table in that file: before submitting, the CLI reads the venue's own
+`GET /admin/mounts` (same host and port as the WS URL, plain HTTP) and sends the
+answer with the call, a connected mount first when two serve one language. A
+client-side copy would drift from the venue's — that is the whole point of
+publishing it (prism ADR-0021, gravity ADR-0001 §7). A `wss://` venue is refused
+with words, since this client carries no TLS.
+
 `scripts/smoke-venue.sh` puts this binary on a real gateway — stub provider,
 k10r's mem-server, prism, then `gravity --json hi` — and asserts both the reply
 on stdout and the message pair k10r recorded. It is a script and not a test

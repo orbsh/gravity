@@ -237,13 +237,15 @@ What the wire already provides (verified against the code, not assumed):
   fact has a home. What is not a file anywhere is the *node's* own manifest: the
   mount list is a compiled-in declaration, and the node's own half is its
   effector config.
-- **Open:** the mount table travels in the turn's args, so every caller carries
-  it (the CLI reads it from its venue config). Prism already holds the same
-  table, so each further client is a drift source; prism ADR-0021 now publishes it at
-  `GET /admin/mounts`, and whether gravity should read it instead of carrying its copy is the
-  remaining half. Whether the
-  venue should inject the table into the turn's args when it routes
-  `ui:turn.submit` is not decided.
+- **The mount table is read, not carried** (closed 2026-11-20). It still rides the
+  turn's args — the turn booth runs inside the venue and cannot enumerate the venue's
+  own `/admin` face — but the table it carries is the venue's ANSWER, fetched from
+  `GET /admin/mounts` at submit time (prism ADR-0021), not a copy the client keeps in
+  its config. A connected mount sorts first when two serve one language, so a job
+  does not spend a dispatch learning what the page already said. The config field is
+  gone: with it went the last client-side copy that could drift. The venue still does
+  not inject the table into an application's args — it would have to know the shape of
+  a payload it does not own (prism ADR-0021, rejected).
 
 ## Related records
 
