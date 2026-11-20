@@ -24,10 +24,14 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
   - [x] two renderings (`protocol: data | fluxen`); an event-routed turn says its own end — 2026-10-29 … 2026-10-31 — ADR-0009
   - [x] the speaker comes from the venue's envelope, never from a form — 2026-11-04 … 2026-11-05
   - [x] the shell declares the platform's `auth` region; auth rides the route declaration — 2026-11-06
-- [ ] 4.5 — The unified call model: hot and cold behind one await — no ADR yet
-  - [ ] what a VALUE-shaped caller receives when the target is cold (the tier exists in aura; nothing reaches it from a tool call)
-  - [ ] what the caller writes down when it ends its entry — the open question in 2.5
-  - [ ] re-entry: the result arrives as an ordinary dispatch carrying the minimal replay set
+- [ ] 4.5 — The unified call model: hot and cold behind one await — ADR-0014 (Proposed; the tier itself already works, the record pins who owns what)
+  - [x] 冷热 = the EXECUTOR's retention, not the machine's presence — the key is in the pool or it is not; "not connected" is a third thing, said separately (ADR-0014 §1)
+  - [x] the split: the realm declares the identity (`{type}/{key}` of the instance), the effector checks and starts under the slot lock; the caller declares and learns nothing (§2)
+  - [x] what a VALUE-shaped caller receives when the target is cold — a value or a failure; the load rides the same await, never a scheduling state (§3)
+  - [ ] a start's failure named as a start — today `language not resident-carried by this effector build: python` arrives as the call's error, reading like a script bug (§4)
+  - [ ] the tests that make the contract hold: one spawn for two calls of one key, eviction on death, one spawn across the smoke's two page turns
+  - [ ] what the caller writes down when it ends its entry — the minimal replay set is FIXED (`target, key, entry, args digest, code digest, deadline`), the mechanism waits for a caller that must end its entry mid-call (ADR-0014, "What ends the entry")
+  - [ ] re-entry: the result arrives as an ordinary dispatch carrying the minimal replay set — same deferral
 - [x] 4.6 — The execution surface is the runner mount; `start`/`advance`/`run`, `write_code` — 2026-10-26 … 2026-11-09 — ADR-0001, ADR-0004, ADR-0011
   - [x] the whole stack, with a real node: `scripts/smoke-venue.sh` runs a code row on an `effector` node through the venue (stub provider → gravity → prism → mount → `runner_nu` → JSON back) — 2026-11-20
 - [ ] 5 — Skill pull-through and the weight write-back — ADR-0003 §5, ADR-0004
@@ -41,7 +45,7 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
 
 - [ ] A duplicated patch frame: one patch delivered N times per page — seen 2026-11-05 in a six-connection probe, re-measured 2026-11-20 in a clean venue with ONE tab (`SMOKE_PAGE=1 scripts/smoke-venue.sh`): turn 1 draws 2 deltas + `opened` + `done`, turn 2 draws 2 deltas + `done`, nothing twice and nothing carried over. prism's fan-out is one delivery per `/channel` CONNECTION (pinned by `ui_leg::one_emit_draws_exactly_one_frame_however_much_was_said_before`), so a frame that arrives N times means N connections for one screen — the page's connection management (reflux), not the venue. Parked here until a page can be driven for real
 - [ ] `scripts/smoke-venue.sh` is not a gate: it passes end to end (provider, k10r, prism, a real effector node, a code row run on that node) but no workflow references it, and this repo has no CI to reference it from
-- [ ] ADR-0007's model row promises `affinity` and the declared row has no such field (`docs/adr/0007-model-configuration-is-gravitys.md:26` vs `crates/booth/src/bin/turn.rs:126-135`) — add the cold field or amend the ADR
+- [x] ADR-0007's model row promised `affinity` with no such field — settled the other way (2026-11-20): the affinity key is the SESSION, so it is not a column, and the ADR no longer lists it
 - [x] Cancellation is a marker the turn polls at its chunk boundary — 2026-11-09 — ADR-0008, aura ADR-0047, effector's `Frame::Interrupt`
 - [x] `run` for a script that belongs to no skill — 2026-11-09
 
