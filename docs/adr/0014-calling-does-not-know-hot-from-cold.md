@@ -32,8 +32,9 @@ the evidence:
 - **A tool call reaches the tier, keyed by the conversation.** gravity hands
   `world.session` where the key goes (`doors.mount(&mount, world.session, …)` →
   `ctx.invoke(type, key, "execute", args)` → `{mount}/{session}`), so one
-  conversation's calls share a runner and two conversations never share module
-  state.
+  conversation's calls share one slot and two conversations never share module
+  state. What stays in that slot is the CARRIER's business (§5): the
+  registry is reached, and a one-shot carrier still spawns a process per call.
 
 PLAN 4.5 recorded the opposite — "the tier exists in aura; nothing reaches it from
 a tool call" — and that line is stale rather than wrong when written: the key
@@ -64,12 +65,21 @@ existed before anything passed a session through it.
    new state: the message says the executor could not be brought up and what the
    node did about it.
 
-5. **The key is semantic, not an optimization.** `{mount}/{session}` says: a
-   conversation's runner state is its own, warm inside the conversation, never
-   shared across people. A per-call key would make every call cold and discard
-   state a script legitimately builds; a key that ignored the session would let one
-   person's module globals answer another's call. No caller chooses a key, and
-   there is no knob.
+5. **The key decides SHARING; the carrier decides whether there is anything to
+   share.** `{mount}/{session}` says: a conversation's executor is its own, warm
+   inside the conversation, never shared across people. A per-call key would make
+   every call cold and discard state a script legitimately builds; a key that
+   ignored the session would let one person's module globals answer another's
+   call. No caller chooses a key, and there is no knob.
+
+   A resident carrier (`induction`) keeps one child per key and state rides it. A
+   one-shot carrier (`exec`) is one process per call BY DECLARATION (effector
+   ADR-0035): the registry holds a slot, the slot's executor starts and exits, and
+   every call is cold in the only sense that carrier has. That is a choice written
+   into the mount rather than an accident — nushell cannot evaluate a delivered
+   script in a resident process (no `eval`, and `source` wants a parse-time
+   constant), so a nu runner is one-shot by necessity and a warm leg needs a
+   carrier that can stay, which today means python.
 
 6. **Residency is not tracked on the plane.** A plane-side table of "which
    executors are warm" would drift from the children it describes, and the first
@@ -135,6 +145,13 @@ reconstructed afterwards.
   one sentence that says whose failure it is.
 - **gravity gains a pinned reason** for handing the session where the key goes, so
   that "optimization" cannot quietly turn a warm conversation cold.
+- **No tool call has ever been served by a warm executor.** gravity's runner
+  mounts declare `exec`, so the tier is reached and nothing is retained: three
+  calls, three processes. That is written down now and pinned from the outside (the
+  smoke asserts the node holds no child once the calls are done), and the warm path
+  through a tool call needs a resident runner that takes `args.code` — the python
+  guest (§5). Until then "hot" is a fact about a carrier, exercised only by
+  effector's own tests.
 - **PLAN 4.5 is corrected**: the tier is reached, and what remains open is the
   replay set's mechanism, not the residency rule.
 
@@ -148,8 +165,17 @@ Planned, not written:
   wording of a start failure.
 - aura — one test naming the key a mount call produces (`{type}/{key}` of the
   instance), so a refactor that changes what is shared fails at home.
-- `scripts/smoke-venue.sh` — the same two page turns must show ONE spawn, not two:
-  the leg that says "warm", beside the leg that says "ran".
+- `scripts/smoke-venue.sh` — the one-shot half, which is the half the deployment
+  actually runs: after the CLI's turn and the page's two, the node holds NO child,
+  because the mount declares `exec`. A resident child there would mean the
+  declaration and the wire disagree.
+
+Written (effector `crates/runtime/tests/exec_carrier.rs`, on real children, pids
+read from inside the guest):
+
+- `one_key_is_one_child_and_a_second_key_is_a_second_child`
+- `a_dead_child_is_evicted_and_the_next_call_starts_a_new_one`
+- `a_start_failure_names_the_start_not_the_code`
 
 ## Related records
 

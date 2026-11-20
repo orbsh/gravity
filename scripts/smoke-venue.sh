@@ -314,7 +314,8 @@ cat > "$ROOT/effector.json" <<JSON
 }
 JSON
 "$EFFECTOR_REPO/target/debug/effector" "$ROOT/effector.json" >"$ROOT/effector.log" 2>&1 &
-PIDS="$PIDS $!"
+NODE_PID=$!
+PIDS="$PIDS $NODE_PID"
 tries=0
 until curl -s "http://127.0.0.1:$PRISM_PORT/admin/mounts" | grep -q '"node_connected":true'; do
     tries=$((tries + 1))
@@ -568,6 +569,18 @@ asyncio.run(main())
 PAGE
     echo "--- the renderer leg: one tab, two turns ---"
     python3 "$ROOT/page.py" "$PRISM_PORT" 2 || fail "the page leg failed"
+fi
+
+# RESIDENCY IS THE CARRIER'S (gravity ADR-0014 §5): this mount's runner is the one-shot
+# `exec` form — one process per call, nothing retained (runner_nu.nu says so in its own
+# header), so the node must hold NO child once the calls are done. A resident child here
+# would mean the declaration and the wire disagree.
+runners=$(pgrep -P "$NODE_PID" | wc -l)
+if [ "$runners" -eq 0 ]; then
+    echo "ok: the one-shot runner left no child behind (exec: one process per call)"
+else
+    pgrep -aP "$NODE_PID" | sed 's/^/  /'
+    fail "the mount declares the one-shot carrier, but the node holds $runners child(ren)"
 fi
 
 python3 - "$ROOT/graph.json" "$ROOT/code_id" <<'PY' || exit 1

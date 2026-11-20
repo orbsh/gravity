@@ -29,7 +29,8 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
   - [x] the split: the realm declares the identity (`{type}/{key}` of the instance), the effector checks and starts under the slot lock; the caller declares and learns nothing (§2)
   - [x] what a VALUE-shaped caller receives when the target is cold — a value or a failure; the load rides the same await, never a scheduling state (§3)
   - [ ] a start's failure named as a start — today `language not resident-carried by this effector build: python` arrives as the call's error, reading like a script bug (§4)
-  - [ ] the tests that make the contract hold: one spawn for two calls of one key, eviction on death, one spawn across the smoke's two page turns
+  - [x] the tests that make the contract hold — `one_key_is_one_child_and_a_second_key_is_a_second_child`, `a_dead_child_is_evicted_and_the_next_call_starts_a_new_one`, `a_start_failure_names_the_start_not_the_code` (effector `crates/runtime/tests/exec_carrier.rs`, real children, pids read from inside the guest)
+  - [ ] RESIDENCY IS THE CARRIER'S (§5): `exec` is one process per call by declaration, `induction` keeps a child — and gravity's runners are one-shot, so the warm path has never run through a tool call. Needs a resident runner that takes `args.code` (nu cannot: no eval), i.e. the python guest; the smoke pins the one-shot half today (the node holds no child after the calls)
   - [ ] what the caller writes down when it ends its entry — the minimal replay set is FIXED (`target, key, entry, args digest, code digest, deadline`), the mechanism waits for a caller that must end its entry mid-call (ADR-0014, "What ends the entry")
   - [ ] re-entry: the result arrives as an ordinary dispatch carrying the minimal replay set — same deferral
 - [x] 4.6 — The execution surface is the runner mount; `start`/`advance`/`run`, `write_code` — 2026-10-26 … 2026-11-09 — ADR-0001, ADR-0004, ADR-0011
