@@ -354,6 +354,8 @@ async fn mem_server_with_compression() -> String {
 /// The ONE member this fixture writes as: k10r's default member (its uuid is all zeros with a
 /// trailing 1). Member ids are identities since k10r ADR-0025 — "1" is a uuid, not a counter.
 const TEST_MEMBER: &str = "00000000-0000-0000-0000-000000000001";
+/// A member the store has never seen, registered as an AGENT by the name the turn carries.
+const CONTEXT_MEMBER: &str = "6f1d3d0e-0000-4000-8000-0000000000cc";
 
 /// The caller's payload. `event` is the data protocol's name for its chunks — gravity owns
 /// no event names, so a consumer that wants `{"delta": …}` says what to call it.
@@ -1029,7 +1031,9 @@ async fn a_tool_call_reaches_its_door_and_feeds_back() {
                 "write_code",
                 "open_task",
                 "move_task",
-                "list_tasks"
+                "list_tasks",
+                "find_member",
+                "supervise"
             ],
             "{body}"
         );
@@ -1306,7 +1310,7 @@ async fn the_compression_branch_lands_the_served_summary() {
         (2_000, "second message of the span"),
         (9_000, "third message of the span"),
     ] {
-        surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
+        surface.append_message(7, ts, 0, 0, 0, text, None).await.unwrap();
     }
 
     let (engine, seen) = boot(&store_url, &endpoint).await;
@@ -1346,7 +1350,7 @@ async fn the_cut_the_pass_chooses_lands_beside_the_summary() {
         (2_000, "second message of the span"),
         (9_000, "third message of the span"),
     ] {
-        surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
+        surface.append_message(7, ts, 0, 0, 0, text, None).await.unwrap();
     }
 
     let (engine, seen) = boot(&store_url, &endpoint).await;
@@ -1394,7 +1398,7 @@ async fn the_review_branch_writes_the_facts_it_found() {
         (2_000, "second message of the span"),
         (9_000, "third message of the span"),
     ] {
-        surface.append_message(7, ts, 0, 0, 0, text).await.unwrap();
+        surface.append_message(7, ts, 0, 0, 0, text, None).await.unwrap();
     }
 
     let (engine, seen) = boot(&store_url, &endpoint).await;
@@ -2507,4 +2511,67 @@ async fn a_hosted_shell_sets_its_region_instead_of_replacing_the_page() {
          that spelled the prefix itself would be spelling a name it was never told: {head}"
     );
     assert_eq!(head["data"]["type"], "frame", "the tree travels unchanged");
+}
+
+/// A CONTEXT'S TURN CARRIES NO TRANSCRIPT (ADR-0015 §3): the rows exist for the people watching,
+/// and the model gets the current message plus its procedures and memory. A person's turn is the
+/// other way round — for them the history IS the conversation.
+#[tokio::test]
+async fn a_context_turn_is_not_given_the_history_a_person_turn_is() {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let bodies_for_route = bodies.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move |request: axum::extract::Request| {
+            let bodies = bodies_for_route.clone();
+            async move {
+                let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&bytes).to_string());
+                let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &format!("http://{addr}")).await;
+
+    // A PERSON FIRST: their turn is a conversation, and its rows are history from then on.
+    run_turn(&engine, &seen, turn_args("first words")).await.unwrap();
+    let first = bodies.lock().unwrap().last().cloned().expect("a request");
+    assert!(first.contains("first words"), "the user says it: {first}");
+
+    // A CONTEXT: an agent the store has never met, registered by the name it brings. It writes in
+    // the same channel — and is NOT handed the conversation it did not have.
+    let mut context_args = turn_args("now");
+    context_args["member_id"] = json!(CONTEXT_MEMBER);
+    context_args["member_name"] = json!("drift check");
+    run_turn(&engine, &seen, context_args).await.unwrap();
+    let context_prompt = bodies.lock().unwrap().last().cloned().expect("a request");
+    assert!(
+        context_prompt.contains("now"),
+        "the current message is always there: {context_prompt}"
+    );
+    assert!(
+        !context_prompt.contains("first words"),
+        "a context is not fed the transcript: {context_prompt}"
+    );
+
+    // A PERSON, in the same channel: the history rides.
+    run_turn(&engine, &seen, turn_args("and now me")).await.unwrap();
+    let person_prompt = bodies.lock().unwrap().last().cloned().expect("a request");
+    assert!(
+        person_prompt.contains("first words"),
+        "a person's turn is the conversation: {person_prompt}"
+    );
 }

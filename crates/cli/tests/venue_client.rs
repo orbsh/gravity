@@ -297,6 +297,53 @@ fn one_command_is_one_turn_per_argument() {
     );
 }
 
+/// A CONTEXT IS A SPEAKER OF ITS OWN: `--context` names it and derives its identity from that
+/// name, so the same name is the same agent on every run — which is exactly what makes a series of
+/// ONE-TURN invocations accumulate into one conversation in the channel. The person who started
+/// the process is not the voice of it; that is the whole point of a separate identity.
+#[test]
+fn a_context_speaks_as_an_agent_derived_from_its_name() {
+    let (url, seen) = venue(Mode::Happy);
+    let out = run_cli(&url, &["--context", "drift check", "hi"]);
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let args = submit_args(&seen);
+    assert_eq!(args["member_name"], "drift check", "{args}");
+    assert!(
+        args.get("supervisor").is_none(),
+        "the agent decides who supervises; the client does not carry one: {args}"
+    );
+    let first = args["member_id"].as_str().unwrap().to_string();
+    assert_eq!(first.len(), 36, "a uuid-shaped identity: {first}");
+
+    // The same context again: the same identity, because the derivation is the name.
+    let (again_url, again_seen) = venue(Mode::Happy);
+    let again = run_cli(&again_url, &["--context", "drift check", "hi"]);
+    assert!(again.status.success(), "exit: {:?}", again.status);
+    assert_eq!(submit_args(&again_seen)["member_id"], first.as_str());
+
+    // A different context: a different agent.
+    let (other_url, other_seen) = venue(Mode::Happy);
+    let other = run_cli(&other_url, &["--context", "nightly", "hi"]);
+    assert!(other.status.success(), "exit: {:?}", other.status);
+    assert_ne!(submit_args(&other_seen)["member_id"], first.as_str());
+
+    // Two ways of saying who speaks are one too many: refused before a socket is opened.
+    let (url, seen) = venue(Mode::Happy);
+    let both = run_cli(&url, &["--context", "x", "--member", first.as_str(), "hi"]);
+    assert_eq!(both.status.code(), Some(2), "usage failure");
+    assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+}
+
+/// The args of the (single) `ui:turn.submit` a fixture recorded.
+fn submit_args(seen: &Arc<Mutex<Vec<Value>>>) -> Value {
+    let frames = seen.lock().unwrap().clone();
+    frames
+        .iter()
+        .find(|f| f["ev"] == "ui:turn.submit")
+        .expect("one submit")["args"]
+        .clone()
+}
+
 /// THE MEMBER ID IS AN IDENTITY, so it is minted once and kept: the first run writes one beside
 /// the config and says so, later runs read it, and an operator who pastes the account's uuid out
 /// of prism changes who the client speaks as without touching a flag.

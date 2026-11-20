@@ -73,6 +73,10 @@ pub async fn turn(
 
     // 4. Append the delta: one exchange, one timestamp, sub 0/1.
     let ts = now_ms();
+    // WHO said each row: the human for the ask, the agent for the answer. Without this the
+    // transcript attributes both to one default member, and a channel with two people reads as
+    // a monologue (k10r ADR-0009 §1).
+    let member = member_id.to_string();
     store
         .append_message(
             channel_id,
@@ -81,10 +85,19 @@ pub async fn turn(
             role::USER,
             kind::TEXT,
             &input.user_message,
+            Some(&member),
         )
         .await?;
     store
-        .append_message(channel_id, ts, 1, role::ASSISTANT, kind::TEXT, &reply)
+        .append_message(
+            channel_id,
+            ts,
+            1,
+            role::ASSISTANT,
+            kind::TEXT,
+            &reply,
+            Some(crate::AGENT_MEMBER),
+        )
         .await?;
 
     Ok(TurnOutput { reply })

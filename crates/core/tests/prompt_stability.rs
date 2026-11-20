@@ -90,15 +90,15 @@ async fn same_state_assembles_byte_identical_views() {
     // A conversation with every role the assembly maps (user, assistant,
     // tool) — the richest stable view.
     surface
-        .append_message(7, 100, 0, role::USER, kind::TEXT, "first question")
+        .append_message(7, 100, 0, role::USER, kind::TEXT, "first question", None)
         .await
         .unwrap();
     surface
-        .append_message(7, 100, 1, role::ASSISTANT, kind::TEXT, "first answer")
+        .append_message(7, 100, 1, role::ASSISTANT, kind::TEXT, "first answer", None)
         .await
         .unwrap();
     surface
-        .append_message(7, 200, 0, role::TOOL, kind::TEXT, "tool observation")
+        .append_message(7, 200, 0, role::TOOL, kind::TEXT, "tool observation", None)
         .await
         .unwrap();
 
@@ -138,13 +138,13 @@ async fn same_state_assembles_byte_identical_views() {
         .unwrap()
         .status();
     assert_eq!(status, reqwest::StatusCode::OK);
-    http.append_message(7, 100, 0, role::USER, kind::TEXT, "first question")
+    http.append_message(7, 100, 0, role::USER, kind::TEXT, "first question", None)
         .await
         .unwrap();
-    http.append_message(7, 100, 1, role::ASSISTANT, kind::TEXT, "first answer")
+    http.append_message(7, 100, 1, role::ASSISTANT, kind::TEXT, "first answer", None)
         .await
         .unwrap();
-    http.append_message(7, 200, 0, role::TOOL, kind::TEXT, "tool observation")
+    http.append_message(7, 200, 0, role::TOOL, kind::TEXT, "tool observation", None)
         .await
         .unwrap();
     let v3 = http.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
@@ -164,7 +164,7 @@ async fn appended_history_is_prefix_stable() {
     let surface = InProcessSurface::open(dir.path()).unwrap();
 
     surface
-        .append_message(7, 100, 0, role::USER, kind::TEXT, "q1")
+        .append_message(7, 100, 0, role::USER, kind::TEXT, "q1", None)
         .await
         .unwrap();
     let v1 = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
@@ -173,11 +173,11 @@ async fn appended_history_is_prefix_stable() {
     // The turn lands: user + assistant appended (one ts, subs 0/1 —
     // a fresh ts, the same-key overwrite is the caller's bug).
     surface
-        .append_message(7, 150, 0, role::USER, kind::TEXT, "a1")
+        .append_message(7, 150, 0, role::USER, kind::TEXT, "a1", None)
         .await
         .unwrap();
     surface
-        .append_message(7, 150, 1, role::ASSISTANT, kind::TEXT, "r1")
+        .append_message(7, 150, 1, role::ASSISTANT, kind::TEXT, "r1", None)
         .await
         .unwrap();
     let v2 = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();
@@ -201,15 +201,15 @@ async fn checkpoint_compression_rewrites_the_view_deliberately() {
     let dir = tempfile::TempDir::new().unwrap();
     let surface = InProcessSurface::open(dir.path()).unwrap();
     surface
-        .append_message(7, 100, 0, role::USER, kind::TEXT, "old q")
+        .append_message(7, 100, 0, role::USER, kind::TEXT, "old q", None)
         .await
         .unwrap();
     surface
-        .append_message(7, 100, 1, role::ASSISTANT, kind::TEXT, "old a")
+        .append_message(7, 100, 1, role::ASSISTANT, kind::TEXT, "old a", None)
         .await
         .unwrap();
     surface
-        .append_message(7, 200, 0, role::USER, kind::TEXT, "new q")
+        .append_message(7, 200, 0, role::USER, kind::TEXT, "new q", None)
         .await
         .unwrap();
     let before = surface.fetch_session(7, gravity_core::surface::default_member()).await.unwrap();

@@ -905,17 +905,61 @@ fn turn(
             channel_of(&store_url, member)?
         }
     };
-    // WHO is speaking. A PAGE has no field for it — the venue mounts `sender {device, user}`
-    // into every page event, and k10r's member id IS the user's uuid (k10r ADR-0025), so the
-    // answer comes from the transport, never from a form. A DIRECT caller (the CLI, a sibling
-    // booth, the test seam) has no envelope to stamp, and it names the member itself: that is
-    // the caller declaring its own identity, not a page claiming another's.
-    let member_id = match user {
-        Some(user) => user.to_string(),
-        None => args
-            .get("member_id")
-            .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())))
-            .context("turn: no `sender.user` on the envelope and no `member_id` in the args —                       a page is identified by the venue, a direct caller names its member")?,
+    // WHO is speaking. A PAGE has no field for it — the venue mounts `sender {device, user}` into
+    // every page event, and k10r's member id IS the user's uuid (k10r ADR-0025), so a page is
+    // identified by the transport, never by a form.
+    //
+    // A PROCESS is a different kind of speaker: the CLI runs a task, and a task is not the person
+    // who started it. So a declared `member_id` may OUTRANK the venue's stamp — but only if k10r
+    // says that identity is an AGENT. A client may be an agent; it may never be a person, or one
+    // caller could speak as another. An agent nobody has registered yet is registered here, under
+    // the name the caller gives it (the task's own name), which is the whole point of the special
+    // user: the transcript says "drift check", not the operator's uuid.
+    let declared = args
+        .get("member_id")
+        .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())));
+    // A CONTEXT's turn is not a chat turn: the rows exist for the people watching, not for the
+    // model — the agent works from its procedures and what it has committed to memory, and k10r
+    // hands it the current message (ADR-0015 §3). So the identity decision answers two things:
+    // who speaks, and whether this speaker is a context.
+    let member_id = match (user, declared) {
+        (Some(user), None) => user.to_string(),
+        (Some(user), Some(declared)) if declared.as_str() == user => declared,
+        (Some(user), Some(declared)) => match member_kind(&store_url, &declared)? {
+            // role 1 = AGENT: a process speaking for itself, which is the one thing a declared id
+            // is allowed to override. The context's name rides along the first time it speaks, and
+            // that is what the store registers it under.
+            Some(AGENT_ROLE) => declared,
+            // A person's identity is the venue's to give (it knows who logged in). A client that
+            // names somebody else is claiming an identity it cannot prove, and it is not honoured.
+            Some(_) => user.to_string(),
+            None => match args.get("member_name").and_then(Value::as_str) {
+                Some(name) => {
+                    join_member(&store_url, channel_id, &declared, name, AGENT_ROLE)?;
+                    declared
+                }
+                // Unknown and unnamed: this is the caller's own fallback id, and the stamp wins.
+                None => user.to_string(),
+            },
+        },
+        (None, Some(declared)) => {
+            // No stamp: a caller naming itself. A name that comes WITH an identity is a context
+            // declaring its own agent (the CLI on a venue that cannot stamp it) and is registered
+            // as one; without a name the store's own record says which kind it is, and an
+            // identity the store has never seen stays what it claimed to be — itself.
+            if let Some(name) = args.get("member_name").and_then(Value::as_str) {
+                if member_kind(&store_url, &declared)?.is_none() {
+                    join_member(&store_url, channel_id, &declared, name, AGENT_ROLE)?;
+                }
+            }
+            declared
+        }
+        // Nobody: no venue stamp and no declared identity. There is no such speaker, and a row
+        // with no speaker is the lie this whole path exists to remove.
+        (None, None) => anyhow::bail!(
+            "turn: no `sender.user` on the envelope and no `member_id` in the args — a page is \
+             identified by the venue, a caller names its member"
+        ),
     };
     let user_message = text_field(args, "user_message")
         .context("turn: missing `user_message`")?;
@@ -940,10 +984,14 @@ fn turn(
     // here: it returns the fact DATA, which this booth does not assemble.
     let format = MemoryFormat::from_config(Some(turn.memory_format.as_str()))
         .context("turn: the configured memory format is unusable")?;
+    // `scope` names the memory this turn is about — a deployment fact the caller states, the way it
+    // states its channel. What the projection CARRIES from it (head, owed, the record) is still
+    // k10r's decision.
     let url = format!(
-        "{store_url}/channels/{channel_id}/members/{}/session?format={}",
+        "{store_url}/channels/{channel_id}/members/{}/session?format={}&scope={}",
         turn.member_id,
-        format.name()
+        format.name(),
+        turn.memory_scope
     );
     let resp = ureq::get(&url)
         .call()
@@ -968,18 +1016,16 @@ fn turn(
             }));
         }
     }
-    // What is OPEN is what the work is: a turn that cannot see its own tasks
-    // starts every conversation from zero, which is the state this whole stack
-    // exists to end. Best effort — a store that cannot answer is the store's
-    // problem, and the model can still ask with `list_tasks`.
-    //
-    // The same rows answer a second question the loop asks: which code rows
-    // finish which tasks (ADR-0003 §3). Fetched ONCE here, so the dispatch
-    // below reads a local table and never the store.
-    let owed = fetch_tasks(&turn.store_url, turn.memory_scope);
-    if let Some(block) = owed.as_deref().and_then(gravity_booth::tasks::render_owed) {
+    // What is OPEN is what the work is: a turn that cannot see its own tasks starts every
+    // conversation from zero, which is the state this whole stack exists to end. The TEXT is the
+    // store's (`owed` rides the projection): which work a prompt holds, and in what shape, is
+    // knowledge policy, and it is decided there — not re-decided in every caller.
+    if let Some(block) = view.get("owed").and_then(Value::as_str) {
         messages.push(json!({ "role": "system", "content": block }));
     }
+    // The same rows answer a question that is BEHAVIOUR rather than text: which code rows finish
+    // which tasks (ADR-0003 §3). Fetched once here, so the dispatch below reads a local table.
+    let owed = fetch_tasks(&turn.store_url, turn.memory_scope);
     let ends_on = gravity_booth::tasks::bindings(owed.as_deref().unwrap_or_default());
     // The tail branches see the same records, NUMBERED: an operation that must
     // point at one (the compression's cut) answers with an index, because the
@@ -988,14 +1034,15 @@ fn turn(
     // A position in the log is a POINTER — `(turn, ts, sub)` since k10r ADR-0024:
     // the turn comes before the millisecond, so two turns cannot be confused.
     let mut keys: Vec<Pointer> = Vec::new();
-    for (index, entry) in view
+    // The increment is whatever k10r decided to hand THIS reader (ADR-0015 §3): a person's turn
+    // carries the record, a context's turn carries none — and the decision is the store's, because
+    // a prompt assembled here would be a knowledge policy in every call site.
+    let history: Vec<Value> = view
         .get("increment")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .enumerate()
-    {
+        .unwrap_or_default();
+    for (index, entry) in history.into_iter().enumerate() {
         // The entry is FLAT and `role` is the resolved NAME — k10r's mapping, the
         // one place a code becomes a label. `null` means a stored code that
         // mapping does not know (a writer's bug: k10r does not police codes and
@@ -1076,6 +1123,7 @@ fn turn(
         &user_message,
         Role::User,
         Kind::Text,
+        &turn.member_id,
     )?;
     // The turn's identity on the wire is the log key's first two segments: an id is
     // minted PER CHANNEL, so a bare number names a different conversation's turn in
@@ -1163,6 +1211,7 @@ fn turn(
                 memory_scope: Some(turn.memory_scope),
                 mounts: &mounts,
                 session: &session,
+                channel: Some(turn.channel_id),
                 ends_on: &ends_on,
             };
             // The waiting requests of a run that stopped on a person, captured
@@ -2166,6 +2215,7 @@ fn answer(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
         memory_scope: Some(settings.memory_scope),
         mounts: &mounts,
         session: &member,
+        channel: None,
         ends_on: &ends_on,
     };
     let value = {
@@ -2447,6 +2497,62 @@ impl Doors for VenueDoors<'_, '_> {
 /// text collides only if two members hash alike, which one deployment will not see; the day a
 /// deployment does, the fix is a mapping row, not a different hash.
 const GRAVITY_APP_ID: &str = "4f1b6c1e-0d3a-5f2b-9c47-6a1d0e5b8c22";
+
+/// k10r's member role axis (its `channel::member_role`): the ONE thing serialization needs. Only
+/// the agent half is named here — a person's rows never need the constant, because a person is
+/// identified by the venue's stamp, not by anything this process decides.
+const AGENT_ROLE: u8 = 1;
+
+/// What kind of identity `member` is in the store, or `None` when the store has never heard of it.
+/// Absence is an answer here — the caller decides whether to register it, and inventing a role
+/// would let a typo become a member.
+fn member_kind(store_url: &str, member: &str) -> anyhow::Result<Option<u8>> {
+    let Some(body) = member_row(store_url, member)? else {
+        return Ok(None);
+    };
+    Ok(body.get("role").and_then(Value::as_u64).map(|role| role as u8))
+}
+
+/// The store's answer for one member, `None` when it has never heard of them. A 404 arrives as a
+/// transport ERROR in ureq, which is why it is matched rather than checked on a response.
+fn member_row(store_url: &str, member: &str) -> anyhow::Result<Option<Value>> {
+    match ureq::get(&format!("{store_url}/members/{member}")).call() {
+        Ok(resp) => Ok(Some(
+            serde_json::from_reader(resp.into_reader()).context("turn: bad member answer")?,
+        )),
+        Err(ureq::Error::Status(404, _)) => Ok(None),
+        Err(e) => Err(e).context("turn: asking the store about a member failed"),
+    }
+}
+
+/// Register a member AND their membership in one commit (k10r's `POST /channels/{id}/members`).
+/// Idempotent by key, so calling it for someone already in the channel is a no-op rewrite.
+fn join_member(
+    store_url: &str,
+    channel: u64,
+    member: &str,
+    name: &str,
+    role: u8,
+) -> anyhow::Result<()> {
+    let resp = ureq::post(&format!("{store_url}/channels/{channel}/members"))
+        .set("Content-Type", "application/json")
+        .send_string(
+            &json!({
+                "member_id": member,
+                "display_name": name,
+                "role": role,
+                "since_ms": now_ms(),
+            })
+            .to_string(),
+        )
+        .context("turn: joining a member failed")?;
+    anyhow::ensure!(
+        (200..300).contains(&resp.status()),
+        "turn: joining `{member}` returned {}",
+        resp.status()
+    );
+    Ok(())
+}
 
 fn channel_id_for(member: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
@@ -3008,6 +3114,10 @@ struct TurnLog<'a> {
     store_url: &'a str,
     channel: u64,
     turn_id: u64,
+    /// The human whose turn this is: their rows belong to them, and everything the turn itself
+    /// says belongs to the agent (`gravity_core::AGENT_MEMBER`). Two people in one channel is
+    /// the ordinary case now, so a row that does not name its speaker is a lie.
+    user: &'a str,
     /// `(ts_ms, sub)` of every row this turn wrote, in order. The keep set is
     /// chosen from this, so it can never name a row that was not written.
     rows: Vec<(u64, u16)>,
@@ -3020,17 +3130,40 @@ impl<'a> TurnLog<'a> {
     /// log inside the same append that puts that sentence there, so two turns starting
     /// in one channel cannot be handed one id. A retry that never lands a row costs
     /// nothing but a gap.
+    #[allow(clippy::too_many_arguments)] // the row's identity IS this wide
     fn open(
         store_url: &'a str,
         channel: u64,
         content: &str,
         role: Role,
         kind: Kind,
+        user: &'a str,
     ) -> anyhow::Result<(Self, (u64, u16))> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .context("turn: clock before epoch")?;
+        // The agent is a MEMBER of the channel, named the same way every human is: the rows it
+        // says are attributed to it by id, and this is what gives that id a readable name in the
+        // transcript. Idempotent (a member is a row in ns 42), so one call per turn costs a write
+        // and saves every later reader a `member-<uuid>` bracket.
+        let joined = ureq::post(&format!("{store_url}/channels/{channel}/members"))
+            .set("Content-Type", "application/json")
+            .send_string(
+                &json!({
+                    "member_id": gravity_core::AGENT_MEMBER,
+                    "display_name": gravity_core::AGENT_NAME,
+                    "role": 1, // AGENT — the one axis serialization needs
+                    "since_ms": ts,
+                })
+                .to_string(),
+            )
+            .context("turn: registering the agent as a member failed")?;
+        anyhow::ensure!(
+            (200..300).contains(&joined.status()),
+            "turn: registering the agent returned {}",
+            joined.status()
+        );
         let url = format!("{store_url}/channels/{channel}/messages");
         let resp = ureq::post(&url)
             .set("Content-Type", "application/json")
@@ -3042,6 +3175,9 @@ impl<'a> TurnLog<'a> {
                     "role": role.code(),
                     "kind": kind.code(),
                     "content": content,
+                    // The opening row is the human's own words, so it is THEIRS — this is the row
+                    // the attribution is read from most often.
+                    "sender": user,
                 })
                 .to_string(),
             )
@@ -3062,6 +3198,7 @@ impl<'a> TurnLog<'a> {
                 store_url,
                 channel,
                 turn_id,
+                user,
                 rows: vec![(ts, 0)],
             },
             (ts, 0),
@@ -3091,6 +3228,13 @@ impl<'a> TurnLog<'a> {
                     "role": role.code(),
                     "kind": kind.code(),
                     "content": content,
+                    // The human's own words are theirs; everything the turn does or says is the
+                    // agent's. Said per row, because the transcript is read by people.
+                    "sender": if role == Role::User {
+                        self.user
+                    } else {
+                        gravity_core::AGENT_MEMBER
+                    },
                 })
                 .to_string(),
             )

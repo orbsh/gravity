@@ -555,6 +555,13 @@ echo "cli exit: $code"
 cat "$ROOT/cli.err"
 [ "$code" -eq 0 ] || fail "the CLI exited $code"
 
+# WHO the CLI is: the uuid it minted into `member_id` beside its config on the first run (an
+# operator replaces that file with the account's uuid from prism). Captured here because the
+# rows it wrote carry it, and the attribution check below reads them back.
+HUMAN=$(cat "$ROOT/member_id" 2>/dev/null || true)
+[ -n "$HUMAN" ] || fail "the CLI never wrote its member id ($ROOT/member_id)"
+echo "ok: the CLI's own id is $HUMAN (a venue that knows the account stamps that instead)"
+
 python3 - "$ROOT/cli.out" "$EXPECTED" <<'PY' || exit 1
 import json
 import sys
@@ -577,9 +584,9 @@ PY
 MEMBER=$(curl -s "http://127.0.0.1:$MEM_PORT/channels/1/members" \
     | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0]["member_id"])' \
     || fail "k10r members read failed")
-# The CLI reads its identity from `member_id` beside the config (minted on first run, editable):
-# writing the channel's member here makes later invocations speak as the same person.
-echo "$MEMBER" >"$ROOT/member_id"
+# NOT written into `member_id`: that file is the CLI's identity, and the member this read returns
+# is the channel's DEFAULT one (the single-party shape k10r seeds) — overwriting the file with it
+# would quietly change who the next invocation speaks as.
 # The status AND the body: a bare `curl -sf` turns "404 with k10r's own words" into
 # "k10r session read failed", which is how this step hid its reason the first time.
 code=$(curl -s -o "$ROOT/session.json" -w '%{http_code}' \
@@ -760,6 +767,90 @@ edges = [(link["kind"]) for link in graph["links"]]
 if "likes" not in edges:
     raise SystemExit(f"FAIL: the fact's edge is missing; link kinds: {edges}")
 print("ok: the node ran the code row and commit_memory landed:", names, edges)
+PY
+
+# WHO SPOKE. Every row names its speaker now: the human's own words carry a member id, everything
+# the turn said carries the agent's (gravity AGENT_MEMBER, registered so the bracket reads
+# "gravity" instead of a uuid). Without this a channel with two people reads as a monologue —
+# which is what it did until the rows learned to say who they belong to (k10r ADR-0009 §1).
+#
+# The human's id here is the VENUE's stamp, not the CLI's own file: prism knows who logged in and
+# puts that in the envelope, and a caller naming itself cannot outrank it (that is the whole point
+# of the stamp). One human in this channel is therefore also the assertion that the CLI and the
+# page spoke as the same person.
+curl -s "http://127.0.0.1:$MEM_PORT/channels/1/messages" >"$ROOT/rows.json"
+python3 - "$ROOT/rows.json" 01900000-0000-7000-8000-000000000001 \
+    00000000-0000-0000-0000-000000000001 <<'PY' || exit 1
+import json
+import sys
+
+rows = json.load(open(sys.argv[1]))
+agent, seeded = sys.argv[2], sys.argv[3]
+if not rows:
+    raise SystemExit("FAIL: the channel has no rows to attribute")
+blank = [row for row in rows if not row.get("sender")]
+if blank:
+    raise SystemExit(f"FAIL: {len(blank)} row(s) name no speaker: {blank[0]}")
+senders = {row["sender"]: row["sender_name"] for row in rows}
+if senders.get(agent) != "gravity":
+    raise SystemExit(f"FAIL: the agent is not the registered speaker it should be: {senders}")
+humans = [who for who in senders if who != agent]
+if len(humans) != 1:
+    raise SystemExit(f"FAIL: expected ONE human speaker in the channel, found {senders}")
+if humans[0] == seeded:
+    raise SystemExit(f"FAIL: the venue's identity was ignored — rows carry the seeded member: {senders}")
+print(f"ok: every row names its speaker — {humans[0]} (venue-stamped) and {senders[agent]}")
+PY
+
+# THE DIRECTORY, through the real stack: the agent was registered by a turn, so it must be
+# findable by name — that is the read an agent makes before adding somebody to a channel.
+curl -s "http://127.0.0.1:$MEM_PORT/members?name=gravity" >"$ROOT/dir.json"
+python3 - "$ROOT/dir.json" <<'PY' || exit 1
+import json
+import sys
+
+found = json.load(open(sys.argv[1]))
+if [row["display_name"] for row in found] != ["gravity"]:
+    raise SystemExit(f"FAIL: the directory does not answer the agent by name: {found}")
+if found[0]["role"] != 1:
+    raise SystemExit(f"FAIL: the agent is not tagged AGENT (role 1): {found}")
+print("ok: the directory finds the agent by name and tags it AGENT")
+PY
+
+# A CONTEXT IS ITS OWN SPEAKER. `--context` makes the CLI an AGENT named by that context, derived
+# from the name — so the SAME name is the same speaker next run, which is how one-turn invocations
+# accumulate into one conversation in the channel. The venue still knows who logged in, and the
+# store does not honour a declared identity that is a PERSON, so this is a process speaking for
+# itself rather than a person pretending to be someone else. WHO supervises is the agent's call
+# (`find_member` + `supervise`), not the client's, so the client carries no such flag.
+GRAVITY_CONFIG="$ROOT/gravity.json" SMOKE_PW="smoke-pw" \
+    "$GRAVITY_REPO/target/debug/gravity" --json --session 7 \
+    --context "drift check" "hi" >"$ROOT/cli-task.out" 2>"$ROOT/cli-task.err"
+code=$?
+[ "$code" -eq 0 ] || fail "the context run exited $code: $(cat "$ROOT/cli-task.err")"
+curl -s "http://127.0.0.1:$MEM_PORT/channels/7/messages" >"$ROOT/task-rows.json"
+curl -s "http://127.0.0.1:$MEM_PORT/channels/7/members" >"$ROOT/task-members.json"
+curl -s "http://127.0.0.1:$MEM_PORT/members?name=drift%20check" >"$ROOT/task-dir.json"
+python3 - "$ROOT/task-rows.json" "$ROOT/task-members.json" "$ROOT/task-dir.json" <<'PY' || exit 1
+import json
+import sys
+
+rows = json.load(open(sys.argv[1]))
+members = {m["member_id"]: m for m in json.load(open(sys.argv[2]))}
+directory = json.load(open(sys.argv[3]))
+
+context = [row for row in directory if row["display_name"] == "drift check"]
+if len(context) != 1:
+    raise SystemExit(f"FAIL: the context is not one agent in the directory: {directory}")
+context_id = context[0]["member_id"]
+if context[0]["role"] != 1:
+    raise SystemExit(f"FAIL: the context speaks as a person, not an agent: {context[0]}")
+asked = [row for row in rows if row["role"] == "user"]
+if not asked or any(row["sender"] != context_id for row in asked):
+    raise SystemExit(f"FAIL: the asks do not belong to the context agent: {asked}")
+if context_id not in members:
+    raise SystemExit(f"FAIL: the context agent is not a member of the channel it speaks in: {list(members)}")
+print(f"ok: the context speaks as its own agent ({context_id[:8]}…), in channel 7")
 PY
 
 echo "PASS (logs under $ROOT)"

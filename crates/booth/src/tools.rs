@@ -409,6 +409,50 @@ static SPECS: &[ToolSpec] = &[
         },
         nature: Nature::Human,
     },
+    ToolSpec {
+        name: "find_member",
+        description: "Ask the store WHO EXISTS: every member of this deployment, or the ones with \
+                      exactly this display name. Members are people and agents; the reply carries \
+                      an id, a name and a role (0 = human, 1 = agent). Use it before you write to \
+                      somebody you have not met in this conversation — an id is how they are \
+                      addressed, and you cannot invent one.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact display name. Omitted = the whole directory."
+                    }
+                },
+                "required": []
+            })
+        },
+        nature: Nature::Fast,
+    },
+    ToolSpec {
+        name: "supervise",
+        description: "Name the PEOPLE who should see this line, and join them to the channel — \
+                      that join is what puts it in their own list. One context can have several \
+                      supervisors (whoever could act on what this line says) or none: a context \
+                      you work in for yourself has nobody to report to, and then you do not call \
+                      this at all. Look each one up with `find_member` first: a supervisor must be \
+                      an existing human, and a name that answers with two people is a question, \
+                      not a choice.",
+        parameters: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "member": {
+                        "type": ["string", "array"],
+                        "description": "One person (member id or exact display name), or a list of them."
+                    }
+                },
+                "required": ["member"]
+            })
+        },
+        nature: Nature::Fast,
+    },
 ];
 
 /// The entries, in the order the model sees them.
@@ -489,6 +533,10 @@ pub struct World<'a> {
     /// chooses it; gravity uses the conversation, so a script's state survives
     /// the turns of one conversation and nothing else).
     pub session: &'a str,
+    /// The conversation this turn is writing in. A tool that joins somebody to it needs the
+    /// number, and the turn is the only place that knows it — absent on the paths that answer a
+    /// form rather than hold a conversation, where joining anybody is meaningless.
+    pub channel: Option<u64>,
     /// Which open tasks each code row finishes (`task --finishes_on--> code`),
     /// built once from the turn's task listing. The call site reads it to close
     /// work (ADR-0003 §3); an empty table means nothing is bound, which is the
@@ -608,6 +656,85 @@ pub fn call(
             };
             doors.get(&url)
         }
+        "find_member" => {
+            let url = match args.get("name").and_then(Value::as_str) {
+                Some(name) => format!("{store_url}/members?name={}", query_escape(name)),
+                None => format!("{store_url}/members"),
+            };
+            doors.get(&url)
+        }
+        "supervise" => {
+            // ONE or SEVERAL people: a line can have more than one supervisor (they are the
+            // humans who could act on it), and a batch is one call rather than N.
+            let targets = match args.get("member") {
+                Some(Value::String(one)) => vec![one.as_str()],
+                Some(Value::Array(rows)) => rows
+                    .iter()
+                    .map(|row| {
+                        row.as_str()
+                            .ok_or_else(|| "supervise: `member` must hold names or ids".to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => return Err("supervise: `member` is required (a name, an id, or a list)".into()),
+            };
+            let channel = world
+                .channel
+                .ok_or("supervise: this call has no conversation to join anybody to")?;
+            let mut joined = Vec::new();
+            for target in targets {
+                let found = if looks_like_member_id(target) {
+                    match doors.get(&format!("{store_url}/members/{target}")) {
+                        Ok(row) => vec![row],
+                        Err(_) => Vec::new(),
+                    }
+                } else {
+                    match doors.get(&format!("{store_url}/members?name={}", query_escape(target)))? {
+                        Value::Array(rows) => rows,
+                        other => return Err(format!("supervise: the directory answered {other}")),
+                    }
+                };
+                let row = match found.len() {
+                    0 => {
+                        return Err(format!(
+                            "supervise: nobody in the store is `{target}` — `find_member` lists who is"
+                        ))
+                    }
+                    1 => found[0].clone(),
+                    n => {
+                        return Err(format!(
+                            "supervise: {n} members are `{target}` — name the one you mean by id: {}",
+                            found
+                                .iter()
+                                .filter_map(|row| row.get("member_id").and_then(Value::as_str))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    }
+                };
+                // A supervisor is a person who can ACT on what the line says. An agent
+                // supervising an agent is a loop with nobody in it.
+                if row.get("role").and_then(Value::as_u64) != Some(0) {
+                    return Err(format!(
+                        "supervise: `{target}` is not a person — a supervisor is a human"
+                    ));
+                }
+                let member = row
+                    .get("member_id")
+                    .and_then(Value::as_str)
+                    .ok_or("supervise: the store answered without an id")?;
+                doors.post(
+                    &format!("{store_url}/channels/{channel}/members"),
+                    &json!({
+                        "member_id": member,
+                        "display_name": row.get("display_name").and_then(Value::as_str).unwrap_or(""),
+                        "role": 0u8,
+                        "since_ms": gravity_core::now_ms(),
+                    }),
+                )?;
+                joined.push(member.to_string());
+            }
+            Ok(json!({ "supervisors": joined }))
+        }
         "create_skill" => create_skill(doors, args, world, store_url),
         "read_code" => read_code(doors, args, world, store_url),
         "write_code" => write_code(doors, args, world, store_url),
@@ -619,6 +746,29 @@ pub fn call(
             names().join(", ")
         )),
     }
+}
+
+/// A member id is a uuid: 36 characters, four dashes, hex. Anything else the model hands over is
+/// a NAME to look up, never an id to address.
+fn looks_like_member_id(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().filter(|c| *c == '-').count() == 4
+        && value.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Percent-encode a query value: a display name can hold spaces and punctuation, and the store's
+/// door reads a raw `?name=` — an unescaped `&` in a name would become another parameter.
+fn query_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// `create_skill`: the procedure the model decided is worth keeping (k10r
@@ -1731,6 +1881,7 @@ mod tests {
             memory_scope: Some(37),
             mounts,
             session,
+            channel: Some(7),
             ends_on: &NOTHING_BOUND,
         }
     }
@@ -1745,6 +1896,7 @@ mod tests {
             memory_scope: Some(37),
             mounts,
             session,
+            channel: Some(7),
             ends_on,
         }
     }
@@ -2019,6 +2171,134 @@ mod tests {
         assert!(doors.puts.is_empty());
     }
 
+    /// WHO EXISTS, and WHO SHOULD SEE THIS LINE. The directory answers a name, and the agent
+    /// joins the person it picked — the model decides because it is the one that knows what the
+    /// task is for; `--supervisor` on the CLI only exists to overrule it.
+    #[test]
+    fn find_member_asks_the_directory_and_supervise_joins_the_person_it_found() {
+        let alice = json!({
+            "member_id": "6f1d3d0e-0000-4000-8000-00000000000a",
+            "display_name": "Alice",
+            "role": 0
+        });
+        let mounts = python_mount();
+        let mut doors = Recorder::default()
+            .answering("/members?name=Alice", json!([alice.clone()]))
+            .answering("/members?name=Drift%20Check", json!([]));
+
+        let found = call(
+            &mut doors,
+            "find_member",
+            &json!({ "name": "Alice" }),
+            &world(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("the directory answers");
+        assert_eq!(found[0]["member_id"], alice["member_id"]);
+        // A name can hold a space, and an unescaped one would not reach the door.
+        call(
+            &mut doors,
+            "find_member",
+            &json!({ "name": "Drift Check" }),
+            &world(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("a name with a space is escaped, not dropped");
+        assert!(
+            doors.gets.iter().any(|url| url.ends_with("/members?name=Drift%20Check")),
+            "{:?}",
+            doors.gets
+        );
+
+        call(
+            &mut doors,
+            "supervise",
+            &json!({ "member": "Alice" }),
+            &world(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("a person can be joined");
+        let (url, body) = doors.posts.last().expect("one join");
+        assert!(url.ends_with("/channels/7/members"), "{url}");
+        assert_eq!(body["member_id"], alice["member_id"]);
+        assert_eq!(body["role"], 0, "a supervisor is a person: {body}");
+        assert_eq!(body["display_name"], "Alice");
+    }
+
+    /// Two people can share a name — the store answers both, and the model is told to pick by id.
+    /// An agent cannot supervise anything: that is a loop with nobody in it.
+    #[test]
+    fn supervise_refuses_an_ambiguous_name_and_a_fellow_agent() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default().answering(
+            "/members?name=Alice",
+            json!([
+                { "member_id": "6f1d3d0e-0000-4000-8000-00000000000a", "display_name": "Alice", "role": 0 },
+                { "member_id": "6f1d3d0e-0000-4000-8000-00000000000b", "display_name": "Alice", "role": 0 }
+            ]),
+        )
+        .answering(
+            "/members?name=gravity",
+            json!([
+                { "member_id": "01900000-0000-7000-8000-000000000001", "display_name": "gravity", "role": 1 }
+            ]),
+        );
+
+        let ambiguous = call(
+            &mut doors,
+            "supervise",
+            &json!({ "member": "Alice" }),
+            &world(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect_err("two Alices is a question");
+        assert!(ambiguous.contains("2 members are `Alice`"), "{ambiguous}");
+        assert!(ambiguous.contains("00000000000a"), "the ids are the answer: {ambiguous}");
+
+        let agent = call(
+            &mut doors,
+            "supervise",
+            &json!({ "member": "gravity" }),
+            &world(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect_err("an agent is not a supervisor");
+        assert!(agent.contains("not a person"), "{agent}");
+        assert!(doors.posts.is_empty(), "nothing was joined");
+    }
+
+    /// SEVERAL supervisors in one call: a line can have more than one person who could act on it,
+    /// and asking the model to make N calls to say so would be N round-trips for one decision.
+    #[test]
+    fn supervise_joins_every_person_it_was_given() {
+        let mounts = python_mount();
+        let mut doors = Recorder::default()
+            .answering(
+                "/members?name=Alice",
+                json!([
+                    { "member_id": "6f1d3d0e-0000-4000-8000-00000000000a", "display_name": "Alice", "role": 0 }
+                ]),
+            )
+            .answering(
+                "/members?name=Bob",
+                json!([
+                    { "member_id": "6f1d3d0e-0000-4000-8000-00000000000b", "display_name": "Bob", "role": 0 }
+                ]),
+            );
+        let joined = call(
+            &mut doors,
+            "supervise",
+            &json!({ "member": ["Alice", "Bob"] }),
+            &world(&mounts, "s-1"),
+            &mut Vec::new(),
+        )
+        .expect("two people, one call");
+        assert_eq!(joined["supervisors"].as_array().map(Vec::len), Some(2), "{joined}");
+        let posts: Vec<&Value> = doors.posts.iter().map(|(_, body)| body).collect();
+        assert_eq!(posts.len(), 2, "one join per person");
+        assert!(posts.iter().all(|body| body["role"] == 0));
+    }
+
     #[test]
     fn the_list_carries_the_tool_faces_names() {
         assert_eq!(
@@ -2036,6 +2316,9 @@ mod tests {
                 "open_task",
                 "move_task",
                 "list_tasks",
+                // The identity doors: who exists, and who ought to see this line.
+                "find_member",
+                "supervise",
             ]
         );
     }
@@ -2452,6 +2735,7 @@ mod tests {
             memory_scope: None,
             mounts: &mounts,
             session: "s-1",
+            channel: Some(7),
             ends_on: &Default::default(),
         };
         let Err(error) = call(

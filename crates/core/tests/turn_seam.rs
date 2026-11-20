@@ -83,10 +83,11 @@ async fn turn_with(
             role::USER,
             kind::TEXT,
             &input.user_message,
+            None,
         )
         .await?;
     store
-        .append_message(input.channel_id, ts, 1, role::ASSISTANT, kind::TEXT, &reply)
+        .append_message(input.channel_id, ts, 1, role::ASSISTANT, kind::TEXT, &reply, None)
         .await?;
     Ok(reply)
 }
@@ -192,7 +193,7 @@ async fn head_is_rendered_by_both_surfaces() {
     // One append so the channel has its seeded member (the head traverses
     // the members of the channel).
     in_process
-        .append_message(7, 100, 0, role::USER, kind::TEXT, "seed")
+        .append_message(7, 100, 0, role::USER, kind::TEXT, "seed", None)
         .await
         .unwrap();
     let local = in_process
@@ -225,7 +226,7 @@ async fn head_is_rendered_by_both_surfaces() {
         .status();
     assert_eq!(status, reqwest::StatusCode::OK);
     let http = gravity_core::surface::HttpSurface::new(&base);
-    http.append_message(7, 100, 0, role::USER, kind::TEXT, "seed")
+    http.append_message(7, 100, 0, role::USER, kind::TEXT, "seed", None)
         .await
         .unwrap();
     let remote = http
@@ -255,7 +256,7 @@ async fn checkpoint_flows_through_surface() {
     let surface = InProcessSurface::open(dir.path()).unwrap();
     for (ts, content) in [(100u64, "old"), (200, "new")] {
         surface
-            .append_message(3, ts, 0, role::USER, kind::TEXT, content)
+            .append_message(3, ts, 0, role::USER, kind::TEXT, content, None)
             .await
             .unwrap();
     }

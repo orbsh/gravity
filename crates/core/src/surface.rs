@@ -224,6 +224,11 @@ pub trait MemorySurface: Send + Sync {
     /// runs for many rounds and is resumed after a cold call — is the booth's
     /// (`TurnLog` in `booth/src/bin/turn.rs`); this one exists for the two-line
     /// exchange and for tests, where a row IS the whole turn.
+    /// `sender` is WHO the row belongs to — a member id (k10r ADR-0009 §1): the human who spoke,
+    /// or [`crate::AGENT_MEMBER`] for the assistant's own words. `None` keeps the single-party
+    /// default, because a caller that does not know whose row this is must say nothing rather
+    /// than invent a speaker; a channel with more than one person has no such default.
+    #[allow(clippy::too_many_arguments)] // a log record IS this wide
     async fn append_message(
         &self,
         channel_id: u64,
@@ -232,6 +237,7 @@ pub trait MemorySurface: Send + Sync {
         role: u8,
         kind: u8,
         content: &str,
+        sender: Option<&str>,
     ) -> anyhow::Result<MessageKey>;
 }
 
@@ -361,13 +367,29 @@ impl MemorySurface for InProcessSurface {
         role: u8,
         kind: u8,
         content: &str,
+        sender: Option<&str>,
     ) -> anyhow::Result<MessageKey> {
         let mut store = self.channels.lock().await;
         // One row, one turn: the append OPENS it and the store mints the id (k10r
         // ADR-0024 §2) — there is no separate open for a turn that writes one row.
-        let key = store
-            .append_opening(channel_id, ts_ms, sub, role, kind, content)
-            .map_err(anyhow::Error::msg)?;
+        // `end_ts` is the row's own clock: a message is an instant.
+        let key = match sender {
+            Some(raw) => store
+                .append_opening_from(
+                    channel_id,
+                    ts_ms,
+                    sub,
+                    raw.parse().map_err(anyhow::Error::msg)?,
+                    ts_ms,
+                    role,
+                    kind,
+                    content,
+                )
+                .map_err(anyhow::Error::msg)?,
+            None => store
+                .append_opening(channel_id, ts_ms, sub, role, kind, content)
+                .map_err(anyhow::Error::msg)?,
+        };
         let turn = key.turn_id;
         // A row written here is a finished exchange, so the turn closes at once
         // and keeps exactly that row. The closing record must sort after it.
@@ -522,6 +544,7 @@ impl MemorySurface for HttpSurface {
         role: u8,
         kind: u8,
         content: &str,
+        sender: Option<&str>,
     ) -> anyhow::Result<MessageKey> {
         // One call = one FINISHED turn (see the trait's note): write the row that
         // OPENS it (the store mints the id there, k10r ADR-0024 §2), close keeping
@@ -537,6 +560,8 @@ impl MemorySurface for HttpSurface {
                 "role": role,
                 "kind": kind,
                 "content": content,
+                // Absent when nobody is named: the single-party shape's default member.
+                "sender": sender,
             }))
             .send()
             .await

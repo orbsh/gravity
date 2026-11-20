@@ -17,6 +17,17 @@ pub mod surface;
 pub mod tool;
 pub mod turn;
 
+/// The agent's member id in k10r, and its display name in the attribution bracket.
+///
+/// A channel's rows belong to whoever said them (k10r ADR-0009 §1), and the assistant's own
+/// words belong to the agent — so the agent needs a member id like any other participant. It is
+/// FIXED rather than minted: there is one agent per deployment, every channel it speaks in must
+/// name the same one, and an id that changed between turns would make one agent look like many.
+/// v7-shaped on purpose so it sorts and reads like the member ids around it.
+pub const AGENT_MEMBER: &str = "01900000-0000-7000-8000-000000000001";
+/// What that member is called in the transcript.
+pub const AGENT_NAME: &str = "gravity";
+
 /// One turn's input: the user message plus the addressing the memory
 /// system needs. `channel_id` addresses the conversation (the channel
 /// log); `member_id` addresses the agent's projection inside it.

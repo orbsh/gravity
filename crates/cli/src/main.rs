@@ -1,5 +1,8 @@
-//! gravity — the CLI is a CLIENT of the venue (ADR-0002): kubectl-shaped,
-//! one command = one call, stdin/stdout, meaningful exit codes, no session
+//! gravity — GRAVITY'S OWN CLI, wearing a client's clothes. It is not prism's CLI: the venue is
+//! the wire it has to pass through (ADR-0002 — there is no other door), not the thing it drives.
+//! What it drives is the agent, and the agent is the one that decides what a task needs.
+//!
+//! Shape: kubectl-like, one command = one call, stdin/stdout, meaningful exit codes, no session
 //! state of its own.
 //!
 //! It speaks the venue's ONE wire (prism ADR-0017): it EMITS `ui:turn.submit` and reads the
@@ -35,6 +38,11 @@ usage: gravity [--json] [--session <id>] [--venue <ws-url>] [--cancel-after-ms <
   --member <uuid>     who is speaking (k10r's member id IS the user's uuid). Default:
                       the id in `member_id` beside the config, minted once on first
                       run — replace that file with your own id from prism
+  --context <name>    speak as the agent working in THIS context instead of as the
+                      person: the member id is derived from the name, so the same name is
+                      the same speaker in this channel on every run, and its line is one
+                      conversation. One invocation is one turn; the channel is where the
+                      turns accumulate. The name is what the transcript shows.
   --venue <ws-url>    override the configured venue URL
   --cancel-after-ms   send `ui:turn.cancel` after n ms (the automation form of
                       Ctrl-C; Ctrl-C does the same at any moment)
@@ -95,6 +103,10 @@ struct Cli {
     /// `None` = take it from the file beside the config (minting one on first run); a value here
     /// is the operator saying who they are, which always wins.
     member: Option<String>,
+    /// The context this invocation works in. Present = speak as the AGENT of that context, not as
+    /// the person who started the process (two different speakers, and the store keeps them apart).
+    /// The same name is the same speaker every run, so its turns are one conversation.
+    context: Option<String>,
     venue: Option<String>,
     cancel_after_ms: Option<u64>,
     turns: Vec<String>,
@@ -104,6 +116,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Failure> {
     let mut json = false;
     let mut session = "1".to_string();
     let mut member: Option<String> = None;
+    let mut context: Option<String> = None;
     let mut venue = None;
     let mut cancel_after_ms = None;
     let mut turns = Vec::new();
@@ -115,6 +128,12 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Failure> {
                 session = args
                     .next()
                     .ok_or_else(|| Failure::Usage("--session needs an id".into()))?;
+            }
+            "--context" => {
+                context = Some(
+                    args.next()
+                        .ok_or_else(|| Failure::Usage("--context needs a name".into()))?,
+                );
             }
             "--member" => {
                 member = Some(
@@ -153,11 +172,23 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Failure> {
             "--session: `{session}` is not a channel id (k10r's channel is a number)"
         ))
     })?;
+    if context.is_some() && member.is_some() {
+        return Err(Failure::Usage(
+            "--context speaks as a context's agent and --member as a member: one or the other"
+                .into(),
+        ));
+    }
+    if let Some(context) = &context {
+        if context.trim().is_empty() {
+            return Err(Failure::Usage("--context: empty name".into()));
+        }
+    }
     Ok(Cli {
         json,
         session,
         channel,
         member,
+        context,
         venue,
         cancel_after_ms,
         turns,
@@ -183,7 +214,14 @@ async fn run(cli: Cli) -> Result<(), Failure> {
     let config = load_config()?;
     // Resolved before a socket is opened: who this client is belongs to the invocation, not to
     // the reply, and a first run that minted an id should say so once rather than per turn.
-    let member = resolve_member(cli.member.as_deref())?;
+    // A CONTEXT SPEAKS AS AN AGENT, a different identity from the person who started the process.
+    // Derived from the name, so the same name is the same speaker on every run — and the same
+    // speaker in the same channel IS the same conversation, which is how one-turn invocations
+    // become a multi-turn history.
+    let member = match cli.context.as_deref() {
+        Some(context) => context_member(context),
+        None => resolve_member(cli.member.as_deref())?,
+    };
     let venue = resolve_venue(&config, cli.venue.as_deref())?;
     let password = std::env::var(&venue.password_env).map_err(|_| {
         Failure::Auth(format!(
@@ -211,6 +249,39 @@ async fn run(cli: Cli) -> Result<(), Failure> {
 
 fn config_path() -> String {
     std::env::var("GRAVITY_CONFIG").unwrap_or_else(|_| "gravity.json".into())
+}
+
+/// A CONTEXT's member id: derived from the context's NAME.
+///
+/// Two properties, both required: the same context speaks as the same agent on every run — so its
+/// turns accumulate into ONE conversation in the channel — and two contexts are two agents without
+/// a file to keep them in. It is not a security boundary: the venue's stamp is what protects a
+/// person's identity, and a declared identity that is a person is not honoured.
+///
+/// FNV-1a twice with different seeds: 128 bits of stable text, shaped like the uuids around it.
+fn context_member(name: &str) -> String {
+    fn fnv(bytes: &[u8], seed: u64) -> u64 {
+        let mut hash = seed;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+    let mut raw = [0u8; 16];
+    raw[..8].copy_from_slice(&fnv(name.as_bytes(), 0xcbf2_9ce4_8422_2325).to_be_bytes());
+    raw[8..].copy_from_slice(&fnv(name.as_bytes(), 0x9e37_79b9_7f4a_7c15).to_be_bytes());
+    raw[6] = (raw[6] & 0x0f) | 0x70; // reads as a v7, like every member id around it
+    raw[8] = (raw[8] & 0x3f) | 0x80;
+    let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// The file the member id lives in: beside the config, because that is the directory the
@@ -256,9 +327,9 @@ fn resolve_member(flag: Option<&str>) -> Result<String, Failure> {
     std::fs::write(&path, format!("{id}\n"))
         .map_err(|e| Failure::Usage(format!("writing {path}: {e}")))?;
     eprintln!(
-        "gravity: this client speaks as `{id}` — first run, written to {path}.\n\
-         Replace that file with your own member id (prism shows it on the account), \
-         or pass --member."
+        "gravity: this client's own id is `{id}` — first run, written to {path}.\n\
+         A venue that knows the account stamps THAT instead; this file is what the client \
+         says when the venue cannot say who is asking. Replace it, or pass --member."
     );
     Ok(id)
 }
@@ -388,6 +459,9 @@ async fn submit(ws: &mut Ws, cli: &Cli, member: &str, content: &str) -> Result<S
             "args": {
                 "channel_id": cli.channel,
                 "member_id": member,
+                // Only when the caller is a context: the name registers the identity in the store
+                // the first time this context speaks, so the transcript can say "drift check".
+                "member_name": cli.context,
                 "user_message": content,
                 "event": "ui:turn.delta",
             }
