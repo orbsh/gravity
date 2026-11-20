@@ -24,6 +24,7 @@ set -uo pipefail
 GRAVITY_REPO=${GRAVITY_REPO:-$HOME/world/gravity}
 PRISM_REPO=${PRISM_REPO:-$HOME/world/prism}
 K10R_REPO=${K10R_REPO:-$HOME/world/krystallizer}
+EFFECTOR_REPO=${EFFECTOR_REPO:-$HOME/world/effector}
 ROOT=${ROOT:-${TMPDIR:-/tmp}/smoke-venue}
 SSE_PORT=${SSE_PORT:-18801}
 MEM_PORT=${MEM_PORT:-17760}
@@ -38,6 +39,9 @@ fail() {
 [ -x "$GRAVITY_REPO/target/debug/gravity" ] || fail "build gravity first (cargo build -p gravity-cli -p gravity-booth)"
 [ -x "$PRISM_REPO/target/debug/prism" ] || fail "build prism first"
 [ -x "$K10R_REPO/target/debug/krystallizer" ] || fail "build krystallizer first"
+[ -x "$EFFECTOR_REPO/target/debug/effector" ] || fail "build effector first (cargo build -p effector-runtime)"
+NU_RUNNER="$EFFECTOR_REPO/deploy/runners/runner_nu.nu"
+[ -f "$NU_RUNNER" ] || fail "no nu runner at $NU_RUNNER"
 
 MODEL_DIR=${KRYSTALLIZER_MODEL_DIR:-$HOME/.local/share/krystallizer/models/bge-small-zh-v1.5}
 [ -d "$MODEL_DIR" ] || fail "no embedding model at $MODEL_DIR (k10r cannot boot without one)"
@@ -68,6 +72,7 @@ KDL
 
 cat > "$ROOT/sse.py" <<PY
 import json
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -79,6 +84,15 @@ CHUNKS = ["hello", " world"]
 FACT = [["alice", "person", {}, "likes", {}, "tea", "drink", {}]]
 ROUNDS = 0
 LOCK = threading.Lock()
+# The code row's id, seeded by the script before the turn: a file rather than an argv so the id
+# is not a second copy of the seed in two places. Read PER REQUEST — the provider starts before
+# the row exists.
+CODE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "code_id")
+
+
+def code_id() -> int:
+    with open(CODE_FILE) as handle:
+        return int(handle.read())
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -136,6 +150,42 @@ class Handler(BaseHTTPRequestHandler):
                     ]
                 }
             )
+        elif round_index == 2:
+            # THE NODE (gravity ADR-0001, Phase 4.6): a code row runs on the mount that serves
+            # its language. The id comes from the row seeded before the run, and the arguments
+            # are the row's OWN declared schema — checked before a node is asked anything.
+            event(
+                {
+                    "tool_calls": [
+                        {
+                            "id": "c3",
+                            "function": {
+                                "name": "run",
+                                "arguments": json.dumps(
+                                    {"code_id": code_id(), "arguments": {"n": 4}}
+                                ),
+                            },
+                        }
+                    ]
+                }
+            )
+        elif round_index == 3:
+            # What the node COMPUTED has to be in this request as the tool message: a turn that
+            # answered without it would look identical from the outside. A refusal keeps the
+            # request on disk, because "the model did not use the tool" and "the call failed with
+            # words" look the same in a 500.
+            if b"total" not in body or b"7" not in body:
+                with open(os.path.join(os.path.dirname(CODE_FILE), "round3.json"), "wb") as out:
+                    out.write(body)
+                self.send_response(500)
+                self.send_header("content-length", "0")
+                self.end_headers()
+                return
+            for piece in CHUNKS:
+                event({"content": piece})
+            chunk(b"data: [DONE]\n\n")
+            chunk(b"")
+            return
         elif round_index == 1:
             # The resolver's answer must have come BACK as the tool message of
             # this request, carrying the skill declared before the run. A door
@@ -194,10 +244,21 @@ wait_for "$SSE_PORT" "stub provider" || exit 1
 PIDS="$PIDS $!"
 wait_for "$MEM_PORT" "mem-server" || exit 1
 
-# One skill declared before the turn: `resolve_skills` must have something to
-# find, or the smoke proves the door exists and nothing else. Its step points at
-# a code row the run never fetches — resolving is the call under test, the walk
-# over the result is invoke_skill's (still unlisted, gravity Phase 4.6).
+# One skill declared before the turn: `resolve_skills` must have something to find, or the smoke
+# proves the door exists and nothing else. Its step names the code row declared below — the
+# resolver does not walk it here (`run` addresses the row by id), so the id in this row is the
+# skill's own business and stays a placeholder.
+# THE CODE ROW the mount will run (k10r's `code` rows are the graph's citizens; a skill's step
+# names one by id). Its `parameters` is the schema the caller's arguments are checked against
+# BEFORE a node is asked anything — the row is the contract, not the script's good manners.
+curl -sf -X POST "http://127.0.0.1:$MEM_PORT/code/37" \
+    -H 'content-type: application/json' \
+    -d '{"language":"nu","description":"sum four more","parameters":"{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"number\"}},\"required\":[\"n\"]}","source":"{total: (($env.TOOLRUNNER_ARGS | from json | get n) + 3)} | to json"}' \
+    >"$ROOT/code.json" || fail "declaring a code row failed"
+python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code_id"])' "$ROOT/code.json" >"$ROOT/code_id" \
+    || fail "the code row answered no id: $(cat "$ROOT/code.json")"
+echo "ok: a code row is declared for the mount to run (id $(cat "$ROOT/code_id"))"
+
 curl -sf -X POST "http://127.0.0.1:$MEM_PORT/skills/37" \
     -H 'content-type: application/json' \
     -d '{"name":"github-issues","title":"issues","content":"Lists the open issues of a GitHub repository.","steps":"[{\"code_id\":1}]"}' \
@@ -209,6 +270,13 @@ echo "ok: a skill is declared for the resolver to find"
 # facts (store URL, model, endpoint, key env, memory scope) are ROWS in the turn type's namespace
 # now (gravity ADR-0007), written below through the application's own door — a gateway that served
 # this app learned no model vocabulary.
+# THE DEPLOYMENT'S LANGUAGE VOCABULARY (prism ADR-0022): one entry, and a mount is the product of
+# it and an approved node — in `open` posture, of a node that DIALS (ADR-0022 §5). The runner is a
+# fixed artifact delivered BY REFERENCE (ADR-0027), which is why the venue also serves `/code`.
+# `requires: host` because this node is BARE METAL (`class: host` below): the default is the
+# container, and a host node cannot become one on demand — the plane refuses in words rather than
+# quietly running unreviewed code in the wrong isolation (ADR-0001 §4).
+PRISM_LANGUAGES="[{\"language\":\"nu\",\"carrier\":\"exec\",\"runner\":\"nu $NU_RUNNER\",\"requires\":\"host\"}]" \
 PRISM_ADDR="127.0.0.1:$PRISM_PORT" PRISM_IDENTITY=open PRISM_DATA="$ROOT/prism-data" \
 GRAVITY_PROVIDER_BIN="$GRAVITY_REPO/target/debug/gravity-provider" \
 GRAVITY_TURN_BIN="$GRAVITY_REPO/target/debug/gravity-turn" \
@@ -216,6 +284,37 @@ SMOKE_KEY="smoke-key" \
     "$PRISM_REPO/target/debug/prism" >"$ROOT/prism.log" 2>&1 &
 PIDS="$PIDS $!"
 wait_for "$PRISM_PORT" "prism gateway" || exit 1
+
+# THE NODE (gravity ADR-0001, effector ADR-0003): a real `effector` dials the venue's
+# `/effector/<alias>` and becomes CALLABLE — the mounts are minted from the vocabulary crossed
+# with the alias, so nothing is configured in a manifest for this machine. `open` posture means
+# the network is the boundary, and the venue's log says the types came from the dial.
+# The node's authority is the TOKEN it dials with (effector ADR-0003): mint one on the venue,
+# which answers the readable form exactly once — hand it to the node and forget it.
+curl -sf -X POST "http://127.0.0.1:$PRISM_PORT/admin/nodes" \
+    -H 'content-type: application/json' -d '{"alias":"smoke-node"}' >"$ROOT/node.json" \
+    || fail "minting a node token failed"
+NODE_TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["token"])' "$ROOT/node.json") \
+    || fail "the mint answered no token: $(cat "$ROOT/node.json")"
+
+cat > "$ROOT/effector.json" <<JSON
+{
+  "class": "host",
+  "control_plane_url": "ws://127.0.0.1:$PRISM_PORT/effector/smoke-node",
+  "token": "$NODE_TOKEN",
+  "capabilities": { "node_alias": "smoke-node", "carriers": ["exec"] },
+  "lease": {}
+}
+JSON
+"$EFFECTOR_REPO/target/debug/effector" "$ROOT/effector.json" >"$ROOT/effector.log" 2>&1 &
+PIDS="$PIDS $!"
+tries=0
+until curl -s "http://127.0.0.1:$PRISM_PORT/admin/mounts" | grep -q '"node_connected":true'; do
+    tries=$((tries + 1))
+    [ "$tries" -gt 80 ] && fail "the node never became callable: $(curl -s "http://127.0.0.1:$PRISM_PORT/admin/mounts"; tail -5 "$ROOT/effector.log")"
+    sleep 0.25
+done
+echo "ok: a node dialled in, and the venue publishes its mount"
 
 # THE DEPLOYMENT IS CONFIGURED THROUGH ITS OWN DOOR, not through prism: `ui:gravity-model.save` is
 # the application's event (gravity ADR-0007 §4), gated by the auth declaration prism reads. A fresh
@@ -361,18 +460,23 @@ PY
 # tool — which is why this reads the graph instead of the transcript.
 code=$(curl -s -o "$ROOT/graph.json" -w '%{http_code}' "http://127.0.0.1:$MEM_PORT/graph/37")
 [ "$code" = "200" ] || fail "k10r graph read failed ($code): $(cat "$ROOT/graph.json")"
-python3 - "$ROOT/graph.json" <<'PY' || exit 1
+python3 - "$ROOT/graph.json" "$ROOT/code_id" <<'PY' || exit 1
 import json
 import sys
 
 graph = json.load(open(sys.argv[1]))
+code_id = open(sys.argv[2]).read().strip()
 names = sorted(node["name"] for node in graph["nodes"])
+# The code row becomes a graph node when a RUN reaches it (the attempt/success touches write it),
+# which is the difference between a row that exists and a script that ran on a machine.
+if f"code-{code_id}" not in names:
+    raise SystemExit(f"FAIL: the code row never ran on the node; graph nodes: {names}")
 if "alice" not in names or "tea" not in names:
     raise SystemExit(f"FAIL: the tool's write never landed; graph nodes: {names}")
 edges = [(link["kind"]) for link in graph["links"]]
 if "likes" not in edges:
     raise SystemExit(f"FAIL: the fact's edge is missing; link kinds: {edges}")
-print("ok: commit_memory reached k10r through the venue:", names, edges)
+print("ok: the node ran the code row and commit_memory landed:", names, edges)
 PY
 
 echo "PASS (logs under $ROOT)"

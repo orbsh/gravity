@@ -28,7 +28,8 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
   - [ ] what a VALUE-shaped caller receives when the target is cold (the tier exists in aura; nothing reaches it from a tool call)
   - [ ] what the caller writes down when it ends its entry — the open question in 2.5
   - [ ] re-entry: the result arrives as an ordinary dispatch carrying the minimal replay set
-- [x] 4.6 — The execution surface is the runner mount; `invoke_skill`, `write_code`, `run` — 2026-10-26 … 2026-11-09 — ADR-0001, ADR-0004, ADR-0011
+- [x] 4.6 — The execution surface is the runner mount; `start`/`advance`/`run`, `write_code` — 2026-10-26 … 2026-11-09 — ADR-0001, ADR-0004, ADR-0011
+  - [x] the whole stack, with a real node: `scripts/smoke-venue.sh` runs a code row on an `effector` node through the venue (stub provider → gravity → prism → mount → `runner_nu` → JSON back) — 2026-11-20
 - [ ] 5 — Skill pull-through and the weight write-back — ADR-0003 §5, ADR-0004
   - [x] the counters at the call: attempt before a node runs anything, success after, on both rows — 2026-10-26
   - [x] the proposal write side: a walk that grew files the composition it walked — 2026-10-26
@@ -39,7 +40,7 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
 ## Open items
 
 - [ ] A duplicated patch frame: one patch delivered N times per page, multiplicity growing per turn — measured 2026-11-05, not fixed. The bubbles are addressed per turn, so this is not the shared-region defect; the suspicion is one delivery per `/channel` connection (prism's fan-out). Measure in a clean venue with one tab — the probe that found it had six
-- [ ] `scripts/smoke-venue.sh` is not a gate: no workflow references it, and wiring it needs the three repos built on three fixed ports
+- [ ] `scripts/smoke-venue.sh` is not a gate: it passes end to end (provider, k10r, prism, a real effector node, a code row run on that node) but no workflow references it, and this repo has no CI to reference it from
 - [ ] ADR-0007's model row promises `affinity` and the declared row has no such field (`docs/adr/0007-model-configuration-is-gravitys.md:26` vs `crates/booth/src/bin/turn.rs:126-135`) — add the cold field or amend the ADR
 - [x] Cancellation is a marker the turn polls at its chunk boundary — 2026-11-09 — ADR-0008, aura ADR-0047, effector's `Frame::Interrupt`
 - [x] `run` for a script that belongs to no skill — 2026-11-09
