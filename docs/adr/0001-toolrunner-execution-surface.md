@@ -192,7 +192,8 @@ What the wire already provides (verified against the code, not assumed):
 - **k10r:** the script store, with gravity as its only client. The node never
   talks to it — the byte path is gravity → control path → node.
 - **prism:** one new piece of work — a mount-registration face
-  (`prism/src/mounts.rs`: `MountDecl` / `PRISM_MOUNTS` / `register_all`). Per
+  (`prism/src/mounts.rs`: `MountDecl` / `register_all`, derived from `PRISM_LANGUAGES` × the
+  approved node rows — prism ADR-0022). Per
   (alias × operation language) a `Remote` type whose source is the runner
   artifact. `Remote` definitions are not persisted, so this is an idempotent
   registration replayed at boot, and the dial-in `Frame::Register { node_alias,
@@ -238,7 +239,9 @@ What the wire already provides (verified against the code, not assumed):
   effector config.
 - **Open:** the mount table travels in the turn's args, so every caller carries
   it (the CLI reads it from its venue config). Prism already holds the same
-  table as `PRISM_MOUNTS`, so each further client is a drift source; whether the
+  table, so each further client is a drift source; prism ADR-0021 now publishes it at
+  `GET /admin/mounts`, and whether gravity should read it instead of carrying its copy is the
+  remaining half. Whether the
   venue should inject the table into the turn's args when it routes
   `ui:turn.submit` is not decided.
 

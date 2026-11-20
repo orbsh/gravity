@@ -145,7 +145,7 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
 - **k10r：** 脚本的家，且 gravity 是它唯一的客户；节点永不与它说话——字节路径是
   gravity → 控制路径 → 节点。
 - **prism：** 多出一件工作——mount 注册面（`prism/src/mounts.rs`：`MountDecl` /
-  `PRISM_MOUNTS` / `register_all`）。按 (别名 × 操作语言) 注册一个 `Remote` 类型，
+  `register_all`，由 `PRISM_LANGUAGES` × 已批准的节点行派生 —— prism ADR-0022）。按 (别名 × 操作语言) 注册一个 `Remote` 类型，
   source 是那份 runner 部署件。`Remote` 定义不持久化，所以这是每次启动重放的幂等
   注册；拨入帧 `Frame::Register { node_alias, carriers }` 提供了别名与载具集，可作
   触发源。
@@ -176,7 +176,7 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
   仍不是**文件**形态的是**节点自己的**清单：挂载清单是编译期声明，节点那一半是它的
   effector config。
 - **仍开：** mount 表随 turn 参数走，于是每个调用方都得自己带（CLI 从它的 venue 配置里
-  读）。prism 已经持有同一张表（`PRISM_MOUNTS`），每多一个客户端多一份声明就是一个漂移
+  读）。prism 已经持有同一张表（现由 prism ADR-0021 在 `GET /admin/mounts` 公布，gravity 何时改为读它、不再自带一份是剩下的那一半），每多一个客户端多一份声明就是一个漂移
   源；该不该由 venue 在路由 `ui:turn.submit` 时把表注入 turn 参数，尚未裁决。
 
 ## 相关记录
