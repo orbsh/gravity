@@ -41,11 +41,16 @@ turn per invocation.**
    heard of is registered as an agent under the `member_name` it came with; unknown and unnamed is
    the caller's own fallback id, so the stamp wins there too. No stamp and no identity is a
    refusal: there is no such speaker, and a row that names nobody is a lie.
-   **A person's member row is BORN NAMED.** When the speaker is the venue's own stamp, the venue
-   has also said what that account is called (`sender.display_name`, prism ADR-0017) and the booth
-   passes that name into the row it creates. It never looks a name up: the registry is the venue's,
-   and a copy kept here would go stale on a rename. An agent's name is its tag, for the same reason
-   — it is what the caller declared.
+   **A person's member row is BORN NAMED, and RE-NAMED on the next turn.** When the speaker is the
+   venue's own stamp, the venue has also said what that account is called (`sender.display_name`,
+   prism ADR-0017), and the booth states it every turn — the store keeps the first `since` and takes
+   the newer name (k10r ADR-0009 §1), which is how a rename in the account reaches a transcript that
+   was written before it. The booth never looks a name up: the registry is the venue's, and a copy
+   kept here would go stale exactly when it matters. An agent's name is its tag, restated the same
+   way. A name this side does NOT have is stated by omission — "nobody is renaming me" — which the
+   store must not confuse with `""`, "nobody has named this member". The role is stated the same
+   time and it is not decoration: k10r withholds the transcript from an agent (its `view::assemble`),
+   so stating a person's row as an agent empties the very projection the turn is built from.
 
 3. **The store decides what a turn is shown, and a program is shown no transcript.**
    `GET …/members/{m}/session` is where the decision lives. For a PERSON the projection carries the
