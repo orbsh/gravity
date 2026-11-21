@@ -96,10 +96,15 @@ for eyes rather than pipes).
   `turn_e2e.rs`); the CLI adds a client, not a surface.
 - **Settled:** the command surface is `--tag` (who calls), `--session` (pin a
   channel), `--venue`, `--cancel-after-ms`, `--json`, one positional turn per
-  argument and `-` for stdin as ONE turn; exit codes are 0/2/3/4/5. **Open:** a
-  credential for unattended callers — today the venue password arrives in the
-  env var the config names, and a token per automation is the shape that
-  belongs here once the venue can issue one.
+  argument and `-` for stdin as ONE turn; exit codes are 0/2/3/4/5.
+- **The unattended credential is a TOKEN** (`token_env`), and it is the whole
+  way in: the client presents it on the dial and sends no login frame, so a CI
+  step holds one secret and never an account's password. The venue mints it
+  (`POST /admin/tokens`, which is login over HTTP — the password is what proves
+  the request), and a config gives `token_env` OR `username` + `password_env`;
+  neither is refused at first sight rather than at the first turn. A token the
+  venue does not know leaves the connection anonymous, which the client reports
+  as an auth failure (exit 3), not as a turn that ran as nobody.
 
 ## Related records
 
