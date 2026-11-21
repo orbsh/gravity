@@ -77,6 +77,14 @@ fn main() -> anyhow::Result<()> {
         // handler does what `advance` does and nothing more: no model is called, because
         // the mechanical part of a run does not need one and the person already decided.
         .on("answer", |ctx: &mut Ctx, args: Value| answer(ctx, &args))
+        // THE WAKE (ADR-0016): the field's clock delivers an `__on_timer` job carrying the tag this
+        // booth armed itself, and the handler asks the store whether a compression is still owed. It
+        // is a DECLARED entry like the others — behind the same gate, because it spends the same
+        // capability: it calls the model and writes through the same doors a turn does.
+        // A HOOK, not an event: the name is the host's (aura's timer delivery), so the venue may not
+        // emit it and this guest may not claim it as a subscription — induction refuses that in so
+        // many words. What the handler does is ask the store a question.
+        .hook("__on_timer", |ctx: &mut Ctx, args: Value| wake(ctx, &args))
         // THE RESOURCE DOOR (ADR-0003 §7): the Effector asks by (owner, type, sequence) and gets
         // material for ONE transfer; after it publishes, it reports the reference it produced and
         // this booth writes the version row and advances the pointer. The node never holds a
@@ -895,10 +903,9 @@ struct Turn<'a> {
     memory_scope: u64,
     /// The head's representation — the deployment's choice, stored beside the other facts.
     memory_format: String,
-    /// The model recipe the settings row named.
-    endpoint: String,
-    model: String,
-    key_env: String,
+    /// The model recipe the settings row named. Kept whole because a WAKE reads the same row a
+    /// turn does and has no turn to read it from.
+    recipe: Recipe,
 }
 
 fn turn(
@@ -1006,9 +1013,7 @@ fn turn(
         member_id,
         memory_scope: settings.memory_scope,
         memory_format: settings.memory_format.clone(),
-        endpoint: recipe.endpoint,
-        model: recipe.model,
-        key_env: recipe.key_env,
+        recipe,
     };
     let out = out_of(args)?;
 
@@ -1060,13 +1065,6 @@ fn turn(
     // which tasks (ADR-0003 §3). Fetched once here, so the dispatch below reads a local table.
     let owed = fetch_tasks(&turn.store_url, turn.memory_scope);
     let ends_on = gravity_booth::tasks::bindings(owed.as_deref().unwrap_or_default());
-    // The tail branches see the same records, NUMBERED: an operation that must
-    // point at one (the compression's cut) answers with an index, because the
-    // store owns positions and a model cannot see them.
-    let mut numbered: Vec<Value> = Vec::new();
-    // A position in the log is a POINTER — `(turn, ts, sub)` since k10r ADR-0024:
-    // the turn comes before the millisecond, so two turns cannot be confused.
-    let mut keys: Vec<Pointer> = Vec::new();
     // The increment is whatever k10r decided to hand THIS reader (ADR-0015 §3): a person's turn
     // carries the record, a context's turn carries none — and the decision is the store's, because
     // a prompt assembled here would be a knowledge policy in every call site.
@@ -1075,7 +1073,7 @@ fn turn(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    for (index, entry) in history.into_iter().enumerate() {
+    for entry in history {
         // The entry is FLAT and `role` is the resolved NAME — k10r's mapping, the
         // one place a code becomes a label. `null` means a stored code that
         // mapping does not know (a writer's bug: k10r does not police codes and
@@ -1089,24 +1087,6 @@ fn turn(
             .unwrap_or_default()
             .to_string();
         messages.push(json!({ "role": role, "content": content }));
-        if let Some(key) = entry.get("key") {
-            let (Some(turn), Some(ts), Some(sub)) = (
-                key.get("turn_id").and_then(Value::as_u64),
-                key.get("ts_ms").and_then(Value::as_u64),
-                key.get("sub").and_then(Value::as_u64),
-            ) else {
-                continue;
-            };
-            keys.push(Pointer {
-                turn_id: turn,
-                ts_ms: ts,
-                sub: sub as u16,
-            });
-            numbered.push(json!({
-                "role": role,
-                "content": format!("[{}] {content}", index + 1),
-            }));
-        }
     }
     // The prefix the compression side branch summarizes: head + summary +
     // history, WITHOUT this turn's new message (the span k10r proposed to
@@ -1117,23 +1097,20 @@ fn turn(
     // each operation here produces its product concurrently with the answer and
     // from the same span — the caller never states a coverage point; k10r
     // derives it from the verdict it served (ADR-0008 §4).
-    let mut branch_prefix: Vec<Value> = Vec::new();
-    if let Some(head) = view.get("head").and_then(Value::as_str) {
-        if !head.is_empty() {
-            branch_prefix.push(json!({ "role": "system", "content": head }));
-        }
-    }
-    if let Some(summary) = view.get("summary").and_then(Value::as_str) {
-        if !summary.is_empty() {
-            branch_prefix.push(json!({
-                "role": "system",
-                "content": format!("Conversation summary so far:\n{summary}"),
-            }));
-        }
-    }
-    branch_prefix.extend(numbered);
+    let (branch_prefix, keys) = branch_material(&view);
     let mut tails: Vec<Tail> = Vec::new();
+    // Whether the store asked for a compression is read ONCE: the branch and the wake below hang
+    // off the same answer, and asking twice is how two decisions become one bug.
+    let compress_wanted = wants_compress(&view);
     start_tails(&turn, &view, &branch_prefix, &keys, &mut tails, ctx.cancel());
+    // ARM THE WAKE (ADR-0016 §5): this entry no longer waits for the branch, so a branch that dies
+    // is noticed by nobody — and the span it was opening stays open until somebody reads again. The
+    // wake is armed however the branch ends, because it is a QUESTION: finding nothing left to do
+    // costs one projection read, and guessing that the branch will finish is what left the span
+    // open in the first place.
+    if compress_wanted {
+        arm_wake(ctx, turn.channel_id, &turn.member_id);
+    }
 
     // 4. The provider: open, run the tool rounds, and land on a CONTENT stream. A
     //    `tool_calls`-first reply = the model wants tools BEFORE any prose: dispatch them,
@@ -1476,9 +1453,9 @@ impl Pump {
     /// The open's own failure travels the channel like any other, so there is one way
     /// to learn what went wrong rather than two.
     fn open(turn: &Turn<'_>, messages: &[Value]) -> Self {
-        let endpoint = turn.endpoint.clone();
-        let model = turn.model.clone();
-        let key_env = turn.key_env.clone();
+        let endpoint = turn.recipe.endpoint.clone();
+        let model = turn.recipe.model.clone();
+        let key_env = turn.recipe.key_env.clone();
         let messages = json!(messages);
         let tools = gravity_booth::tools::tools_array();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2727,6 +2704,188 @@ struct Tail {
     keys: Vec<Pointer>,
 }
 
+/// WHAT A MAINTENANCE BRANCH SEES, derived from the projection alone: the head, the summary, and the
+/// records k10r handed this reader NUMBERED (an operation that must point at one answers with an
+/// index — the store owns positions and a model cannot see them). A turn and a wake build it from
+/// the same read; a wake has no conversation of its own, and two spellings of "what the branch sees"
+/// would drift the day one of them changed.
+fn branch_material(view: &Value) -> (Vec<Value>, Vec<Pointer>) {
+    let mut prefix: Vec<Value> = Vec::new();
+    if let Some(head) = view.get("head").and_then(Value::as_str) {
+        if !head.is_empty() {
+            prefix.push(json!({ "role": "system", "content": head }));
+        }
+    }
+    if let Some(summary) = view.get("summary").and_then(Value::as_str) {
+        if !summary.is_empty() {
+            prefix.push(json!({
+                "role": "system",
+                "content": format!("Conversation summary so far:\n{summary}"),
+            }));
+        }
+    }
+    // A position in the log is a POINTER — `(turn, ts, sub)` since k10r ADR-0024: the turn comes
+    // before the millisecond, so two turns cannot be confused.
+    let mut keys: Vec<Pointer> = Vec::new();
+    let history: Vec<Value> = view
+        .get("increment")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for (index, entry) in history.into_iter().enumerate() {
+        let role = entry.get("role").and_then(Value::as_str).unwrap_or("system");
+        let content = entry
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(key) = entry.get("key") else {
+            continue;
+        };
+        let (Some(turn_id), Some(ts_ms), Some(sub)) = (
+            key.get("turn_id").and_then(Value::as_u64),
+            key.get("ts_ms").and_then(Value::as_u64),
+            key.get("sub").and_then(Value::as_u64),
+        ) else {
+            continue;
+        };
+        prefix.push(json!({ "role": role, "content": format!("[{}] {content}", index + 1) }));
+        keys.push(Pointer {
+            turn_id,
+            ts_ms,
+            sub: sub as u16,
+        });
+    }
+    (prefix, keys)
+}
+
+/// Did the store ask for a compression? k10r's verdict is the only authority on what is owed — this
+/// guest does not decide that a conversation has grown too long, and neither does a wake.
+fn wants_compress(view: &Value) -> bool {
+    view.get("tails")
+        .and_then(Value::as_array)
+        .map(|tails| {
+            tails
+                .iter()
+                .any(|tail| tail.get("name").and_then(Value::as_str) == Some(OP_COMPRESS))
+        })
+        .unwrap_or(false)
+}
+
+/// The intent a wake carries. One word, because the tag has to be readable in a log line.
+const WAKE_COMPRESS: &str = "compress";
+
+/// The wake's tag: `<intent>:<channel>:<member>`. The delivery carries `{tag}` and NOTHING else, and
+/// a guest is told no instance key (ADR-0016 §2), so whatever a wake must know travels here or not
+/// at all.
+fn wake_tag(channel_id: u64, member_id: &str) -> String {
+    format!("{WAKE_COMPRESS}:{channel_id}:{member_id}")
+}
+
+/// Parse a tag back. `None` is a tag this guest did not write — printed by the caller rather than
+/// swallowed, because a silent mismatch is a wake that fires forever for a channel nobody can name.
+fn parse_wake_tag(tag: &str) -> Option<(String, u64, String)> {
+    let mut parts = tag.splitn(3, ':');
+    let intent = parts.next()?.to_string();
+    let channel_id = parts.next()?.parse::<u64>().ok()?;
+    let member_id = parts.next()?.to_string();
+    if intent.is_empty() || member_id.is_empty() {
+        return None;
+    }
+    Some((intent, channel_id, member_id))
+}
+
+/// How long after a turn the wake looks again. Short enough that a dead branch is noticed while the
+/// conversation is still recent, long enough that a branch still pulling is given its chance to
+/// land first (a wake that opens a second pass over a span in flight pays twice for one summary).
+const WAKE_DELAY_MS: u64 = 60_000;
+
+/// Arm the wake. Durable, because the window it covers outlives the booth's residency (ADR-0016 §4)
+/// — a memory-tier wake on an evicted instance is a schedule that vanished, and the span it was
+/// meant to land stays open.
+fn arm_wake(ctx: &mut Ctx, channel_id: u64, member_id: &str) {
+    let tag = wake_tag(channel_id, member_id);
+    match ctx.timer_register(WAKE_DELAY_MS, &tag, true) {
+        // A host that knows the arm but keeps no table answers 0: the wake was accepted and will die
+        // with the process. Say so rather than believing the request.
+        Ok(0) => eprintln!("[gravity-turn] the wake `{tag}` was accepted without an id — not durable"),
+        Ok(_) => {}
+        // A host that declines the arm (the minimal host: "mudra has none today") must not fail the
+        // turn it was armed for: maintenance that breaks the answer is worse than maintenance that
+        // does not happen.
+        Err(e) => eprintln!("[gravity-turn] the wake `{tag}` could not be armed: {e:#}"),
+    }
+}
+
+/// A WAKE IS A QUESTION (ADR-0016 §3): re-read the projection and act only if the store still says
+/// a compression is owed. The span may have been landed by the turn that armed this wake, or by a
+/// later one — the store's answer is the authority, and a wake that compresses unconditionally pays
+/// a second model call for a summary already in flight.
+///
+/// It writes through the same doors a turn does (`land_summary`/`land_review`) and writes NO
+/// exchange row: maintenance that appears in the conversation as somebody speaking is a defect in
+/// the product, not a detail of the mechanism (ADR-0016 §6).
+fn wake(ctx: &mut Ctx, args: &Value) -> anyhow::Result<Value> {
+    let Some(tag) = args.get("tag").and_then(Value::as_str) else {
+        eprintln!("[gravity-turn] a wake arrived with no tag: {args}");
+        return Ok(json!({ "woke": false }));
+    };
+    let Some((intent, channel_id, member_id)) = parse_wake_tag(tag) else {
+        eprintln!("[gravity-turn] wake tag `{tag}` is not one this guest writes");
+        return Ok(json!({ "woke": false }));
+    };
+    if intent != WAKE_COMPRESS {
+        eprintln!("[gravity-turn] wake `{intent}` is not an intent this guest knows");
+        return Ok(json!({ "woke": false }));
+    }
+    // The deployment facts come from the same rows a turn reads: a wake has no call arguments.
+    let settings = read_settings(ctx)?;
+    let recipe = read_recipe(ctx, settings.default_model)?;
+    let store_url = settings.store_url.trim_end_matches('/').to_string();
+    let format = MemoryFormat::from_config(Some(settings.memory_format.as_str()))
+        .context("wake: the configured memory format is unusable")?;
+    let url = format!(
+        "{store_url}/channels/{channel_id}/members/{member_id}/session?format={}&scope={}",
+        format.name(),
+        settings.memory_scope
+    );
+    let resp = ureq::get(&url)
+        .call()
+        .context("wake: mem-server session request failed")?;
+    let view: Value =
+        serde_json::from_reader(resp.into_reader()).context("wake: bad session projection")?;
+    if !wants_compress(&view) {
+        // The span closed (or was never open): the wake did its job by asking.
+        return Ok(json!({ "woke": false }));
+    }
+    let (prefix, keys) = branch_material(&view);
+    let landing = Landing {
+        store_url,
+        channel_id,
+        member_id: member_id.clone(),
+        memory_scope: settings.memory_scope,
+    };
+    let mut tails: Vec<Tail> = Vec::new();
+    let cancel = ctx.cancel();
+    for tail in view
+        .get("tails")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let Some(name) = tail.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if name != OP_COMPRESS && name != OP_REVIEW {
+            eprintln!("[gravity-turn] wake: tail operation `{name}` is not known to this guest");
+            continue;
+        }
+        open_branch(&recipe, &tail, name, &prefix, &keys, &mut tails, cancel.clone());
+    }
+    let opened = tails.len();
+    raise_tails(landing, tails);
+    Ok(json!({ "woke": true, "branches": opened }))
+}
+
 /// Open the tail branches k10r asked for (ADR-0008 §4): the same prefix the main
 /// branch reads, the served prompt in place of this turn's message, the records
 /// NUMBERED so the operation can point at one. They run CONCURRENTLY with the
@@ -2759,7 +2918,7 @@ fn start_tails(
             eprintln!("[gravity-turn] tail operation `{name}` is not known to this guest");
             continue;
         }
-        open_branch(turn, &tail, name, prefix, keys, tails, cancel.clone());
+        open_branch(&turn.recipe, &tail, name, prefix, keys, tails, cancel.clone());
     }
 }
 
@@ -2773,7 +2932,7 @@ const OP_COMPRESS: &str = "compress";
 const OP_REVIEW: &str = "review";
 
 fn open_branch(
-    turn: &Turn<'_>,
+    recipe: &Recipe,
     tail: &Value,
     name: &str,
     prefix: &[Value],
@@ -2787,9 +2946,9 @@ fn open_branch(
     let mut messages: Vec<Value> = prefix.to_vec();
     messages.push(json!({ "role": "user", "content": prompt }));
     let messages = json!(messages);
-    let endpoint = turn.endpoint.clone();
-    let model = turn.model.clone();
-    let key_env = turn.key_env.clone();
+    let endpoint = recipe.endpoint.clone();
+    let model = recipe.model.clone();
+    let key_env = recipe.key_env.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     // A THREAD, not a shared pull loop: the endpoint caches the prefix, so the
     // branch pays only its own delta, and nothing about it touches the answer's
@@ -3411,6 +3570,63 @@ mod tests {
 
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+    /// The tag is the whole wake: the delivery carries `{tag}` and nothing else and the guest is
+    /// told no instance key, so a tag that does not round-trip is a wake for a channel nobody can
+    /// name (ADR-0016 §2).
+    #[test]
+    fn a_wake_tag_names_its_channel_and_member_and_reads_back() {
+        let tag = wake_tag(7, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(tag, "compress:7:00000000-0000-0000-0000-000000000001");
+        let (intent, channel, member) = parse_wake_tag(&tag).unwrap();
+        assert_eq!(intent, WAKE_COMPRESS);
+        assert_eq!(channel, 7);
+        assert_eq!(member, "00000000-0000-0000-0000-000000000001");
+        // A tag this guest did not write is refused, not guessed at.
+        assert!(parse_wake_tag("compress:x:member").is_none());
+        assert!(parse_wake_tag("compress:7").is_none());
+        assert!(parse_wake_tag("compress:7:").is_none());
+        assert!(parse_wake_tag("").is_none());
+    }
+
+    /// The wake's whole decision is this one question, and the answer is the STORE's: a projection
+    /// that no longer asks for a compression means somebody landed it (ADR-0016 §3).
+    #[test]
+    fn a_wake_only_acts_on_the_stores_verdict() {
+        let asking = json!({ "tails": [{ "name": "compress", "prompt": "fold it" }] });
+        let answering = json!({ "tails": [{ "name": "review", "prompt": "what is missing" }] });
+        assert!(wants_compress(&asking));
+        assert!(!wants_compress(&answering));
+        assert!(!wants_compress(&json!({})));
+        assert!(!wants_compress(&json!({ "tails": [] })));
+    }
+
+    /// What the branch sees is derived from the projection alone — the same rule the turn used when
+    /// it assembled this by hand, and the reason it was extracted: a wake has no conversation.
+    #[test]
+    fn a_branch_sees_the_head_the_summary_and_the_numbered_records() {
+        let view = json!({
+            "head": "the user is a beekeeper",
+            "summary": "we discussed hives",
+            "increment": [
+                { "role": "user", "content": "how many frames?", "key": { "turn_id": 3, "ts_ms": 10, "sub": 0 } },
+                { "role": "assistant", "content": "nine" },
+                { "role": "user", "content": "and supers?", "key": { "turn_id": 3, "ts_ms": 11, "sub": 1 } }
+            ]
+        });
+        let (prefix, keys) = branch_material(&view);
+        assert_eq!(prefix[0], json!({ "role": "system", "content": "the user is a beekeeper" }));
+        assert_eq!(prefix[1]["content"], json!("Conversation summary so far:\nwe discussed hives"));
+        // Only the records that carry a position are numbered, and the number is the record's index
+        // in the increment — an unkeyed row keeps its place in the count, because the store's
+        // positions are what an operation points at.
+        assert_eq!(prefix.len(), 4, "{prefix:?}");
+        assert_eq!(prefix[2], json!({ "role": "user", "content": "[1] how many frames?" }));
+        assert_eq!(prefix[3], json!({ "role": "user", "content": "[3] and supers?" }));
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], Pointer { turn_id: 3, ts_ms: 10, sub: 0 });
+        assert_eq!(keys[1], Pointer { turn_id: 3, ts_ms: 11, sub: 1 });
+    }
+
     /// THE ENTRY DOES NOT WAIT FOR ITS MAINTENANCE — milestone 3's "the branch's owner after the turn
     /// returns". `raise_tails` hands the branches to a thread in this resident process and returns at
     /// once; the old `drain_tails` sat here for up to sixty seconds and then dropped the product.
@@ -3455,10 +3671,15 @@ mod tests {
                 keys: Vec::new(),
             }],
         );
-        // The whole point: the call above returned without the branch having answered.
+        // The whole point: the call above returned without the branch having answered. The proof is
+        // structural — the product is sent BELOW, after this line, so a `raise_tails` that waited
+        // would still be waiting when the send happens and the test would time out rather than fail.
+        // The bound is a load guard, not the contract: a loaded machine can spend a moment in the
+        // spawn itself, and a millisecond figure there would fail for reasons that are not the
+        // ownership rule.
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(50),
-            "raise_tails waited on the branch ({:?})",
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "raise_tails blocked for {:?} — it is waiting on the branch",
             started.elapsed()
         );
 

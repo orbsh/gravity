@@ -1328,6 +1328,69 @@ async fn the_compression_branch_lands_the_served_summary() {
     assert_eq!(view.coverage_ts, 2_000, "the split k10r proposed");
 }
 
+/// A COMPRESSION NOBODY'S MESSAGE ASKED FOR (ADR-0016): the store owes a compression, no turn
+/// exists to open the branch, and the field's clock delivers `__on_timer` carrying the tag this
+/// booth armed itself. The wake asks, the store answers yes, and the summary lands through the same
+/// checkpoint door a turn uses — the difference is only who caused the read.
+///
+/// The tag is written out LITERALLY here: it is the contract the delivery carries (`{tag}` and
+/// nothing else — the guest is told no instance key), so the test should see what the clock sees.
+#[tokio::test]
+async fn a_wake_folds_a_span_that_no_turn_is_watching() {
+    let endpoint = sse_server(vec!["compressed ", "span"]).await;
+    let store_url = mem_server_with_compression().await;
+    let surface = gravity_core::surface::HttpSurface::new(&store_url);
+    for (ts, text) in [
+        (1_000u64, "first message of the span"),
+        (2_000, "second message of the span"),
+        (9_000, "third message of the span"),
+    ] {
+        surface.append_message(7, ts, 0, 0, 0, text, None).await.unwrap();
+    }
+    let (engine, _seen) = boot(&store_url, &endpoint).await;
+    seed(&engine, &store_url, &endpoint).await;
+
+    // NO TURN: the delivery is the whole cause of this compression.
+    drive(
+        &engine,
+        "__on_timer",
+        json!({ "tag": format!("compress:7:{TEST_MEMBER}") }),
+    )
+    .await
+    .unwrap();
+
+    // The product lands off the entry's stack (ADR-0016 §5 — the wake does not wait for its own
+    // branch either), so the test polls the store instead of reading a return value.
+    let mut view = surface
+        .fetch_session(7, gravity_core::surface::default_member())
+        .await
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while view.summary.as_deref() != Some("compressed span")
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        view = surface
+            .fetch_session(7, gravity_core::surface::default_member())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        view.summary.as_deref(),
+        Some("compressed span"),
+        "the wake opened the branch the store asked for and landed its summary"
+    );
+    assert_eq!(view.coverage_ts, 2_000, "the split k10r proposed");
+    // A WAKE IS MAINTENANCE (ADR-0016 §6): the log holds the three records it folded, and nothing
+    // the wake said — it has no words of its own to put there.
+    assert_eq!(
+        view.increment.last().map(|e| e.1.content.as_str()),
+        Some("third message of the span"),
+        "the wake wrote no exchange row: {:?}",
+        view.increment.iter().map(|e| e.1.content.clone()).collect::<Vec<_>>()
+    );
+}
+
 /// The compression's SECOND product: the pass says where the span would have
 /// been better cut, the turn resolves that INDEX against the records it numbered,
 /// and the checkpoint records it beside the summary without moving the coverage
