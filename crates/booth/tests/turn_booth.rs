@@ -2575,3 +2575,79 @@ async fn a_context_turn_is_not_given_the_history_a_person_turn_is() {
         "a person's turn is the conversation: {person_prompt}"
     );
 }
+
+/// A PERSON'S LINE IS THE SOLO ONE. With no `channel_id` in the args the engine looks the
+/// conversation up, and the lookup used to be "the first channel this member is in" — true while a
+/// member had one channel, wrong the moment an agent can add a person to the channel it works in.
+/// The store now says which channel is somebody's own, and that is the one a person's turn lands in.
+#[tokio::test]
+async fn a_persons_turn_lands_in_their_own_line_not_the_first_channel_they_are_in() {
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let bodies_for_route = bodies.clone();
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(move |request: axum::extract::Request| {
+            let bodies = bodies_for_route.clone();
+            async move {
+                let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                bodies
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&bytes).to_string());
+                let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(sse))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &format!("http://{addr}")).await;
+
+    // The MACHINE's channel first (lower id), the person's own line second — the order that made
+    // "first" answer with somebody else's channel. Both hold the person, as a supervisor is held.
+    let app_id = "4f1b6c1e-0d3a-5f2b-9c47-6a1d0e5b8c22";
+    for (channel, scene, solo) in [(2u64, "context", 0u8), (3, "conversation", 1)] {
+        let open_url = format!("{store_url}/channels/{channel}");
+        let join_url = format!("{store_url}/channels/{channel}/members");
+        tokio::task::spawn_blocking(move || {
+            ureq::post(&open_url)
+                .send_json(json!({
+                    "app_id": app_id, "scene": scene, "created_ms": 5u64, "solo": solo
+                }))
+                .unwrap();
+            ureq::post(&join_url)
+                .send_json(json!({
+                    "member_id": TEST_MEMBER, "display_name": "Alice", "role": 0u8,
+                    "since_ms": 1u64
+                }))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    // No `channel_id`: this is the path where the engine asks the store instead of guessing.
+    let mut args = turn_args("my own words");
+    args.as_object_mut().unwrap().remove("channel_id");
+    run_turn(&engine, &seen, args).await.unwrap();
+
+    let rows: Vec<Value> = tokio::task::spawn_blocking(move || {
+        let resp = ureq::get(&format!("{store_url}/channels/3/messages"))
+            .call()
+            .unwrap();
+        serde_json::from_reader::<_, Vec<Value>>(resp.into_reader()).unwrap()
+    })
+    .await
+    .unwrap();
+    // Two rows: the question and the answer, both in the person's own line.
+    assert_eq!(rows.len(), 2, "the turn wrote into the person's own line: {rows:?}");
+    assert_eq!(rows[0]["content"], "my own words");
+    assert_eq!(rows[1]["role"], "assistant");
+}

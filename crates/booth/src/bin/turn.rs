@@ -2491,9 +2491,10 @@ impl Doors for VenueDoors<'_, '_> {
 /// (`k10r` stores them, the engine decides them), and the decision here is the smallest one
 /// that can hold: ONE conversation per member, opened on first use.
 ///
-/// The id is DERIVED from the member rather than allocated, so two turns racing on a member's
-/// first message open the same channel instead of two — `put_channel` is idempotent, and a
-/// derived id keeps it so without a mapping table to keep in step. A u64 hash over the member's
+/// The id of that first open is DERIVED from the member rather than allocated, so two turns racing
+/// on a member's first message open the same channel instead of two — `put_channel` is idempotent,
+/// and a derived id keeps it so without a mapping table to keep in step. It is the OPENING id
+/// only: finding the line again is the store's answer (`solo`), never a hash this side remembers. A u64 hash over the member's
 /// text collides only if two members hash alike, which one deployment will not see; the day a
 /// deployment does, the fix is a mapping row, not a different hash.
 const GRAVITY_APP_ID: &str = "4f1b6c1e-0d3a-5f2b-9c47-6a1d0e5b8c22";
@@ -2570,11 +2571,22 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The member's conversation: the first channel they are in, or the one this engine opens.
+/// The member's OWN line — the channel they opened for their conversation, asked for by the flag
+/// that names it.
+///
+/// It is NOT "the first channel this member is in": that read was true while a member had one
+/// channel, and it became a lie the day an agent could add a person to a channel it works in —
+/// the supervisor's own words would then land in a machine's line. k10r records which channel is
+/// somebody's own (`solo`, k10r ADR-0025), and the narrowing is done there because the store is
+/// the one that knows the rows.
+///
+/// The app filter rides along: a deployment has its own lines and nobody else's.
 fn channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
-    let listed = ureq::get(&format!("{store_url}/members/{member}/channels"))
-        .call()
-        .with_context(|| format!("turn: asking the store which channels {member} is in failed"))?;
+    let listed = ureq::get(&format!(
+        "{store_url}/members/{member}/channels?app={GRAVITY_APP_ID}&solo=1"
+    ))
+    .call()
+    .with_context(|| format!("turn: asking the store which channels {member} is in failed"))?;
     let rows: Value =
         serde_json::from_reader(listed.into_reader()).context("turn: bad channel list")?;
     if let Some(open) = rows.as_array().and_then(|rows| {
@@ -2590,6 +2602,9 @@ fn channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
             "app_id": GRAVITY_APP_ID,
             "scene": "conversation",
             "created_ms": now_ms(),
+            // The line this engine opens is somebody's OWN: that is what makes it findable next
+            // time without consulting an order.
+            "solo": 1,
         }))
         .map(|_| ())
         .or_else(|e| match e {
