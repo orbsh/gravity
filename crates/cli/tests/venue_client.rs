@@ -224,8 +224,8 @@ fn run_cli(venue_url: &str, args: &[&str]) -> Output {
     run_cli_in(dir.path(), venue_url, args)
 }
 
-/// The same, in an installation the caller keeps: the member id lives beside the config, so two
-/// invocations share it only if they share the directory.
+/// The same, in an installation the caller keeps (a config file of its own): the tag is the
+/// identity, so the directory does not decide who runs.
 fn run_cli_in(dir: &std::path::Path, venue_url: &str, args: &[&str]) -> Output {
     let config = dir.join("gravity.json");
     std::fs::write(
@@ -255,7 +255,7 @@ fn run_cli_in(dir: &std::path::Path, venue_url: &str, args: &[&str]) -> Output {
 #[test]
 fn one_command_is_one_turn_per_argument() {
     let (url, seen) = venue(Mode::Happy);
-    let out = run_cli(&url, &["--json", "hello", "again"]);
+    let out = run_cli(&url, &["--tag", "smoke", "--json", "hello", "again"]);
     assert!(out.status.success(), "exit: {:?}", out.status);
     let stdout = String::from_utf8(out.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
@@ -284,10 +284,9 @@ fn one_command_is_one_turn_per_argument() {
         args.get("channel_id").is_none(),
         "the channel follows the speaker: {args}"
     );
-    // WHO this client is: a uuid, not a number — k10r's member id IS the user's uuid, and the
-    // client mints one on first run and keeps it (a fresh id per invocation would make every
-    // command a different person to the store). The shape is asserted, not a value: the id is the
-    // deployment's, and the test's temp dir is a fresh installation.
+    // WHO this client is: a uuid derived from the tag, and the same uuid on every run — a fresh id
+    // per invocation would make every command a different agent. The shape is asserted, not a
+    // value; `a_tag_speaks_as_an_agent_derived_from_its_name` pins the value's stability.
     let member = args["member_id"].as_str().expect("member_id is a string uuid");
     assert_eq!(member.len(), 36, "uuid text: {member}");
     assert_eq!(member.matches('-').count(), 4, "uuid text: {member}");
@@ -304,14 +303,15 @@ fn one_command_is_one_turn_per_argument() {
     );
 }
 
-/// A CONTEXT IS A SPEAKER OF ITS OWN: `--context` names it and derives its identity from that
-/// name, so the same name is the same agent on every run — which is exactly what makes a series of
-/// ONE-TURN invocations accumulate into one conversation in the channel. The person who started
-/// the process is not the voice of it; that is the whole point of a separate identity.
+/// THE TAG IS THE CALLER'S WHOLE IDENTITY: `--tag` names the automation and its member id is
+/// derived from that name, so the same tag is the same agent on every run — which is exactly what
+/// makes a series of ONE-TURN invocations (a cron job, a CI step) accumulate into one history
+/// instead of a new one each time. Nothing is stored: a fresh checkout cannot come up as a
+/// different speaker.
 #[test]
-fn a_context_speaks_as_an_agent_derived_from_its_name() {
+fn a_tag_speaks_as_an_agent_derived_from_its_name() {
     let (url, seen) = venue(Mode::Happy);
-    let out = run_cli(&url, &["--context", "drift check", "hi"]);
+    let out = run_cli(&url, &["--tag", "drift check", "hi"]);
     assert!(out.status.success(), "exit: {:?}", out.status);
     let args = submit_args(&seen);
     assert_eq!(args["member_name"], "drift check", "{args}");
@@ -322,23 +322,26 @@ fn a_context_speaks_as_an_agent_derived_from_its_name() {
     let first = args["member_id"].as_str().unwrap().to_string();
     assert_eq!(first.len(), 36, "a uuid-shaped identity: {first}");
 
-    // The same context again: the same identity, because the derivation is the name.
+    // The same tag again: the same identity, because the derivation is the name.
     let (again_url, again_seen) = venue(Mode::Happy);
-    let again = run_cli(&again_url, &["--context", "drift check", "hi"]);
+    let again = run_cli(&again_url, &["--tag", "drift check", "hi"]);
     assert!(again.status.success(), "exit: {:?}", again.status);
     assert_eq!(submit_args(&again_seen)["member_id"], first.as_str());
 
-    // A different context: a different agent.
+    // A different tag: a different agent.
     let (other_url, other_seen) = venue(Mode::Happy);
-    let other = run_cli(&other_url, &["--context", "nightly", "hi"]);
+    let other = run_cli(&other_url, &["--tag", "nightly", "hi"]);
     assert!(other.status.success(), "exit: {:?}", other.status);
     assert_ne!(submit_args(&other_seen)["member_id"], first.as_str());
 
-    // Two ways of saying who speaks are one too many: refused before a socket is opened.
+    // A caller that will not name itself is refused before a socket is opened: an unnamed caller
+    // has no line to continue, and guessing one would be the client inventing an identity.
     let (url, seen) = venue(Mode::Happy);
-    let both = run_cli(&url, &["--context", "x", "--member", first.as_str(), "hi"]);
-    assert_eq!(both.status.code(), Some(2), "usage failure");
+    let nameless = run_cli(&url, &["hi"]);
+    assert_eq!(nameless.status.code(), Some(2), "usage failure");
     assert!(seen.lock().unwrap().is_empty(), "nothing was sent");
+    let stderr = String::from_utf8(nameless.stderr).unwrap();
+    assert!(stderr.contains("--tag"), "the refusal names the flag: {stderr}");
 }
 
 /// The args of the (single) `ui:turn.submit` a fixture recorded.
@@ -351,75 +354,12 @@ fn submit_args(seen: &Arc<Mutex<Vec<Value>>>) -> Value {
         .clone()
 }
 
-/// THE MEMBER ID IS AN IDENTITY, so it is minted once and kept: the first run writes one beside
-/// the config and says so, later runs read it, and an operator who pastes the account's uuid out
-/// of prism changes who the client speaks as without touching a flag.
-#[test]
-fn the_member_id_is_minted_once_kept_beside_the_config_and_editable() {
-    let dir = tempfile::TempDir::new().unwrap();
-
-    let (first_url, first_seen) = venue(Mode::Happy);
-    let first = run_cli_in(dir.path(), &first_url, &["hi"]);
-    assert!(first.status.success(), "exit: {:?}", first.status);
-    let path = dir.path().join("member_id");
-    let minted = std::fs::read_to_string(&path).expect("the id was written beside the config")
-        .trim()
-        .to_string();
-    assert_eq!(minted.len(), 36, "uuid text: {minted}");
-    let stderr = String::from_utf8(first.stderr).unwrap();
-    assert!(stderr.contains("first run"), "a first run says so: {stderr}");
-    let used = first_seen.lock().unwrap().clone();
-    let submit = used
-        .iter()
-        .find(|f| f["ev"] == "ui:turn.submit")
-        .expect("one submit")
-        .clone();
-    assert_eq!(submit["args"]["member_id"], minted.as_str(), "{submit}");
-
-    // A second run in the same installation reads the file instead of minting: same person, no
-    // second notice, and the file untouched.
-    let (second_url, second_seen) = venue(Mode::Happy);
-    let second = run_cli_in(dir.path(), &second_url, &["hi"]);
-    assert!(second.status.success(), "exit: {:?}", second.status);
-    let stderr = String::from_utf8(second.stderr).unwrap();
-    assert!(!stderr.contains("first run"), "no second notice: {stderr}");
-    assert_eq!(
-        std::fs::read_to_string(&path).unwrap().trim(),
-        minted,
-        "the file is the identity, not a per-run default"
-    );
-    let used = second_seen.lock().unwrap().clone();
-    let submit = used
-        .iter()
-        .find(|f| f["ev"] == "ui:turn.submit")
-        .expect("one submit")
-        .clone();
-    assert_eq!(submit["args"]["member_id"], minted.as_str(), "{submit}");
-
-    // The file is plain text for a reason: the real answer is the account's uuid from prism.
-    std::fs::write(&path, "6f1d3d0e-0000-4000-8000-000000000001\n").unwrap();
-    let (third_url, third_seen) = venue(Mode::Happy);
-    let third = run_cli_in(dir.path(), &third_url, &["hi"]);
-    assert!(third.status.success(), "exit: {:?}", third.status);
-    let used = third_seen.lock().unwrap().clone();
-    let submit = used
-        .iter()
-        .find(|f| f["ev"] == "ui:turn.submit")
-        .expect("one submit")
-        .clone();
-    assert_eq!(
-        submit["args"]["member_id"], "6f1d3d0e-0000-4000-8000-000000000001",
-        "editing the file changes who the client is: {submit}"
-    );
-}
-
-/// `--session` PINS the conversation (absent = the speaker's own line) and `--member` is who speaks
-/// in it: a pinned session rides the call, and one that is not a channel id is refused before
-/// anything is sent.
+/// `--session` PINS the conversation (absent = the speaker's own line): a pinned session rides the
+/// call, and one that is not a channel id is refused before anything is sent.
 #[test]
 fn the_conversation_and_the_speaker_ride_the_call() {
     let (url, seen) = venue(Mode::Happy);
-    let out = run_cli(&url, &["--session", "9", "--member", "alice's-own-id", "hi"]);
+    let out = run_cli(&url, &["--tag", "nightly", "--session", "9", "hi"]);
     assert!(out.status.success(), "exit: {:?}", out.status);
     let frames = seen.lock().unwrap().clone();
     let submit = frames
@@ -427,14 +367,16 @@ fn the_conversation_and_the_speaker_ride_the_call() {
         .find(|f| f["ev"] == "ui:turn.submit")
         .expect("one submit");
     assert_eq!(submit["args"]["channel_id"], 9, "{submit}");
+    assert_eq!(submit["args"]["member_name"], "nightly", "{submit}");
     assert_eq!(
-        submit["args"]["member_id"], "alice's-own-id",
-        "--member wins over the file, verbatim: {submit}"
+        submit["args"]["member_id"].as_str().unwrap().len(),
+        36,
+        "the speaker is derived from the tag, not typed: {submit}"
     );
 
     // A session that is not a channel id never reaches the socket: usage failure, exit 2.
     let (url, seen) = venue(Mode::Happy);
-    let out = run_cli(&url, &["--session", "not-a-number", "hi"]);
+    let out = run_cli(&url, &["--tag", "smoke", "--session", "not-a-number", "hi"]);
     assert_eq!(out.status.code(), Some(2), "a bad id is a usage failure");
     assert!(
         seen.lock().unwrap().is_empty(),
@@ -447,7 +389,7 @@ fn the_conversation_and_the_speaker_ride_the_call() {
 #[test]
 fn a_failed_turn_exits_4() {
     let (url, _seen) = venue(Mode::TurnError);
-    let out = run_cli(&url, &["hi"]);
+    let out = run_cli(&url, &["--tag", "smoke", "hi"]);
     assert_eq!(out.status.code(), Some(4));
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("the provider died"), "stderr: {stderr}");
@@ -457,7 +399,7 @@ fn a_failed_turn_exits_4() {
 #[test]
 fn a_refused_auth_exits_3() {
     let (url, _seen) = venue(Mode::AuthRefused);
-    let out = run_cli(&url, &["hi"]);
+    let out = run_cli(&url, &["--tag", "smoke", "hi"]);
     assert_eq!(out.status.code(), Some(3));
 }
 
@@ -466,7 +408,7 @@ fn a_refused_auth_exits_3() {
 #[test]
 fn cancel_sends_the_venue_verb_and_ends_the_turn() {
     let (url, seen) = venue(Mode::SlowTurn);
-    let out = run_cli(&url, &["--cancel-after-ms", "100", "hi"]);
+    let out = run_cli(&url, &["--tag", "smoke", "--cancel-after-ms", "100", "hi"]);
     assert_eq!(out.status.code(), Some(4));
     let frames = seen.lock().unwrap().clone();
     assert_eq!(
@@ -483,6 +425,6 @@ fn an_unreachable_venue_exits_5() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
-    let out = run_cli(&format!("ws://{addr}"), &["hi"]);
+    let out = run_cli(&format!("ws://{addr}"), &["--tag", "smoke", "hi"]);
     assert_eq!(out.status.code(), Some(5));
 }

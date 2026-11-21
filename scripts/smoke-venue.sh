@@ -548,23 +548,16 @@ cat > "$ROOT/gravity.json" <<JSON
 { "venue": { "url": "ws://127.0.0.1:$PRISM_PORT", "username": "smoke", "password_env": "SMOKE_PW" } }
 JSON
 
-# The person's turn is PINNED to channel 1: the legs below read that channel by name, and what this
-# one proves is the round trip, not the addressing. The addressing has its own leg further down
-# (`--context` with no `--session`, where the channel has to follow the speaker).
+# This turn is PINNED to channel 1: the legs below read that channel by name, and what this one
+# proves is the round trip, not the addressing. The addressing has its own leg further down
+# (`--tag` with no `--session`, where the channel has to follow the speaker).
 GRAVITY_CONFIG="$ROOT/gravity.json" SMOKE_PW="smoke-pw" \
-    "$GRAVITY_REPO/target/debug/gravity" --json --session 1 "hi" \
+    "$GRAVITY_REPO/target/debug/gravity" --json --tag operator --session 1 "hi" \
     >"$ROOT/cli.out" 2>"$ROOT/cli.err"
 code=$?
 echo "cli exit: $code"
 cat "$ROOT/cli.err"
 [ "$code" -eq 0 ] || fail "the CLI exited $code"
-
-# WHO the CLI is: the uuid it minted into `member_id` beside its config on the first run (an
-# operator replaces that file with the account's uuid from prism). Captured here because the
-# rows it wrote carry it, and the attribution check below reads them back.
-HUMAN=$(cat "$ROOT/member_id" 2>/dev/null || true)
-[ -n "$HUMAN" ] || fail "the CLI never wrote its member id ($ROOT/member_id)"
-echo "ok: the CLI's own id is $HUMAN (a venue that knows the account stamps that instead)"
 
 python3 - "$ROOT/cli.out" "$EXPECTED" <<'PY' || exit 1
 import json
@@ -579,7 +572,9 @@ if value.get("reply") != expected:
     raise SystemExit(f"FAIL: reply {value.get('reply')!r} != {expected!r}")
 if value.get("session") != "1":
     raise SystemExit(f"FAIL: session {value.get('session')!r} != '1'")
-print(f"ok: reply {value['reply']!r} on session {value['session']}")
+if value.get("tag") != "operator":
+    raise SystemExit(f"FAIL: the answer does not say who asked: {value}")
+print(f"ok: reply {value['reply']!r} on session {value['session']}, as `{value['tag']}`")
 PY
 
 # WHICH MEMBER: k10r's member ids are uuids (identity, not a counter), so `1` is not one.
@@ -588,9 +583,8 @@ PY
 MEMBER=$(curl -s "http://127.0.0.1:$MEM_PORT/channels/1/members" \
     | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0]["member_id"])' \
     || fail "k10r members read failed")
-# NOT written into `member_id`: that file is the CLI's identity, and the member this read returns
-# is the channel's DEFAULT one (the single-party shape k10r seeds) — overwriting the file with it
-# would quietly change who the next invocation speaks as.
+# The member this read returns is the channel's DEFAULT one (the single-party shape k10r seeds),
+# not the caller: the caller is an agent, and it arrives by tag.
 # The status AND the body: a bare `curl -sf` turns "404 with k10r's own words" into
 # "k10r session read failed", which is how this step hid its reason the first time.
 code=$(curl -s -o "$ROOT/session.json" -w '%{http_code}' \
@@ -773,23 +767,23 @@ if "likes" not in edges:
 print("ok: the node ran the code row and commit_memory landed:", names, edges)
 PY
 
-# WHO SPOKE. Every row names its speaker now: the human's own words carry a member id, everything
-# the turn said carries the agent's (gravity AGENT_MEMBER, registered so the bracket reads
-# "gravity" instead of a uuid). Without this a channel with two people reads as a monologue —
-# which is what it did until the rows learned to say who they belong to (k10r ADR-0009 §1).
+# WHO SPOKE. Every row names its speaker: the caller's words carry the identity its TAG derives,
+# and everything the turn said carries the agent's (gravity AGENT_MEMBER, registered so the bracket
+# reads "gravity" instead of a uuid). Without this a channel with two speakers reads as a monologue
+# — which is what it did until the rows learned to say who they belong to (k10r ADR-0009 §1).
 #
-# The human's id here is the VENUE's stamp, not the CLI's own file: prism knows who logged in and
-# puts that in the envelope, and a caller naming itself cannot outrank it (that is the whole point
-# of the stamp). One human in this channel is therefore also the assertion that the CLI and the
-# page spoke as the same person.
+# The caller is an AGENT, never the person who logged in: prism stamps the account on the envelope,
+# and a declared identity that k10r knows as an agent outranks it (ADR-0015 §1). So the speakers in
+# this channel are exactly two — the tag's agent and gravity — and the venue's stamp appearing as a
+# speaker would mean the stamp won, which is the thing this leg is here to catch.
 curl -s "http://127.0.0.1:$MEM_PORT/channels/1/messages" >"$ROOT/rows.json"
-python3 - "$ROOT/rows.json" 01900000-0000-7000-8000-000000000001 \
+python3 - "$ROOT/rows.json" 01900000-0000-7000-8000-000000000001 operator \
     00000000-0000-0000-0000-000000000001 <<'PY' || exit 1
 import json
 import sys
 
 rows = json.load(open(sys.argv[1]))
-agent, seeded = sys.argv[2], sys.argv[3]
+agent, tag, seeded = sys.argv[2], sys.argv[3], sys.argv[4]
 if not rows:
     raise SystemExit("FAIL: the channel has no rows to attribute")
 blank = [row for row in rows if not row.get("sender")]
@@ -798,12 +792,14 @@ if blank:
 senders = {row["sender"]: row["sender_name"] for row in rows}
 if senders.get(agent) != "gravity":
     raise SystemExit(f"FAIL: the agent is not the registered speaker it should be: {senders}")
-humans = [who for who in senders if who != agent]
-if len(humans) != 1:
-    raise SystemExit(f"FAIL: expected ONE human speaker in the channel, found {senders}")
-if humans[0] == seeded:
-    raise SystemExit(f"FAIL: the venue's identity was ignored — rows carry the seeded member: {senders}")
-print(f"ok: every row names its speaker — {humans[0]} (venue-stamped) and {senders[agent]}")
+callers = [who for who in senders if who != agent]
+if len(callers) != 1:
+    raise SystemExit(f"FAIL: expected ONE caller in the channel, found {senders}")
+if senders[callers[0]] != tag:
+    raise SystemExit(f"FAIL: the caller is not the agent its tag names: {senders}")
+if callers[0] == seeded:
+    raise SystemExit(f"FAIL: the rows carry the seeded member: {senders}")
+print(f"ok: every row names its speaker — {tag} (the tag's agent) and {senders[agent]}")
 PY
 
 # THE DIRECTORY, through the real stack: the agent was registered by a turn, so it must be
@@ -821,7 +817,7 @@ if found[0]["role"] != 1:
 print("ok: the directory finds the agent by name and tags it AGENT")
 PY
 
-# A CONTEXT IS ITS OWN SPEAKER. `--context` makes the CLI an AGENT named by that context, derived
+# THE TAG IS AN AGENT OF ITS OWN. `--tag` makes the CLI an agent named by that tag, derived
 # from the name — so the SAME name is the same speaker next run, which is how one-turn invocations
 # accumulate into one conversation in the channel. The venue still knows who logged in, and the
 # store does not honour a declared identity that is a PERSON, so this is a process speaking for
@@ -829,9 +825,9 @@ PY
 # (`find_member` + `supervise`), not the client's, so the client carries no such flag.
 GRAVITY_CONFIG="$ROOT/gravity.json" SMOKE_PW="smoke-pw" \
     "$GRAVITY_REPO/target/debug/gravity" --json --session 7 \
-    --context "drift check" "hi" >"$ROOT/cli-task.out" 2>"$ROOT/cli-task.err"
+    --tag "drift check" "hi" >"$ROOT/cli-task.out" 2>"$ROOT/cli-task.err"
 code=$?
-[ "$code" -eq 0 ] || fail "the context run exited $code: $(cat "$ROOT/cli-task.err")"
+[ "$code" -eq 0 ] || fail "the tagged run exited $code: $(cat "$ROOT/cli-task.err")"
 curl -s "http://127.0.0.1:$MEM_PORT/channels/7/messages" >"$ROOT/task-rows.json"
 curl -s "http://127.0.0.1:$MEM_PORT/channels/7/members" >"$ROOT/task-members.json"
 curl -s "http://127.0.0.1:$MEM_PORT/members?name=drift%20check" >"$ROOT/task-dir.json"
@@ -864,7 +860,7 @@ PY
 # the one that knows.
 GRAVITY_CONFIG="$ROOT/gravity.json" SMOKE_PW="smoke-pw" \
     "$GRAVITY_REPO/target/debug/gravity" --json \
-    --context "unpinned line" "hi" >"$ROOT/cli-own.out" 2>"$ROOT/cli-own.err"
+    --tag "unpinned line" "hi" >"$ROOT/cli-own.out" 2>"$ROOT/cli-own.err"
 code=$?
 [ "$code" -eq 0 ] || fail "the unpinned run exited $code: $(cat "$ROOT/cli-own.err")"
 curl -s "http://127.0.0.1:$MEM_PORT/members?name=unpinned%20line" >"$ROOT/own-dir.json"
