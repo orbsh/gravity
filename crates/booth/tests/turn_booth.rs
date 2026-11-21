@@ -1350,14 +1350,19 @@ async fn a_wake_folds_a_span_that_no_turn_is_watching() {
     let (engine, _seen) = boot(&store_url, &endpoint).await;
     seed(&engine, &store_url, &endpoint).await;
 
-    // NO TURN: the delivery is the whole cause of this compression.
-    drive(
-        &engine,
-        "__on_timer",
-        json!({ "tag": format!("compress:7:{TEST_MEMBER}") }),
+    // NO TURN: the delivery is the whole cause of this compression — and it arrives through the
+    // PRODUCTION DOOR, `deliver_timer`, which is what the realm's wheel calls when a timer comes
+    // due (an `__on_timer` job → the carrier → the guest's hook). Invoking the handler directly
+    // would have proved the handler and missed the seam a reserved-name mistake breaks.
+    aura_realm::Realm::deliver_timer(
+        engine.realm.clone(),
+        InstanceId {
+            booth_type: TURN_TYPE.into(),
+            key: InstanceKey::Named("s-door".into()),
+        },
+        format!("compress:7:{TEST_MEMBER}"),
     )
-    .await
-    .unwrap();
+    .await;
 
     // The product lands off the entry's stack (ADR-0016 §5 — the wake does not wait for its own
     // branch either), so the test polls the store instead of reading a return value.
