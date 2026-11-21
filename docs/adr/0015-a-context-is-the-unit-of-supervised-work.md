@@ -1,7 +1,7 @@
 # 0015 — a context is the unit of work somebody can watch
 
 Status: Proposed (2026-11-21). The mechanism this record describes is landed: the CLI's
-`--context`, the booth's declared-agent rule, `find_member`, `supervise`, and a smoke leg that runs
+`--tag`, the booth's declared-agent rule, `find_member`, `supervise`, and a smoke leg that runs
 two invocations of one context and shows the second one the first. What the record adds is the
 GENERAL statement — that a background task and a parallel batch are the same object, opened by a
 different hand.
@@ -27,7 +27,7 @@ borrow a person's identity or have none at all.
 **A context is the unit of agent work: a name, an agent member derived from it, one channel, one
 turn per invocation.**
 
-1. **The name IS the identity.** `--context "drift check"` derives a member id from the name
+1. **The name IS the identity.** `--tag "drift check"` derives a member id from the name
    (FNV-1a twice, uuid-shaped) and declares it to the turn along with `member_name`. The same name
    is therefore the same speaker on every run, and — because a member's rows in a channel are its
    conversation — the same name in the same channel is the same CONTEXT. Two names are two agents.

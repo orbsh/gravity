@@ -47,6 +47,23 @@ for eyes rather than pipes).
    is the automation interface. Development order follows that, and the CLI does
    not gate the phases that serve the web.
 
+5. **The caller is a tag, not a person.** `--tag <name>` is the whole identity:
+   the member id is derived from the name, so the same tag is the same agent —
+   and the same line — on every run, and nothing is stored, so a fresh checkout
+   or a new CI worker cannot come up as a different speaker. There is no
+   `--member` and no `member_id` file: this client is not the user, and a
+   person's voice comes from the page they are looking at. A caller that does
+   not name itself is a usage failure, because an unnamed caller has no history
+   to continue and a client that mints one is inventing an identity.
+
+6. **The environment is the venue's.** Tools run on the node that lives inside
+   the venue the turn was submitted to (ADR-0001), so "run this where the
+   incident is" means "submit to the venue on that machine" — not "link an
+   executor into this process". Likewise the lifetime: one invocation is one
+   turn, and anything that has to stay resident belongs to the venue, not to
+   the client. A caller that needs facts about its own machine passes them in
+   the text.
+
 ## Considered and rejected
 
 - **A REPL.** It duplicates the web client's statefulness in a second place,
@@ -77,9 +94,12 @@ for eyes rather than pipes).
 - **No protocol work.** `turn.submit` / `turn.delta` / `turn.done` /
   `turn.error` / `turn.cancel` exist and are tested (prism `turns.rs` +
   `turn_e2e.rs`); the CLI adds a client, not a surface.
-- **Open:** the command surface (verb names and their arguments) and the output
-  conventions (JSON shape, streaming rendering, exit-code mapping) — client-side
-  design, no venue impact.
+- **Settled:** the command surface is `--tag` (who calls), `--session` (pin a
+  channel), `--venue`, `--cancel-after-ms`, `--json`, one positional turn per
+  argument and `-` for stdin as ONE turn; exit codes are 0/2/3/4/5. **Open:** a
+  credential for unattended callers — today the venue password arrives in the
+  env var the config names, and a token per automation is the shape that
+  belongs here once the venue can issue one.
 
 ## Related records
 
