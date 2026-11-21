@@ -69,6 +69,6 @@ gravity 的实例在 idle TTL 之后被逐出，而一次压缩唤醒要覆盖�
 - gravity 多出第三个 entry（`__on_timer`）、一个 tag 解析函数、一处注册点：以 `compressing: true` 结束且没有落地摘要的 turn 会为该频道装一次唤醒；而开了分支的唤醒，也顺手把「本来会开同一个分支的那一轮 turn」挡在外面。
 - **随本记录一起落地**，都在 `crates/booth`：`.hook("__on_timer", …)`（是 HOOK 不是 `.on(…)` —— 名字是 host 的，induction 拒绝把它当订阅）、投影要求压缩之后的 `arm_wake`、`<意图>:<频道>:<成员>` 形状的 `wake_tag`/`parse_wake_tag`、作为唯一判据的 `wants_compress`，以及被抽出来的 `branch_material` —— 于是分支的前缀只从投影推导，不再依赖某一轮 turn 自己的状态。装不上只记一行日志，绝不让它要守护的那一轮 turn 失败。
 - **host 投递的名字要改四处，因为词汇是复制的。** `__on_timer` 必须同时加进 induction 的 guest、aura 的 booth builder、effector 的 python 与 steel 两个载体 —— 同一个数组的四份拷贝，各自用同样的话拒掉这个名字。这次落地让它们一致了；没有任何东西让它们保持一致，而这就是下一个保留名被发明之前该修的形状。
-- 测试：`a_wake_folds_a_span_that_no_turn_is_watching`（真 store、真时钟投递的 `__on_timer`、全程没有 turn —— 摘要落地，日志里只有它折掉的那些记录）、`a_wake_only_acts_on_the_stores_verdict`、`a_wake_tag_names_its_channel_and_member_and_reads_back`、`a_branch_sees_the_head_the_summary_and_the_numbered_records`。
+- 测试：`a_wake_folds_a_span_that_no_turn_is_watching`（真 store，投递走 `Realm::deliver_timer` —— 轮子自己调用的正是这个函数 —— 全程没有 turn：摘要落地，日志里只有它折掉的那些记录）、`a_wake_only_acts_on_the_stores_verdict`、`a_wake_tag_names_its_channel_and_member_and_reads_back`、`a_branch_sees_the_head_the_summary_and_the_numbered_records`。
 - **`durable` 这个请求已经到了 guest 这一侧**（2026-11-21）：`Ctx::timer_register` 把第三个参数带上，帧也带着它，于是 §4 的残项在这一侧关掉了。仍然开着的，是本仓自己的接线 —— 见下一条。
 - 接线落地时要补的测试：一个投递 `__on_timer` 的桩 host，断言分支经 checkpoint 门落地；一个 span 已被别的写者关闭的唤醒，断言摊位什么也没写；一个解析不了的 tag，断言这次错过被打印出来而不是被吞掉。
