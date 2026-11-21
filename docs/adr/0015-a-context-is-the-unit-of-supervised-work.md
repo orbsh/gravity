@@ -61,13 +61,20 @@ turn per invocation.**
    still holds" block — moved here from the booth for exactly this reason, and k10r ADR-0021 says
    so in its own words.
 
-4. **Every source of work has this shape.** A user's instruction that spawns a background task, a
+4. **A person's line is named, not guessed.** The engine used to take the first channel a member
+   was in, which was true while a member had one channel and wrong the moment an agent could add a
+   person to the channel it works in — a supervisor's own words would land in a machine's line. k10r
+   records which channel is somebody's own (`solo`, k10r ADR-0025) and the engine asks for it by
+   name; the id derived from the member is the OPENING id of a first use, never the way back to a
+   line that already exists.
+
+5. **Every source of work has this shape.** A user's instruction that spawns a background task, a
    trigger that fires on an event, one item of a parallel batch: each is a context, each speaks as
    its own agent, and each is watched the same way. What differs is who opens the turn — a person
    typing, a scheduler, a fan-out — and that is the only thing that differs. The opener is not a
    property of the line.
 
-5. **Watching is data, not a flag.** k10r's rows name their sender (k10r ADR-0009 §1), so a mixed
+6. **Watching is data, not a flag.** k10r's rows name their sender (k10r ADR-0009 §1), so a mixed
    line is readable; the channel's memberships are the visibility set. The agent decides who
    supervises — `find_member` asks the directory by name, `supervise` joins the people it chose —
    because the agent is the one that knows what the work is for and who could act on it. There can
@@ -75,7 +82,7 @@ turn per invocation.**
    client carries no such flag, and the abandoned `--supervisor` parameter is the evidence that a
    client-side list was the wrong shape.
 
-6. **Parallel work is one channel per context.** Two contexts sharing one channel would each read
+7. **Parallel work is one channel per context.** Two contexts sharing one channel would each read
    the other's rows: two narrators, one transcript, and a prompt that mixes two jobs. The line is
    the unit of isolation, and "watch it" means "open its channel".
 
