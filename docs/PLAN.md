@@ -12,8 +12,8 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
 - [x] 2.6 — Progress as data: a task row per step, completed at the call site — 2026-10-31 — ADR-0003, ADR-0011
 - [ ] 3 — Compression as a side branch — ADR-0003
   - [x] the turn-loop half: the branch opens off k10r's verdict and lands at the checkpoint door — 2026-10-26
-  - [ ] the standalone trigger: no idle/no-turn tick exists anywhere in the tree
-  - [ ] the branch's owner after the turn returns — `drain_tails` holds the turn today; needs one process serving two requests first (induction ADR-0002, steps 1–3)
+  - [ ] the standalone trigger: no idle/no-turn tick exists anywhere in the tree — the protocol half exists (`induction_guest::Ctx::timer_register(at_ms, tag)` / `timer_cancel`), and nothing in gravity registers one, so a compression that no turn caused cannot start
+  - [ ] the branch's owner after the turn returns — `drain_tails` waits INLINE up to 60s, so a slow summary holds the turn open and a longer one is abandoned as "outlived the turn". Its stated precondition is met and stale: induction ADR-0002's steps 1–3 landed 2026-11-02 (one route per request, replies paired by id, `host.call` naming the request), so one booth CAN serve two requests. What is missing is a PULLER that outlives the entry — the turn guest is resident (`BoothType::script(TURN_TYPE, "induction", …)`, one child per key), so the drain can be handed to a thread in the same process
 
 ## Milestone B — distributed execution
 
