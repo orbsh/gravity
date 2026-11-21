@@ -2651,3 +2651,109 @@ async fn a_persons_turn_lands_in_their_own_line_not_the_first_channel_they_are_i
     assert_eq!(rows[0]["content"], "my own words");
     assert_eq!(rows[1]["role"], "assistant");
 }
+
+/// THE CHANNEL FOLLOWS THE SPEAKER, NOT THE PERSON WHO LOGGED IN. A context run from a page's
+/// session arrives stamped as the operator and declares a different identity; resolving the
+/// channel from the stamp put the context's rows in the operator's own line — two narrators on
+/// one transcript (ADR-0015 §7). Who speaks is decided first, and the channel is resolved from
+/// THAT.
+#[tokio::test]
+async fn a_context_speaks_in_its_own_line_not_in_the_operators() {
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(|| async {
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &format!("http://{addr}")).await;
+
+    // The operator's own line, already holding one row: whatever else happens, a context's turn
+    // must not add to it.
+    let operator_line = 5u64;
+    let app_id = "4f1b6c1e-0d3a-5f2b-9c47-6a1d0e5b8c22";
+    let store = store_url.clone();
+    tokio::task::spawn_blocking(move || {
+        ureq::post(&format!("{store}/channels/{operator_line}"))
+            .send_json(json!({
+                "app_id": app_id, "scene": "conversation", "created_ms": 5u64, "solo": 1u8
+            }))
+            .unwrap();
+        ureq::post(&format!("{store}/channels/{operator_line}/members"))
+            .send_json(json!({
+                "member_id": TEST_MEMBER, "display_name": "Alice", "role": 0u8, "since_ms": 1u64
+            }))
+            .unwrap();
+        ureq::post(&format!("{store}/channels/{operator_line}/messages"))
+            .send_json(json!({
+                "ts_ms": 1_000u64, "sub": 0u16, "role": 0u8, "kind": 0u8,
+                "content": "my own words", "sender": TEST_MEMBER
+            }))
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    // A page-shaped envelope: the venue stamps the operator, the args declare a context.
+    let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
+    let mut args = turn_args("work to do");
+    args.as_object_mut().unwrap().remove("channel_id");
+    args["member_id"] = json!(CONTEXT_MEMBER);
+    args["member_name"] = json!("drift check");
+    Realm::emit(
+        &engine.realm,
+        None,
+        "ui:turn.submit",
+        json!({
+            "name": "ui:turn.submit",
+            "device": device,
+            "sender": { "device": device, "user": TEST_MEMBER },
+            "data": args,
+        }),
+    )
+    .await
+    .unwrap();
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if !seen.all("ui:turn.delta").is_empty() && seen.all("ui:turn.end").len() > 0 {
+            break;
+        }
+    }
+
+    let store = store_url.clone();
+    let (own_rows, own_line, operators_rows) = tokio::task::spawn_blocking(move || {
+        let read = |path: String| -> Vec<Value> {
+            let resp = ureq::get(&format!("{store}{path}")).call().unwrap();
+            serde_json::from_reader(resp.into_reader()).unwrap()
+        };
+        let directory: Vec<Value> = read("/members?name=drift%20check".into());
+        let agent = directory[0]["member_id"].as_str().unwrap().to_string();
+        let lines: Vec<Value> = read(format!("/members/{agent}/channels"));
+        let line = lines[0]["channel_id"].as_u64().unwrap();
+        (
+            read(format!("/channels/{line}/messages")),
+            line,
+            read(format!("/channels/{operator_line}/messages")),
+        )
+    })
+    .await
+    .unwrap();
+
+    assert_ne!(own_line, operator_line, "a context has a line of its own");
+    assert_eq!(
+        operators_rows.len(),
+        1,
+        "the operator's line did not grow: {operators_rows:?}"
+    );
+    assert_eq!(
+        own_rows[0]["sender"], "6f1d3d0e-0000-4000-8000-0000000000cc",
+        "the rows belong to the context: {own_rows:?}"
+    );
+}

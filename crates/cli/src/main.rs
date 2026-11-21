@@ -33,8 +33,11 @@ usage: gravity [--json] [--session <id>] [--venue <ws-url>] [--cancel-after-ms <
   <text>...           one turn per argument; `-` reads stdin as ONE turn
   --json              one JSON object per turn on stdout (scripts); the
                       readable form streams the deltas as they arrive
-  --session <id>      the conversation this call speaks in (k10r's channel id,
-                      a number; default 1 — the client keeps no state, ADR-0002 §3)
+  --session <id>      PIN the conversation (k10r's channel id, a number). Left out, the
+                      channel follows the SPEAKER: the line k10r records as theirs, opened
+                      on first use — so a person's first message needs no id at all, and
+                      two contexts never share a transcript. The client keeps no state
+                      (ADR-0002 §3)
   --member <uuid>     who is speaking (k10r's member id IS the user's uuid). Default:
                       the id in `member_id` beside the config, minted once on first
                       run — replace that file with your own id from prism
@@ -95,11 +98,13 @@ impl Failure {
 
 struct Cli {
     json: bool,
-    /// The conversation, as the operator typed it (echoed in `--json` output).
-    session: String,
+    /// The conversation, as the operator typed it (echoed in `--json` output). `None` = the
+    /// channel follows the speaker, which is the shape that needs no ids: k10r knows which channel
+    /// is somebody's own (`solo`), and this client never learns an id it did not need.
+    session: Option<String>,
     /// The same value as a channel id: k10r's channel is a NUMBER, so a session that is not one is
     /// a usage failure, refused before a socket is opened.
-    channel: u64,
+    channel: Option<u64>,
     /// `None` = take it from the file beside the config (minting one on first run); a value here
     /// is the operator saying who they are, which always wins.
     member: Option<String>,
@@ -114,7 +119,7 @@ struct Cli {
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Failure> {
     let mut json = false;
-    let mut session = "1".to_string();
+    let mut session: Option<String> = None;
     let mut member: Option<String> = None;
     let mut context: Option<String> = None;
     let mut venue = None;
@@ -125,9 +130,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Failure> {
         match arg.as_str() {
             "--json" => json = true,
             "--session" => {
-                session = args
-                    .next()
-                    .ok_or_else(|| Failure::Usage("--session needs an id".into()))?;
+                session = Some(
+                    args.next()
+                        .ok_or_else(|| Failure::Usage("--session needs an id".into()))?,
+                );
             }
             "--context" => {
                 context = Some(
@@ -167,11 +173,14 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<Cli, Failure> {
             "no input: pass text, or `-` to read stdin".into(),
         ));
     }
-    let channel: u64 = session.parse().map_err(|_| {
-        Failure::Usage(format!(
-            "--session: `{session}` is not a channel id (k10r's channel is a number)"
-        ))
-    })?;
+    let channel = match session.as_deref() {
+        Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
+            Failure::Usage(format!(
+                "--session: `{raw}` is not a channel id (k10r's channel is a number)"
+            ))
+        })?),
+        None => None,
+    };
     if context.is_some() && member.is_some() {
         return Err(Failure::Usage(
             "--context speaks as a context's agent and --member as a member: one or the other"
@@ -452,22 +461,21 @@ async fn submit(ws: &mut Ws, cli: &Cli, member: &str, content: &str) -> Result<S
     // see the same table instead of one client carrying a copy. The `event` is the PLANE name for
     // the chunks; the venue hands it back with the marker stripped, which is the `turn.delta`
     // read below.
-    send(
-        ws,
-        &json!({
-            "ev": "ui:turn.submit",
-            "args": {
-                "channel_id": cli.channel,
-                "member_id": member,
-                // Only when the caller is a context: the name registers the identity in the store
-                // the first time this context speaks, so the transcript can say "drift check".
-                "member_name": cli.context,
-                "user_message": content,
-                "event": "ui:turn.delta",
-            }
-        }),
-    )
-    .await?;
+    let mut args = json!({
+        "member_id": member,
+        // Only when the caller is a context: the name registers the identity in the store the
+        // first time this context speaks, so the transcript can say "drift check".
+        "member_name": cli.context,
+        "user_message": content,
+        "event": "ui:turn.delta",
+    });
+    // ABSENT unless the operator pinned one, never `null`: the booth then resolves the speaker's
+    // OWN line from k10r (`solo`), and that is the whole addressing a caller needs — a person's
+    // first message carries no channel id, and the store opens their line for them.
+    if let Some(channel) = cli.channel {
+        args["channel_id"] = json!(channel);
+    }
+    send(ws, &json!({ "ev": "ui:turn.submit", "args": args })).await?;
     let mut seen = String::new();
     let mut cancelled = false;
     let mut deadline =

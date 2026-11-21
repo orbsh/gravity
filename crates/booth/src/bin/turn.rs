@@ -893,66 +893,42 @@ fn turn(
     let settings = read_settings(ctx)?;
     let recipe = read_recipe(ctx, settings.default_model)?;
     let store_url = settings.store_url.trim_end_matches('/').to_string();
-    // WHICH conversation. A caller that knows says so; a page does not, because the channel is
-    // the application's business (prism ADR-0018) and the deployment serves one person. The
-    // fallback is the member's OWN first channel — the same query a chat view makes when it
-    // builds, asked from the side that needs the answer.
-    let channel_id = match args.get("channel_id").and_then(Value::as_u64) {
-        Some(channel_id) => channel_id,
-        None => {
-            let member = user.or_else(|| args.get("member_id").and_then(Value::as_str));
-            let member = member.context("turn: no `channel_id` and no member to look one up for")?;
-            channel_of(&store_url, member)?
-        }
-    };
-    // WHO is speaking. A PAGE has no field for it — the venue mounts `sender {device, user}` into
-    // every page event, and k10r's member id IS the user's uuid (k10r ADR-0025), so a page is
-    // identified by the transport, never by a form.
+    // WHO SPEAKS COMES FIRST, because the CHANNEL follows the SPEAKER: k10r records which channel
+    // is somebody's own (`solo`), and that "somebody" is the speaker — not the person the venue
+    // logged in. Resolving the channel from the stamp put a context's rows in the operator's own
+    // line, which is two narrators on one transcript (ADR-0015 §7). Deciding who speaks can be
+    // done without writing anything, so it is done before the channel is known.
     //
-    // A PROCESS is a different kind of speaker: the CLI runs a task, and a task is not the person
-    // who started it. So a declared `member_id` may OUTRANK the venue's stamp — but only if k10r
-    // says that identity is an AGENT. A client may be an agent; it may never be a person, or one
-    // caller could speak as another. An agent nobody has registered yet is registered here, under
-    // the name the caller gives it (the task's own name), which is the whole point of the special
-    // user: the transcript says "drift check", not the operator's uuid.
+    // The rule, in order: a venue stamp with no declared identity uses the stamp; a declared
+    // identity overrides it ONLY if k10r says that member is an AGENT (a client may be an agent —
+    // it may never be a person, or one caller could speak as another); an agent the store has never
+    // seen is registered under the name the caller gave it; unknown and unnamed is the caller's own
+    // fallback id, so the stamp wins there too.
     let declared = args
         .get("member_id")
         .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())));
-    // A CONTEXT's turn is not a chat turn: the rows exist for the people watching, not for the
-    // model — the agent works from its procedures and what it has committed to memory, and k10r
-    // hands it the current message (ADR-0015 §3). So the identity decision answers two things:
-    // who speaks, and whether this speaker is a context.
-    let member_id = match (user, declared) {
-        (Some(user), None) => user.to_string(),
-        (Some(user), Some(declared)) if declared.as_str() == user => declared,
+    let (member_id, register_as) = match (user, declared) {
+        (Some(user), None) => (user.to_string(), None),
+        (Some(user), Some(declared)) if declared.as_str() == user => (declared, None),
         (Some(user), Some(declared)) => match member_kind(&store_url, &declared)? {
-            // role 1 = AGENT: a process speaking for itself, which is the one thing a declared id
-            // is allowed to override. The context's name rides along the first time it speaks, and
-            // that is what the store registers it under.
-            Some(AGENT_ROLE) => declared,
-            // A person's identity is the venue's to give (it knows who logged in). A client that
-            // names somebody else is claiming an identity it cannot prove, and it is not honoured.
-            Some(_) => user.to_string(),
+            Some(AGENT_ROLE) => (declared, None),
+            Some(_) => (user.to_string(), None),
             None => match args.get("member_name").and_then(Value::as_str) {
-                Some(name) => {
-                    join_member(&store_url, channel_id, &declared, name, AGENT_ROLE)?;
-                    declared
-                }
-                // Unknown and unnamed: this is the caller's own fallback id, and the stamp wins.
-                None => user.to_string(),
+                Some(name) => (declared, Some(name.to_string())),
+                None => (user.to_string(), None),
             },
         },
         (None, Some(declared)) => {
             // No stamp: a caller naming itself. A name that comes WITH an identity is a context
-            // declaring its own agent (the CLI on a venue that cannot stamp it) and is registered
-            // as one; without a name the store's own record says which kind it is, and an
-            // identity the store has never seen stays what it claimed to be — itself.
-            if let Some(name) = args.get("member_name").and_then(Value::as_str) {
-                if member_kind(&store_url, &declared)?.is_none() {
-                    join_member(&store_url, channel_id, &declared, name, AGENT_ROLE)?;
+            // declaring its own agent (the CLI on a venue that cannot stamp it); without one the
+            // store's own record says which kind it is.
+            let register = match args.get("member_name").and_then(Value::as_str) {
+                Some(name) if member_kind(&store_url, &declared)?.is_none() => {
+                    Some(name.to_string())
                 }
-            }
-            declared
+                _ => None,
+            };
+            (declared, register)
         }
         // Nobody: no venue stamp and no declared identity. There is no such speaker, and a row
         // with no speaker is the lie this whole path exists to remove.
@@ -961,6 +937,18 @@ fn turn(
              identified by the venue, a caller names its member"
         ),
     };
+
+    // WHICH conversation: the one the caller pinned, else the line that belongs to the SPEAKER.
+    let channel_id = match args.get("channel_id").and_then(Value::as_u64) {
+        Some(channel_id) => channel_id,
+        None => channel_of(&store_url, &member_id)?,
+    };
+    // A declared identity the store has never met is registered now — after the channel, because a
+    // membership is (member, channel) and the channel is what was just decided. The name is what
+    // the transcript shows ("drift check"), which is the whole point of the special user.
+    if let Some(name) = register_as {
+        join_member(&store_url, channel_id, &member_id, &name, AGENT_ROLE)?;
+    }
     let user_message = text_field(args, "user_message")
         .context("turn: missing `user_message`")?;
     let mut turn = Turn {

@@ -263,7 +263,9 @@ fn one_command_is_one_turn_per_argument() {
     for line in lines {
         let value: Value = serde_json::from_str(line).unwrap();
         assert_eq!(value["reply"], "hel lo");
-        assert_eq!(value["session"], "1");
+        // No `--session`: the channel followed the SPEAKER (k10r's `solo` line), so the client has
+        // no id to echo — `null` is the honest answer, and the store chose.
+        assert!(value["session"].is_null(), "unpinned session: {value}");
     }
     let frames = seen.lock().unwrap().clone();
     let submits: Vec<&Value> = frames
@@ -276,7 +278,12 @@ fn one_command_is_one_turn_per_argument() {
     // venue it runs inside (ADR-0001 §7 as amended), so this client carries none and a page's turn
     // sees the same table a CLI turn does.
     let args = &submits[0]["args"];
-    assert_eq!(args["channel_id"], 1, "the default channel: {args}");
+    // ABSENT, not `1`: a caller that does not pin a conversation sends no channel at all, and the
+    // booth resolves the speaker's own line from k10r. A default id here was the client guessing.
+    assert!(
+        args.get("channel_id").is_none(),
+        "the channel follows the speaker: {args}"
+    );
     // WHO this client is: a uuid, not a number — k10r's member id IS the user's uuid, and the
     // client mints one on first run and keeps it (a fresh id per invocation would make every
     // command a different person to the store). The shape is asserted, not a value: the id is the
@@ -406,8 +413,9 @@ fn the_member_id_is_minted_once_kept_beside_the_config_and_editable() {
     );
 }
 
-/// `--session` is the conversation and `--member` is who speaks in it: both ride the call, and a
-/// session that is not a channel id is refused before anything is sent.
+/// `--session` PINS the conversation (absent = the speaker's own line) and `--member` is who speaks
+/// in it: a pinned session rides the call, and one that is not a channel id is refused before
+/// anything is sent.
 #[test]
 fn the_conversation_and_the_speaker_ride_the_call() {
     let (url, seen) = venue(Mode::Happy);

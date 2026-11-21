@@ -548,8 +548,12 @@ cat > "$ROOT/gravity.json" <<JSON
 { "venue": { "url": "ws://127.0.0.1:$PRISM_PORT", "username": "smoke", "password_env": "SMOKE_PW" } }
 JSON
 
+# The person's turn is PINNED to channel 1: the legs below read that channel by name, and what this
+# one proves is the round trip, not the addressing. The addressing has its own leg further down
+# (`--context` with no `--session`, where the channel has to follow the speaker).
 GRAVITY_CONFIG="$ROOT/gravity.json" SMOKE_PW="smoke-pw" \
-    "$GRAVITY_REPO/target/debug/gravity" --json "hi" >"$ROOT/cli.out" 2>"$ROOT/cli.err"
+    "$GRAVITY_REPO/target/debug/gravity" --json --session 1 "hi" \
+    >"$ROOT/cli.out" 2>"$ROOT/cli.err"
 code=$?
 echo "cli exit: $code"
 cat "$ROOT/cli.err"
@@ -851,6 +855,57 @@ if not asked or any(row["sender"] != context_id for row in asked):
 if context_id not in members:
     raise SystemExit(f"FAIL: the context agent is not a member of the channel it speaks in: {list(members)}")
 print(f"ok: the context speaks as its own agent ({context_id[:8]}…), in channel 7")
+PY
+
+# THE CHANNEL FOLLOWS THE SPEAKER. No `--session` anywhere in this call: k10r records which channel
+# is a speaker's own (`solo`), the booth asks for it by name, and a context that has never run gets
+# its line opened on the spot. A person's first message takes the same path — which is why the CLI
+# no longer defaults to channel 1: that default was the client guessing at an identity the store is
+# the one that knows.
+GRAVITY_CONFIG="$ROOT/gravity.json" SMOKE_PW="smoke-pw" \
+    "$GRAVITY_REPO/target/debug/gravity" --json \
+    --context "unpinned line" "hi" >"$ROOT/cli-own.out" 2>"$ROOT/cli-own.err"
+code=$?
+[ "$code" -eq 0 ] || fail "the unpinned run exited $code: $(cat "$ROOT/cli-own.err")"
+curl -s "http://127.0.0.1:$MEM_PORT/members?name=unpinned%20line" >"$ROOT/own-dir.json"
+python3 - "$ROOT/own-dir.json" "$MEM_PORT" <<'PY' || exit 1
+import json
+import sys
+import urllib.request
+
+directory = json.load(open(sys.argv[1]))
+port = sys.argv[2]
+rows = [m for m in directory if m["display_name"] == "unpinned line"]
+if len(rows) != 1:
+    raise SystemExit(f"FAIL: the unpinned context is not one agent: {directory}")
+member = rows[0]["member_id"]
+lines = json.load(
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/members/{member}/channels?solo=1")
+)
+if len(lines) != 1:
+    raise SystemExit(f"FAIL: expected ONE own line for the context, got {lines}")
+channel = lines[0]["channel_id"]
+if channel in (1, 7):
+    raise SystemExit(
+        f"FAIL: the unpinned context spoke in somebody else's channel ({channel})"
+    )
+said = json.load(
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/channels/{channel}/messages")
+)
+if not said:
+    raise SystemExit("FAIL: the context's own line is empty")
+if said[0]["sender"] != member or said[0]["role"] != "user":
+    who = json.load(
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/channels/{channel}/members")
+    )
+    raise SystemExit(
+        f"FAIL: the question is not the context's own: {said[0]}"
+        f"\n  channel {channel} holds {who}"
+        f"\n  lines of the context: {lines}"
+    )
+if said[-1]["role"] != "assistant":
+    raise SystemExit(f"FAIL: the line does not end with the answer: {said[-1]}")
+print(f"ok: an unpinned context opened its own line ({channel}) — no id typed anywhere")
 PY
 
 echo "PASS (logs under $ROOT)"
