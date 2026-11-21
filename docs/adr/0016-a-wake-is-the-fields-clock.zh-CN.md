@@ -2,7 +2,7 @@
 
 > **语言：** [English](0016-a-wake-is-the-fields-clock.md)（主文档） · [中文](0016-a-wake-is-the-fields-clock.zh-CN.md)
 
-**状态：** Accepted（2026-11-21）—— 设计；本仓尚未注册任何计时器，见「后果」
+**状态：** Accepted（2026-11-21）—— 同日落地：`__on_timer` hook、tag、注册点都在 `crates/booth`（见「后果」）
 **日期：** 2026-11-21
 
 ## 背景
@@ -36,9 +36,11 @@ gravity 的实例在 idle TTL 之后被逐出，而一次压缩唤醒要覆盖�
 
 `induction_guest::Ctx::timer_register(at_ms, tag, durable)` 带这个标记（2026-11-21：第三个参数，由 `timer_args` 构造，`the_timer_arm_carries_the_durable_ask` 钉住帧的形状）。最小 host 仍然拒这条臂 —— 不维护计时表的 host 兑现不了「活过重启」这个请求，拒掉比留下一次事后无人能找到的唤醒更诚实。
 
-### 5. 重新装填是显式的，并且从当下算
+### 5. 重新装填是显式的、从当下算，并且在 turn 之后隔一个延迟才装
 
 发现自己的 span 仍开着的唤醒，要么开分支，要么（材料还没到时）按当下这一刻装下一次唤醒。它从不预先装一串，也从不为睡过去的那些时刻补一轮爆发：aura ADR-0016 §3 已经裁定跳过而不是补齐，而停机之后一串压缩，正是压缩策略当初要避免的那种形态。
+
+一轮 turn 只装一次唤醒，装在「投影要求压缩」之后六十秒（`WAKE_DELAY_MS`）—— 不是一个分支一次，也不是在答案写出来之前。六十秒是策略数字，不是结构数字：长到还在拉的分支有机会先落地（对着一个在飞的 span 再开一个 pass，一份摘要付两次钱），短到死掉的分支在会话还新鲜的时候就被注意到。撞上已关闭 span 的唤醒只花一次读取就停下。
 
 ### 6. 唤醒是维护：它不写往来行
 
@@ -65,6 +67,8 @@ gravity 的实例在 idle TTL 之后被逐出，而一次压缩唤醒要覆盖�
 ## 后果
 
 - gravity 多出第三个 entry（`__on_timer`）、一个 tag 解析函数、一处注册点：以 `compressing: true` 结束且没有落地摘要的 turn 会为该频道装一次唤醒；而开了分支的唤醒，也顺手把「本来会开同一个分支的那一轮 turn」挡在外面。
-- **本仓尚未实现。** 这里没有任何地方注册计时器，也没有任何地方处理 `__on_timer`（`crates/` 里既没有 `timer_register` 调用，也没有 `__on_timer` 这个字符串）。上面的设计是接线要遵循的裁决；在它落地之前，失败形态 1 就如上所述地成立：分支死掉的 span，要等后来的某一轮 turn 才发现它。
+- **随本记录一起落地**，都在 `crates/booth`：`.hook("__on_timer", …)`（是 HOOK 不是 `.on(…)` —— 名字是 host 的，induction 拒绝把它当订阅）、投影要求压缩之后的 `arm_wake`、`<意图>:<频道>:<成员>` 形状的 `wake_tag`/`parse_wake_tag`、作为唯一判据的 `wants_compress`，以及被抽出来的 `branch_material` —— 于是分支的前缀只从投影推导，不再依赖某一轮 turn 自己的状态。装不上只记一行日志，绝不让它要守护的那一轮 turn 失败。
+- **host 投递的名字要改四处，因为词汇是复制的。** `__on_timer` 必须同时加进 induction 的 guest、aura 的 booth builder、effector 的 python 与 steel 两个载体 —— 同一个数组的四份拷贝，各自用同样的话拒掉这个名字。这次落地让它们一致了；没有任何东西让它们保持一致，而这就是下一个保留名被发明之前该修的形状。
+- 测试：`a_wake_folds_a_span_that_no_turn_is_watching`（真 store、真时钟投递的 `__on_timer`、全程没有 turn —— 摘要落地，日志里只有它折掉的那些记录）、`a_wake_only_acts_on_the_stores_verdict`、`a_wake_tag_names_its_channel_and_member_and_reads_back`、`a_branch_sees_the_head_the_summary_and_the_numbered_records`。
 - **`durable` 这个请求已经到了 guest 这一侧**（2026-11-21）：`Ctx::timer_register` 把第三个参数带上，帧也带着它，于是 §4 的残项在这一侧关掉了。仍然开着的，是本仓自己的接线 —— 见下一条。
 - 接线落地时要补的测试：一个投递 `__on_timer` 的桩 host，断言分支经 checkpoint 门落地；一个 span 已被别的写者关闭的唤醒，断言摊位什么也没写；一个解析不了的 tag，断言这次错过被打印出来而不是被吞掉。

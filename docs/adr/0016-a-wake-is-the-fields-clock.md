@@ -2,7 +2,7 @@
 
 > **Languages:** [English](0016-a-wake-is-the-fields-clock.md) (primary) · [中文](0016-a-wake-is-the-fields-clock.zh-CN.md)
 
-**Status:** Accepted (2026-11-21) — design; no timer is registered by this repo yet, see Consequences
+**Status:** Accepted (2026-11-21) — landed the same day: the `__on_timer` hook, the tag, and the registration site are in `crates/booth` (see Consequences)
 **Date:** 2026-11-21
 
 ## Context
@@ -36,9 +36,11 @@ A gravity instance is evicted after its idle TTL, and the window a compression w
 
 `induction_guest::Ctx::timer_register(at_ms, tag, durable)` carries that flag (2026-11-21: the third parameter, built by `timer_args`, with `the_timer_arm_carries_the_durable_ask` pinning the frame's shape). The minimal host still declines the arm — a host that keeps no timer table cannot honour a request to survive a restart, and declining is more honest than a wake nobody can find afterwards.
 
-### 5. Re-arm is explicit and computed from now
+### 5. Re-arm is explicit and computed from now, and armed one delay after the turn
 
 The wake that finds its span still open either opens the branch or, when the material is not there yet, arms the next wake from the current instant. It never arms a chain in advance and never fires a burst for instants it slept through: aura ADR-0016 §3 already ruled skipping over catch-up, and a burst of compressions after downtime is the exact failure shape the compression policy was written to avoid.
+
+The turn arms one wake, sixty seconds after a projection that asked for a compression (`WAKE_DELAY_MS`) — not one per branch, and not before the answer is written. Sixty seconds is a policy number, not a structural one: long enough that a branch still pulling lands first (a wake that opens a second pass over a span in flight pays twice for one summary), short enough that a branch which died is noticed while the conversation is still recent. A wake that finds the span closed costs one read and stops.
 
 ### 6. A wake is maintenance: it writes no exchange row
 
@@ -65,6 +67,8 @@ The wake runs the same two landing doors a turn uses — the checkpoint for the 
 ## Consequences
 
 - Gravity gains a third entry (`__on_timer`), one tag parser, and one registration site: a turn that ends with `compressing: true` and no landed summary arms a wake for that channel; a wake that opens a branch also heads off a turn that would have opened the same one.
-- **Not implemented in this repo yet.** Nothing here registers a timer and nothing handles `__on_timer` (no `timer_register` call and no `__on_timer` string exists in `crates/`). The design above is the ruling the wiring follows; until it lands, failure mode 1 stands as described: a span whose branch died stays open until a later turn notices it.
+- **Landed with this record**, in `crates/booth`: `.hook("__on_timer", …)` (a HOOK, not `.on(…)` — the name is the host's, and induction refuses it as a subscription), `arm_wake` after a projection that asked to compress, `wake_tag`/`parse_wake_tag` for `<intent>:<channel>:<member>`, `wants_compress` as the only decision, and `branch_material` extracted so the branch's prefix is derived from the projection alone instead of from a turn's own state. A failed arm is logged and never fails the turn it was armed for.
+- **A host-delivered name costs four edits, because the vocabulary is duplicated.** `__on_timer` had to be added to the reserved list in induction's guest, aura's booth builder, and effector's python and steel carriers — four copies of one array, each rejecting the name in the same words. The landing made them agree; nothing makes them stay agreed, and that is the shape to fix before the next reserved name is invented.
+- Tests: `a_wake_folds_a_span_that_no_turn_is_watching` (a real store, a real clock-delivered `__on_timer`, no turn anywhere — the summary lands and the log keeps only the records it folded), `a_wake_only_acts_on_the_stores_verdict`, `a_wake_tag_names_its_channel_and_member_and_reads_back`, `a_branch_sees_the_head_the_summary_and_the_numbered_records`.
 - **The `durable` ask reached the guest** (2026-11-21): `Ctx::timer_register` takes it as a third parameter and the frame carries it, so §4's residual is closed on this side. What is still open is gravity's own wiring, below.
 - Tests, when the wiring lands: a stub host that delivers `__on_timer` and asserts the branch lands through the checkpoint door; a wake whose span was closed by another writer, asserting the booth writes nothing; an unparsable tag, asserting the miss is printed rather than swallowed.
