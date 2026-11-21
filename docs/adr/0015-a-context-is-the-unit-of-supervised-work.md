@@ -68,6 +68,13 @@ turn per invocation.**
    name; the id derived from the member is the OPENING id of a first use, never the way back to a
    line that already exists.
 
+   Which means WHO SPEAKS is decided BEFORE which channel: the line belongs to the speaker, and the
+   speaker is not the person who logged in. A context run from a page's session arrives stamped as
+   the operator and declares another identity; resolving the channel from the stamp first put the
+   context's rows in the operator's own line — the two-narrators-one-transcript failure, arrived at
+   by ordering rather than by design. The CLI therefore pins no channel by default (`--session` is
+   for a caller that wants one) and a person's first message carries no id at all.
+
 5. **Every source of work has this shape.** A user's instruction that spawns a background task, a
    trigger that fires on an event, one item of a parallel batch: each is a context, each speaks as
    its own agent, and each is watched the same way. What differs is who opens the turn — a person
