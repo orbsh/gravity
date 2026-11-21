@@ -2820,3 +2820,89 @@ async fn a_persons_row_is_named_by_the_venue_not_by_the_booth() {
     assert_eq!(member["display_name"], "Alice", "the venue's name: {member}");
     assert_eq!(rows[0]["sender_name"], "Alice", "{rows:?}");
 }
+
+/// A RENAME LANDS ON THE NEXT TURN, and it does not create a second membership. The venue states the
+/// account's name every time it stamps a page, so the booth re-states the speaker on every turn; what
+/// the store does with that is take the newer name and keep the FIRST `since` (k10r ADR-0009 §1).
+#[tokio::test]
+async fn a_rename_reaches_the_row_without_touching_since() {
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(|| async {
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &format!("http://{addr}")).await;
+
+    let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5c";
+    let say = |name: &'static str| {
+        let mut args = turn_args("hello");
+        args.as_object_mut().unwrap().remove("channel_id");
+        json!({
+            "name": "ui:turn.submit",
+            "device": device,
+            "sender": { "device": device, "user": TEST_MEMBER, "display_name": name },
+            "data": args,
+        })
+    };
+    async fn get(url: String) -> Value {
+        tokio::task::spawn_blocking(move || {
+            let resp = ureq::get(&url).call().unwrap();
+            serde_json::from_reader(resp.into_reader()).unwrap()
+        })
+        .await
+        .unwrap()
+    }
+    let mut since = 0u64;
+    for (round, name) in ["Alice", "Alicia"].into_iter().enumerate() {
+        let before = seen.len();
+        Realm::emit(&engine.realm, None, "ui:turn.submit", say(name))
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if seen.len() > before && !seen.all("ui:turn.end").is_empty() {
+                break;
+            }
+        }
+        // Give the exchange write (the turn's own k10r calls) the moment it needs before reading.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let lines = get(format!("{store_url}/members/{TEST_MEMBER}/channels")).await;
+        assert_eq!(
+            lines.as_array().unwrap().len(),
+            1,
+            "round {round}: one line, one membership: {lines}"
+        );
+        let now = lines[0]["since_ms"].as_u64().unwrap();
+        if round == 0 {
+            assert!(now > 0, "the first turn set it: {lines}");
+            since = now;
+        } else {
+            assert_eq!(now, since, "a re-statement does not move `since`");
+        }
+    }
+
+    let url = store_url.clone();
+    let member = tokio::task::spawn_blocking(move || -> Value {
+        let resp = ureq::get(&format!("{url}/members/{TEST_MEMBER}"))
+            .call()
+            .unwrap();
+        serde_json::from_reader(resp.into_reader()).unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        member["display_name"], "Alicia",
+        "the venue's latest statement about the name is the one stored: {member}"
+    );
+
+}

@@ -933,28 +933,40 @@ fn turn(
     let declared = args
         .get("member_id")
         .and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string())));
-    let (member_id, register_as) = match (user, declared) {
-        (Some(user), None) => (user.to_string(), None),
-        (Some(user), Some(declared)) if declared.as_str() == user => (declared, None),
+    // The tag an agent declares is its NAME, repeated every turn (it is what the id was derived
+    // from, so it cannot change without the member changing too).
+    let declared_name = || {
+        args.get("member_name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    };
+    let (member_id, speaker_name, speaker_role) = match (user, declared) {
+        (Some(user), None) => (user.to_string(), sender_name.map(str::to_string), HUMAN_ROLE),
+        (Some(user), Some(declared)) if declared.as_str() == user => {
+            (declared, sender_name.map(str::to_string), HUMAN_ROLE)
+        }
         (Some(user), Some(declared)) => match member_kind(&store_url, &declared)? {
-            Some(AGENT_ROLE) => (declared, None),
-            Some(_) => (user.to_string(), None),
-            None => match args.get("member_name").and_then(Value::as_str) {
-                Some(name) => (declared, Some(name.to_string())),
-                None => (user.to_string(), None),
+            Some(AGENT_ROLE) => (declared, declared_name(), AGENT_ROLE),
+            Some(_) => (user.to_string(), sender_name.map(str::to_string), HUMAN_ROLE),
+            None => match declared_name() {
+                Some(name) => (declared, Some(name), AGENT_ROLE),
+                None => (user.to_string(), sender_name.map(str::to_string), HUMAN_ROLE),
             },
         },
+        // No stamp: a caller naming itself. The STORE says which kind a known member is (a
+        // membership row carries the role, and re-stating it wrongly would flip a person's own row
+        // into an agent's — k10r then withholds that reader's transcript, view.rs). Unknown: a
+        // client that arrives with a NAME is declaring an agent (the CLI on a venue that cannot
+        // stamp it); an id with no name is the caller's own fallback and is left as the store's
+        // seed has it.
         (None, Some(declared)) => {
-            // No stamp: a caller naming itself. A name that comes WITH an identity is a context
-            // declaring its own agent (the CLI on a venue that cannot stamp it); without one the
-            // store's own record says which kind it is.
-            let register = match args.get("member_name").and_then(Value::as_str) {
-                Some(name) if member_kind(&store_url, &declared)?.is_none() => {
-                    Some(name.to_string())
-                }
-                _ => None,
+            let role = match member_kind(&store_url, &declared)? {
+                Some(role) => role,
+                None if declared_name().is_some() => AGENT_ROLE,
+                None => HUMAN_ROLE,
             };
-            (declared, register)
+            (declared, declared_name(), role)
         }
         // Nobody: no venue stamp and no declared identity. There is no such speaker, and a row
         // with no speaker is the lie this whole path exists to remove.
@@ -964,26 +976,24 @@ fn turn(
         ),
     };
 
-    // A PERSON'S ROW IS BORN NAMED: when the speaker is the person the venue stamped (not an agent
-    // declaring itself), the venue also told us what that account is called, and that name is the
-    // one the transcript should show. Taken from the envelope and passed through — never looked up
-    // here, because the name lives in the venue's registry, not in this memory (k10r ADR-0009 §4).
-    let stamped_name = match (user, &register_as) {
-        (Some(user), None) if user == member_id => sender_name,
-        _ => None,
-    };
-
     // WHICH conversation: the one the caller pinned, else the line that belongs to the SPEAKER.
     let channel_id = match args.get("channel_id").and_then(Value::as_u64) {
         Some(channel_id) => channel_id,
-        None => channel_of(&store_url, &member_id, stamped_name.as_deref())?,
+        None => channel_of(&store_url, &member_id)?,
     };
-    // A declared identity the store has never met is registered now — after the channel, because a
-    // membership is (member, channel) and the channel is what was just decided. The name is what
-    // the transcript shows ("drift check"), which is the whole point of the special user.
-    if let Some(name) = register_as {
-        join_member(&store_url, channel_id, &member_id, &name, AGENT_ROLE)?;
-    }
+    // WHO THIS IS, stated into the channel on every turn — after the channel, because a membership
+    // is (member, channel) and the channel is what was just decided. Stating it every time is what
+    // makes a RENAME land: the venue says the account's current name, the caller repeats its tag,
+    // and the store's `join` keeps the first `since` while taking the newer name (k10r ADR-0009
+    // §4). What is NOT stated is a name this side does not have: `None` says "nobody is renaming
+    // me", which is different from `""` ("nobody has named me").
+    join_member(
+        &store_url,
+        channel_id,
+        &member_id,
+        speaker_name.as_deref(),
+        speaker_role,
+    )?;
     let user_message = text_field(args, "user_message")
         .context("turn: missing `user_message`")?;
     let mut turn = Turn {
@@ -2522,10 +2532,11 @@ impl Doors for VenueDoors<'_, '_> {
 /// deployment does, the fix is a mapping row, not a different hash.
 const GRAVITY_APP_ID: &str = "4f1b6c1e-0d3a-5f2b-9c47-6a1d0e5b8c22";
 
-/// k10r's member role axis (its `channel::member_role`): the ONE thing serialization needs. Only
-/// the agent half is named here — a person's rows never need the constant, because a person is
-/// identified by the venue's stamp, not by anything this process decides.
+/// k10r's member role axis (its `channel::member_role`): the ONE thing serialization needs. Both
+/// halves are named because a membership row carries the role, and the two ways of speaking are not
+/// interchangeable — a client may be an agent, it may never be a person.
 const AGENT_ROLE: u8 = 1;
+const HUMAN_ROLE: u8 = 0;
 
 /// What kind of identity `member` is in the store, or `None` when the store has never heard of it.
 /// Absence is an answer here — the caller decides whether to register it, and inventing a role
@@ -2555,20 +2566,25 @@ fn join_member(
     store_url: &str,
     channel: u64,
     member: &str,
-    name: &str,
+    name: Option<&str>,
     role: u8,
 ) -> anyhow::Result<()> {
+    let mut body = json!({
+        "member_id": member,
+        "role": role,
+        "since_ms": now_ms(),
+    });
+    // ABSENT, NOT EMPTY. A name reaches this row only when the layer that OWNS it said it — the
+    // venue for a person (it holds the account registry), the tag for an agent (the caller declared
+    // it). When neither did, this side says nothing and the stored name stays; inventing one (a
+    // login name guessed from somewhere, the uuid echoed into a name column) is exactly what the
+    // reads' `member-<id>` fallback exists to avoid (k10r ADR-0009 §4).
+    if let Some(name) = name {
+        body["display_name"] = json!(name);
+    }
     let resp = ureq::post(&format!("{store_url}/channels/{channel}/members"))
         .set("Content-Type", "application/json")
-        .send_string(
-            &json!({
-                "member_id": member,
-                "display_name": name,
-                "role": role,
-                "since_ms": now_ms(),
-            })
-            .to_string(),
-        )
+        .send_string(&body.to_string())
         .context("turn: joining a member failed")?;
     anyhow::ensure!(
         (200..300).contains(&resp.status()),
@@ -2609,7 +2625,7 @@ fn now_ms() -> u64 {
 /// creates the member row — the row is born with it rather than blank. A member row that already
 /// exists keeps whatever name somebody set there: renaming is its own act, not a side effect of
 /// speaking again.
-fn channel_of(store_url: &str, member: &str, name: Option<&str>) -> anyhow::Result<u64> {
+fn channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
     let listed = ureq::get(&format!(
         "{store_url}/members/{member}/channels?app={GRAVITY_APP_ID}&solo=1"
     ))
@@ -2640,23 +2656,6 @@ fn channel_of(store_url: &str, member: &str, name: Option<&str>) -> anyhow::Resu
             // answer is success too — the door does not say which, and does not need to.
             ureq::Error::Status(code, _) if (200..300).contains(&code) => Ok(()),
             other => Err(format!("turn: opening channel {channel} failed: {other}")),
-        })
-        .map_err(anyhow::Error::msg)?;
-    ureq::post(&format!("{store_url}/channels/{channel}/members"))
-        .send_json(json!({
-            "member_id": member,
-            // THE VENUE'S STATEMENT, OR NOTHING. A name reaches this row only when the venue put
-            // it on the envelope (it owns the account registry); otherwise the row stays empty and
-            // the reads show the id. What never happens is this side inventing a name — not the
-            // login name guessed from somewhere else, and not the uuid echoed into a name column.
-            "display_name": name.unwrap_or(""),
-            "role": 0,
-            "since_ms": now_ms(),
-        }))
-        .map(|_| ())
-        .or_else(|e| match e {
-            ureq::Error::Status(code, _) if (200..300).contains(&code) => Ok(()),
-            other => Err(format!("turn: joining channel {channel} failed: {other}")),
         })
         .map_err(anyhow::Error::msg)?;
     Ok(channel)
