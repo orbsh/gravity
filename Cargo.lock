@@ -384,7 +384,7 @@ dependencies = [
  "effector-runtime",
  "futures-util",
  "okm-core",
- "okm-dynamic",
+ "okm-value",
  "okm-wire",
  "serde",
  "serde_json",
@@ -2836,7 +2836,7 @@ dependencies = [
 [[package]]
 name = "okm-core"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 dependencies = [
  "fjall",
  "getrandom 0.3.4",
@@ -2855,7 +2855,7 @@ dependencies = [
 [[package]]
 name = "okm-derive"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 dependencies = [
  "prettyplease",
  "proc-macro2",
@@ -2864,36 +2864,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "okm-dynamic"
-version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
-dependencies = [
- "arrow",
- "okm-core",
- "okm-value",
-]
-
-[[package]]
 name = "okm-entry"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 dependencies = [
  "okm-core",
- "okm-dynamic",
  "serde_json",
 ]
 
 [[package]]
 name = "okm-lake"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 dependencies = [
  "arrow",
  "bytes",
  "futures",
  "object_store",
  "okm-core",
- "okm-dynamic",
  "okm-value",
  "okm-wire",
  "parquet",
@@ -2906,7 +2894,7 @@ dependencies = [
 [[package]]
 name = "okm-query"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 dependencies = [
  "okm-core",
 ]
@@ -2914,13 +2902,13 @@ dependencies = [
 [[package]]
 name = "okm-steel"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 dependencies = [
  "im-rc",
  "okm-core",
- "okm-dynamic",
  "okm-entry",
  "okm-query",
+ "okm-value",
  "serde_json",
  "steel-core",
 ]
@@ -2928,7 +2916,7 @@ dependencies = [
 [[package]]
 name = "okm-value"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 dependencies = [
  "indexmap 2.14.2",
  "serde",
@@ -2937,7 +2925,7 @@ dependencies = [
 [[package]]
 name = "okm-vector"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 dependencies = [
  "okm-core",
 ]
@@ -2945,7 +2933,7 @@ dependencies = [
 [[package]]
 name = "okm-wire"
 version = "0.1.0"
-source = "git+https://github.com/orbsh/okm?branch=main#8c72b2e9cdf8b3d10d216423674ad49f75bae502"
+source = "git+https://github.com/orbsh/okm?branch=main#3ba0ac9577993acf1f9385add7083b69dcfebc43"
 
 [[package]]
 name = "once_cell"

@@ -1399,9 +1399,12 @@ fn turn(
             return Err(error);
         }
     };
-    // The answer has streamed; the summary's tail is the only thing still owed (see
-    // drain_tails).
-    drain_tails(&turn, &mut tails);
+    // The answer has streamed; the summary's tail is the only thing still owed, and it is NO
+    // LONGER THIS ENTRY'S TO WAIT FOR: the drain goes to a thread in this (resident) guest
+    // process — see `raise_tails`. The checkpoint door pins the coverage point when the
+    // compression NODE opens, not when the summary lands (k10r `open_span`/`complete_checkpoint`),
+    // so a summary that arrives after the exchange covers exactly the span it was given.
+    raise_tails(Landing::of(&turn), std::mem::take(&mut tails));
 
     // 6. The exchange, only now: one ts, subs 0/1. Gravity's clock IS the channel's time
     //    (krystallizer ADR-0008 §3).
@@ -1540,6 +1543,9 @@ fn stream_answer(
 ) -> anyhow::Result<Ending> {
     let mut reply = String::new();
     let mut first = true;
+    // Owned, so a branch that is still running when this loop ends can be landed by a thread that
+    // outlives it (`raise_tails`): the streaming loop only needs to read these four fields.
+    let landing = Landing::of(turn);
     loop {
         match out {
             Out::View => {
@@ -1560,7 +1566,7 @@ fn stream_answer(
 
         // The side branch advances one pull per round, on the same face: the summary is
         // produced alongside the answer, never in front of it.
-        step_tail(tails, turn);
+        step_tail(tails, &landing);
         // THE STOP BOUNDARY (ADR-0008 as revised; ADR-0047 stage one): one BIT read per chunk —
         // a boundary this loop already had, not an interruption bolted onto a pull. The bit
         // belongs to this activation and is set by whoever holds authority over the connection
@@ -2845,7 +2851,7 @@ fn open_branch(
 /// it served, so the caller never states WHERE the node ends — but the record a
 /// compression says it should have ended at is the caller's observation to make,
 /// because only the caller built the messages the model read.
-fn step_tail(tails: &mut Vec<Tail>, turn: &Turn<'_>) {
+fn step_tail(tails: &mut Vec<Tail>, landing: &Landing) {
     if tails.is_empty() {
         return;
     }
@@ -2853,7 +2859,7 @@ fn step_tail(tails: &mut Vec<Tail>, turn: &Turn<'_>) {
     match branch.rx.try_recv() {
         Ok(Ok(text)) => {
             if !text.trim().is_empty() {
-                land_tail(turn, &branch, &text);
+                land_tail(landing, &branch, &text);
             }
         }
         Ok(Err(error)) => eprintln!("[gravity-turn] `{}` branch failed: {error}", branch.op),
@@ -2866,37 +2872,60 @@ fn step_tail(tails: &mut Vec<Tail>, turn: &Turn<'_>) {
     }
 }
 
-/// Drain the live branch before the turn closes. The reason is NOT that the
-/// carrier reclaims the stream when the entry returns (it does not — a stream is
-/// released by `iterate_dispose` or by eviction, ADR-0034 §3): it is that a pull
-/// stream does not move on its own. The pull loop IS this call stack, so the
-/// moment the turn returns, nobody is left to ask for the next envelope and the
-/// branch would sit idle until eviction. Draining is therefore the only way to
-/// land the summary from here — the summary must be in place before the next user
-/// message (Phase 3) and the answer has already streamed, so the wait is the
-/// product's own tail. The cap keeps a runaway branch from holding the turn open;
-/// what is left unlanded is k10r's open node, which its next read treats as
-/// "compressing".
-fn drain_tails(turn: &Turn<'_>, tails: &mut Vec<Tail>) {
-    for branch in tails.drain(..) {
-        match branch
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(60))
-        {
-            Ok(Ok(text)) => {
-                if !text.trim().is_empty() {
-                    land_tail(turn, &branch, &text);
-                }
-            }
-            Ok(Err(error)) => eprintln!("[gravity-turn] `{}` branch failed: {error}", branch.op),
-            // The cap keeps a runaway branch from holding the turn open; what is
-            // left unlanded is k10r's open node, which its next read treats as
-            // "compressing".
-            Err(_) => {
-                eprintln!("[gravity-turn] `{}` branch outlived the turn", branch.op)
-            }
+/// EVERYTHING A BRANCH NEEDS TO LAND, OWNED — because the branch outlives the entry that opened
+/// it. These four fields are all the landing doors read; borrowing the turn instead is what made the
+/// drain hold the turn open.
+#[derive(Clone)]
+struct Landing {
+    store_url: String,
+    channel_id: u64,
+    member_id: String,
+    memory_scope: u64,
+}
+
+impl Landing {
+    fn of(turn: &Turn<'_>) -> Self {
+        Self {
+            store_url: turn.store_url.clone(),
+            channel_id: turn.channel_id,
+            member_id: turn.member_id.clone(),
+            memory_scope: turn.memory_scope,
         }
     }
+}
+
+/// THE BRANCH'S OWNER AFTER THE ENTRY RETURNS: a thread in this process, which is resident (one
+/// child per instance key), so it outlives the call that opened the branch. The turn no longer waits
+/// and there is no 60-second cap: a branch that takes a minute is a branch that takes a minute, and the
+/// product still lands at the door it was always going to land at.
+///
+/// What the old inline drain was protecting is unchanged: the coverage point is pinned when the
+/// compression NODE opens (`open_span` on read, `complete_checkpoint` on write), so a summary that
+/// arrives after the exchange covers exactly the span k10r handed out. A span that has since closed
+/// answers 400 and the product is dropped — the same loss a timeout used to cause, stated by the door
+/// instead of by a timer.
+///
+/// Cancellation still stops a branch: the worker polls the turn's token and returns without sending
+/// (see `open_tail`), so a drainer waiting on a cancelled branch sees the channel close, not a product.
+fn raise_tails(landing: Landing, tails: Vec<Tail>) {
+    if tails.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for branch in tails {
+            match branch.rx.recv() {
+                Ok(Ok(text)) => {
+                    if !text.trim().is_empty() {
+                        land_tail(&landing, &branch, &text);
+                    }
+                }
+                Ok(Err(error)) => eprintln!("[gravity-turn] `{}` branch failed: {error}", branch.op),
+                // The worker died without an answer (its process is going away, or the turn was
+                // cancelled): nothing to land, and nothing to wait for either.
+                Err(_) => eprintln!("[gravity-turn] `{}` branch vanished", branch.op),
+            }
+        }
+    });
 }
 
 /// What an operation's answer MEANT. A compression answers with one JSON object
@@ -2940,17 +2969,17 @@ fn read_products(text: &str, keys: &[Pointer]) -> (String, Option<Pointer>) {
 /// Hand one product to its door. 2xx is the answer; anything else is REPORTED
 /// and the turn goes on (the alternative, failing the turn over maintenance,
 /// would trade a user-visible answer for a bookkeeping one).
-fn land_tail(turn: &Turn<'_>, branch: &Tail, text: &str) {
+fn land_tail(landing: &Landing, branch: &Tail, text: &str) {
     match branch.op.as_str() {
         OP_COMPRESS => {
             let (summary, suggested) = read_products(text, &branch.keys);
-            land_summary(turn, &summary, suggested);
+            land_summary(landing, &summary, suggested);
         }
         OP_REVIEW => match read_review_facts(text) {
             Some(facts) if facts.is_empty() => {
                 eprintln!("[gravity-turn] review: nothing worth writing down");
             }
-            Some(facts) => land_review(turn, &facts),
+            Some(facts) => land_review(landing, &facts),
             // A review whose answer is not the shape saves NOTHING: unlike a
             // summary, there is no "usable" version of a fact list, and guessing
             // what prose meant would write invented facts into the graph.
@@ -2985,9 +3014,9 @@ fn read_review_facts(text: &str) -> Option<Vec<Value>> {
 
 /// `POST …/memories/{scope}` — the door `commit_memory` writes through. Same body
 /// shape (an array of 8-slot tuples), so a review needs no vocabulary of its own.
-fn land_review(turn: &Turn<'_>, facts: &[Value]) {
-    let scope = turn.memory_scope;
-    let url = format!("{}/memories/{scope}", turn.store_url);
+fn land_review(landing: &Landing, facts: &[Value]) {
+    let scope = landing.memory_scope;
+    let url = format!("{}/memories/{scope}", landing.store_url);
     match ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_json(Value::Array(facts.to_vec()))
@@ -3002,10 +3031,10 @@ fn land_review(turn: &Turn<'_>, facts: &[Value]) {
 /// opened when it served the verdict. The suggestion rides along and is the
 /// only thing this caller states about position; k10r validates it against the
 /// span it opened.
-fn land_summary(turn: &Turn<'_>, summary: &str, suggested: Option<Pointer>) {
+fn land_summary(landing: &Landing, summary: &str, suggested: Option<Pointer>) {
     let url = format!(
         "{}/channels/{}/members/{}/checkpoint",
-        turn.store_url, turn.channel_id, turn.member_id
+        landing.store_url, landing.channel_id, landing.member_id
     );
     let mut body = json!({ "summary": summary });
     if let Some(point) = suggested {
@@ -3381,6 +3410,73 @@ fn fetch_tasks(store_url: &str, scope: u64) -> Option<Vec<Value>> {
 mod tests {
 
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    /// THE ENTRY DOES NOT WAIT FOR ITS MAINTENANCE — milestone 3's "the branch's owner after the turn
+    /// returns". `raise_tails` hands the branches to a thread in this resident process and returns at
+    /// once; the old `drain_tails` sat here for up to sixty seconds and then dropped the product.
+    /// The product must still land, and it must land after the entry is gone.
+    #[test]
+    fn the_entry_does_not_wait_for_a_slow_branch() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc::channel;
+        use std::sync::{Arc, Mutex};
+
+        // A store that answers 204 and keeps the body it was handed.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                if let Some(body) = request.split("\r\n\r\n").nth(1) {
+                    record.lock().unwrap().push(body.to_string());
+                }
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
+            }
+        });
+
+        let (tx, rx) = channel::<Result<String, String>>();
+        let landing = Landing {
+            store_url: format!("http://{addr}"),
+            channel_id: 7,
+            member_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            memory_scope: 1,
+        };
+        let started = std::time::Instant::now();
+        raise_tails(
+            landing,
+            vec![Tail {
+                op: OP_COMPRESS.to_string(),
+                rx,
+                keys: Vec::new(),
+            }],
+        );
+        // The whole point: the call above returned without the branch having answered.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "raise_tails waited on the branch ({:?})",
+            started.elapsed()
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        tx.send(Ok("a summary written after the turn returned".to_string()))
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while seen.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 1, "the checkpoint door was called once: {bodies:?}");
+        assert!(
+            bodies[0].contains("a summary written after the turn returned"),
+            "the landed body is not the branch's product: {}",
+            bodies[0]
+        );
+    }
 
     /// A person's answer reaches the log as VALUES, not as the wire's envelope: the form sends
     /// `{side: {data: "right", payload: {...}}}`, and a plan binding `$.ask.side` must read
