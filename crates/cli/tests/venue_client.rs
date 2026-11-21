@@ -70,10 +70,24 @@ fn venue(mode: Mode) -> (String, Arc<Mutex<Vec<Value>>>) {
                         if !request.contains("sec-websocket-key") {
                             serve_admin(&mut stream).await.unwrap();
                         } else {
+                            // The credential an unattended caller presents rides the DIAL, so it is
+                            // not a frame and the recorder has to see the request line to witness
+                            // it. `__dial` is the fixture's own name, not a venue one.
+                            let dial = request
+                                .split("token=")
+                                .nth(1)
+                                .map(|rest| rest.split(['&', ' ']).next().unwrap_or("").to_string())
+                                .filter(|t| !t.is_empty());
+                            if let Some(token) = &dial {
+                                recorder.lock().unwrap().push(json!({
+                                    "ev": "__dial",
+                                    "args": { "token": token },
+                                }));
+                            }
                             let recorder = recorder.clone();
                             let done = done_tx.clone();
                             tokio::spawn(async move {
-                                serve(stream, mode, recorder).await.unwrap();
+                                serve(stream, mode, recorder, dial).await.unwrap();
                                 let _ = done.send(()).await;
                             });
                         }
@@ -119,9 +133,17 @@ async fn serve(
     stream: TcpStream,
     mode: Mode,
     seen: Arc<Mutex<Vec<Value>>>,
+    dial: Option<String>,
 ) -> anyhow::Result<()> {
     let mut ws = tokio_tungstenite::accept_async(stream).await?;
-    send(&mut ws, json!({ "ev": "connected", "args": {} })).await?;
+    // A TOKEN THE VENUE KNOWS names an account right here, on the connect answer — that is what a
+    // real venue does with `?token=` (prism ADR-0017 §2). An unknown one changes nothing, which is
+    // exactly how a stale token shows up to a client: no account.
+    let args = match dial.as_deref() {
+        Some(GOOD_TOKEN) => json!({ "user_id": "01a1fbc9-cd84-76c8-b046-1874ff9d7c26" }),
+        _ => json!({}),
+    };
+    send(&mut ws, json!({ "ev": "connected", "args": args })).await?;
     while let Some(message) = ws.next().await {
         let message = message?;
         let Message::Text(text) = message else {
@@ -226,6 +248,23 @@ fn run_cli(venue_url: &str, args: &[&str]) -> Output {
 
 /// The same, in an installation the caller keeps (a config file of its own): the tag is the
 /// identity, so the directory does not decide who runs.
+/// The one token the fixture venue accepts: enough to tell "the venue knows it" from "it does not"
+/// without pretending to be a registry.
+const GOOD_TOKEN: &str = "tok3n-6f1d3d0e";
+
+/// The same CLI with a venue node written verbatim — the shape that differs is the credential, and
+/// a helper that always writes a password could not express a token-only config.
+fn run_cli_with(dir: &std::path::Path, venue: Value, envs: &[(&str, &str)], args: &[&str]) -> Output {
+    let config = dir.join("gravity.json");
+    std::fs::write(&config, serde_json::to_string(&json!({ "venue": venue })).unwrap()).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_gravity"));
+    command.env("GRAVITY_CONFIG", &config).args(args);
+    for (name, value) in envs {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
 fn run_cli_in(dir: &std::path::Path, venue_url: &str, args: &[&str]) -> Output {
     let config = dir.join("gravity.json");
     std::fs::write(
@@ -381,6 +420,72 @@ fn the_conversation_and_the_speaker_ride_the_call() {
     assert!(
         seen.lock().unwrap().is_empty(),
         "nothing was sent to the venue"
+    );
+}
+
+/// A TOKEN IS THE UNATTENDED WAY IN: the config names the env var holding one, the client presents
+/// it on the dial, and there is no login frame at all — a script has no password to hold and no
+/// account to sign up. It is not a weaker path: the venue resolved the token to an account, which is
+/// the only reason the run is allowed to proceed.
+#[test]
+fn a_token_is_the_whole_way_in() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (url, seen) = venue(Mode::Happy);
+    let out = run_cli_with(
+        dir.path(),
+        json!({ "url": url, "token_env": "GRAVITY_TEST_TOKEN" }),
+        &[("GRAVITY_TEST_TOKEN", GOOD_TOKEN)],
+        &["--tag", "nightly", "--json", "hi"],
+    );
+    assert!(out.status.success(), "exit: {:?}", out.status);
+    let frames = seen.lock().unwrap().clone();
+    assert_eq!(
+        frames.iter().filter(|f| f["ev"] == "__dial").count(),
+        1,
+        "the token rode the dial once: {frames:?}"
+    );
+    assert_eq!(frames.iter().find(|f| f["ev"] == "__dial").unwrap()["args"]["token"], GOOD_TOKEN);
+    assert!(
+        !frames
+            .iter()
+            .any(|f| matches!(f["ev"].as_str(), Some("login" | "signup"))),
+        "a token needs no login: {frames:?}"
+    );
+}
+
+/// A token the venue does not know leaves the connection anonymous, and the client says so as an
+/// AUTH failure (exit 3) instead of running a turn as nobody.
+#[test]
+fn a_token_the_venue_does_not_know_exits_3() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (url, seen) = venue(Mode::Happy);
+    let out = run_cli_with(
+        dir.path(),
+        json!({ "url": url, "token_env": "GRAVITY_TEST_TOKEN" }),
+        &[("GRAVITY_TEST_TOKEN", "stale-token")],
+        &["--tag", "nightly", "hi"],
+    );
+    assert_eq!(out.status.code(), Some(3), "auth: {:?}", out.status);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("token"), "the answer names the credential: {stderr}");
+    assert!(
+        !seen.lock().unwrap().iter().any(|f| f["ev"] == "ui:turn.submit"),
+        "no turn was submitted"
+    );
+}
+
+/// A venue node with neither a token nor an account is refused at first sight (exit 2), not at the
+/// first turn.
+#[test]
+fn a_venue_with_no_way_in_is_a_usage_failure() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (url, _seen) = venue(Mode::Happy);
+    let out = run_cli_with(dir.path(), json!({ "url": url }), &[], &["--tag", "x", "hi"]);
+    assert_eq!(out.status.code(), Some(2), "{:?}", out.status);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("token_env") && stderr.contains("password_env"),
+        "the refusal names both ways in: {stderr}"
     );
 }
 

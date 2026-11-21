@@ -41,16 +41,27 @@ pub struct GravityConfig {
     pub venue: Option<VenueConfig>,
 }
 
-/// The venue's connection facts. The password is NOT here — the field names
-/// the env var that holds it (the same custody rule as the API key).
+/// The venue's connection facts. No secret is here — each field names the env
+/// var that holds one (the same custody rule as the API key).
+///
+/// TWO WAYS IN, one of them for machines: `token_env` names a token minted for
+/// an unattended caller (`POST /admin/tokens`, prism), which the client
+/// presents on the dial and never trades for anything; otherwise `username` +
+/// `password_env` name an account the client logs in as (signup on first use).
+/// A config that gives neither is refused when the venue is resolved.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct VenueConfig {
     /// The gateway's WS address, e.g. `ws://127.0.0.1:7780`.
     pub url: String,
     /// The account the CLI binds as (signup on first use, login after).
-    pub username: String,
+    /// Optional: a token already names the account it was minted for.
+    pub username: Option<String>,
     /// The env var NAME holding the password.
-    pub password_env: String,
+    pub password_env: Option<String>,
+    /// The env var NAME holding a token for an unattended caller. Alone it is a
+    /// complete identity: the venue resolves the token to its account, so there
+    /// is no login frame and nothing to store between runs.
+    pub token_env: Option<String>,
 }
 
 /// One mount as `GET /admin/mounts` publishes it (prism ADR-0021). This is an ANSWER, not config:

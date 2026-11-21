@@ -223,19 +223,47 @@ async fn run(cli: Cli) -> Result<(), Failure> {
     // which is how one-turn invocations accumulate into a history.
     let member = tag_member(&cli.tag);
     let venue = resolve_venue(&config, cli.venue.as_deref())?;
-    let password = std::env::var(&venue.password_env).map_err(|_| {
-        Failure::Auth(format!(
-            "env var {} is not set (the venue password)",
-            venue.password_env
-        ))
-    })?;
+    // A TOKEN IS THE UNATTENDED WAY IN (prism `POST /admin/tokens`): it already names the account it
+    // was minted for, so it rides the dial and there is no login frame at all. Everything else is the
+    // interactive shape — an account and a password, signup on first use.
+    let token = match &venue.token_env {
+        Some(env) => Some(std::env::var(env).map_err(|_| {
+            Failure::Auth(format!("env var {env} is not set (the venue token)"))
+        })?),
+        None => None,
+    };
+    let password = match (&token, &venue.password_env) {
+        (None, Some(env)) => Some(std::env::var(env).map_err(|_| {
+            Failure::Auth(format!("env var {env} is not set (the venue password)"))
+        })?),
+        _ => None,
+    };
 
-    let url = format!("{}/ws?protocol=json", venue.url.trim_end_matches('/'));
+    let mut url = format!("{}/ws?protocol=json", venue.url.trim_end_matches('/'));
+    if let Some(token) = &token {
+        url.push_str(&format!("&token={token}"));
+    }
     let (mut ws, _) = connect_async(&url)
         .await
-        .map_err(|e| Failure::Link(format!("connecting to {url}: {e}")))?;
-    expect(&mut ws, "connected").await?;
-    authenticate(&mut ws, &venue.username, &password).await?;
+        // The URL is NOT echoed: it carries the token, and an error line is the wrong place to
+        // print a credential.
+        .map_err(|e| Failure::Link(format!("connecting to {}: {e}", venue.url)))?;
+    let connected = expect(&mut ws, "connected").await?;
+    match (&token, &password, venue.username.as_deref()) {
+        // A token that the venue did not accept leaves the connection ANONYMOUS — that is a rejected
+        // credential, not a broken venue, and a script must be able to tell the two apart.
+        (Some(_), _, _) => {
+            if connected.get("user_id").and_then(Value::as_str).is_none() {
+                return Err(Failure::Auth(
+                    "the venue did not accept the token (no account on the connection)".into(),
+                ));
+            }
+        }
+        (None, Some(password), Some(username)) => {
+            authenticate(&mut ws, username, password).await?;
+        }
+        _ => unreachable!("resolve_venue refuses a config with neither way in"),
+    }
 
     for text in &cli.turns {
         let reply = submit(&mut ws, &cli, &member, text).await?;
@@ -310,6 +338,19 @@ fn resolve_venue(
     })?;
     if let Some(url) = override_url {
         venue.url = url.to_string();
+    }
+    // ONE WAY IN, and it has to be complete: a token alone, or an account with the env var that
+    // holds its password. Everything else is a config that would fail at the first turn instead of
+    // at first sight.
+    match (&venue.token_env, &venue.username, &venue.password_env) {
+        (Some(_), _, _) | (None, Some(_), Some(_)) => {}
+        (None, None, _) | (None, _, None) => {
+            return Err(Failure::Usage(
+                "the venue has no way in: name `token_env` (a token for an unattended caller) \
+                 or `username` + `password_env` (an account to log in as)"
+                    .into(),
+            ))
+        }
     }
     Ok(venue)
 }

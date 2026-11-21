@@ -848,6 +848,35 @@ if found[0]["role"] != 1:
 print("ok: the directory finds the agent by name and tags it AGENT")
 PY
 
+# A TOKEN IS THE UNATTENDED WAY IN (prism `POST /admin/tokens`, gravity ADR-0002 §5). The account
+# exists by now (the page signed up as `smoke`), so the password buys a TOKEN and the CLI runs on
+# that alone: no username, no password in its config, nothing to log in as. This is the shape a CI
+# step has — one secret, and a caller that cannot be anybody's page.
+curl -s -X POST "http://127.0.0.1:$PRISM_PORT/admin/tokens" \
+    -d '{"login_name": "smoke", "password": "smoke-pw", "alias": "ops"}' >"$ROOT/token.json"
+TOKEN=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("token",""))' \
+    "$ROOT/token.json")
+[ -n "$TOKEN" ] || fail "no token was minted: $(cat "$ROOT/token.json")"
+echo "{\"venue\":{\"url\":\"ws://127.0.0.1:$PRISM_PORT\",\"token_env\":\"GRAVITY_TOKEN\"}}" \
+    >"$ROOT/gravity-token.json"
+GRAVITY_CONFIG="$ROOT/gravity-token.json" GRAVITY_TOKEN="$TOKEN" \
+    "$GRAVITY_REPO/target/debug/gravity" --json --tag tokenline --session 2 "hi" \
+    >"$ROOT/cli-token.out" 2>"$ROOT/cli-token.err"
+code=$?
+[ "$code" -eq 0 ] || fail "the token run exited $code: $(cat "$ROOT/cli-token.err")"
+python3 - "$ROOT/cli-token.out" <<'PY' || exit 1
+import json
+import sys
+
+out = [line for line in open(sys.argv[1]).read().splitlines() if line.strip()]
+if len(out) != 1:
+    raise SystemExit(f"FAIL: expected one JSON line from the token run: {out}")
+value = json.loads(out[0])
+if value.get("tag") != "tokenline" or not value.get("reply"):
+    raise SystemExit(f"FAIL: the token run did not answer as its tag: {value}")
+print(f"ok: a minted token ran a turn as `{value['tag']}` — no account in the config")
+PY
+
 # THE TAG IS AN AGENT OF ITS OWN. `--tag` makes the CLI an agent named by that tag, derived
 # from the name — so the SAME name is the same speaker next run, which is how one-turn invocations
 # accumulate into one conversation in the channel. The venue still knows who logged in, and the
