@@ -55,7 +55,7 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
 - [x] ADR-0007's model row promised `affinity` with no such field — settled the other way (2026-11-20): the affinity key is the SESSION, so it is not a column, and the ADR no longer lists it
 - [x] Cancellation is a marker the turn polls at its chunk boundary — 2026-11-09 — ADR-0008, aura ADR-0047, effector's `Frame::Interrupt`
 - [x] `run` for a script that belongs to no skill — 2026-11-09
-- [ ] The CLI's credential is a PASSWORD ENV today (`venue.password_env`): it logs in on every invocation and holds no token, so a script that runs it in a loop logs in in a loop. A token — issued once, kept in a file beside the config like the member id, refreshed by the venue — is a separate mechanism and not this milestone's; recorded 2026-11-21 so the shape is not improvised later
+- [x] The CLI's credential for an unattended caller is a TOKEN (`venue.token_env`) — 2026-11-21, ADR-0002: the venue mints one from the account's password (`POST /admin/tokens`, login over HTTP) and the client presents it on the dial with no login frame, so a loop logs in nowhere. A config names `token_env` or `username` + `password_env`; neither is refused at first sight, and a token the venue does not know is an auth failure (exit 3), not a turn run as nobody
 
 ## Deferred
 
