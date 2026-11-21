@@ -3677,8 +3677,11 @@ mod tests {
         // The bound is a load guard, not the contract: a loaded machine can spend a moment in the
         // spawn itself, and a millisecond figure there would fail for reasons that are not the
         // ownership rule.
+        // Two seconds is a load guard, not the contract. The old shape waited up to SIXTY, so the
+        // number only has to separate "spawned a thread" from "waited for an answer that has not
+        // been sent yet".
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            started.elapsed() < std::time::Duration::from_secs(2),
             "raise_tails blocked for {:?} — it is waiting on the branch",
             started.elapsed()
         );
