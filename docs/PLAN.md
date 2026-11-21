@@ -41,11 +41,13 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
   - [ ] re-entry: the result arrives as an ordinary dispatch carrying the minimal replay set — same deferral
 - [x] 4.6 — The execution surface is the runner mount; `start`/`advance`/`run`, `write_code` — 2026-10-26 … 2026-11-09 — ADR-0001, ADR-0004, ADR-0011
   - [x] the whole stack, with a real node: `scripts/smoke-venue.sh` runs a code row on an `effector` node through the venue (stub provider → gravity → prism → mount → `runner_nu` → JSON back) — 2026-11-20
-- [ ] 5 — Skill pull-through and the weight write-back — ADR-0003 §5, ADR-0004
+- [x] 5 — Skill pull-through and the weight write-back — ADR-0003 §5, ADR-0004 — closed 2026-11-21
   - [x] the counters at the call: attempt before a node runs anything, success after, on both rows — 2026-10-26
   - [x] the proposal write side: a walk that grew files the composition it walked — 2026-10-26
   - [x] the task tools, `write_code` / `read_code` — 2026-10-27 … 2026-10-31
-  - [ ] the line's original target sentence predates the runner mount; what remains of it is not restated here
+  - [x] PULL-THROUGH, restated in the terms that now exist: a skill is a k10r row, its steps name code rows, and both are fetched AT THE CALL (`turn.rs`'s one GET for the step) — the booth holds no copy, so a revised script is what runs next time. `resolve_skills` answers the candidates, `start` runs one as a run, `run` runs a row no skill names (ADR-0011)
+  - [x] THE WEIGHT WRITE-BACK, as the counter it was ruled to be (ADR-0003 §5): `tools.rs` touches `skills/{scope}/{id}/touch` and `code/{scope}/{id}/touch` with `attempt` around the call and `success` after it — numbers on existing rows, never topology. The counters are asserted in `tools.rs`'s own tests
+  - NOTE the door this does NOT cover: k10r's fact weight (`POST /memories/{scope}/edges/{key}/touch`, k10r ADR-0005's `tool_invoke_count`) has no production caller anywhere in `~/world`, and a turn cannot honestly report which fact it used — `recall_memory` answers with rendered text, so the model's use of one fact is not observable to the process that asked. The door waits for a consumer that shows a fact structurally (a UI, a dossier); until then the index never moves and a plain read stays its equal
 - [x] 6 — The CLI is a client of the venue, kubectl-shaped, no second driver — 2026-10-26 — ADR-0002
 
 ## Open items
