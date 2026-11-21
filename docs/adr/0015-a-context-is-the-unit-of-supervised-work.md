@@ -41,6 +41,11 @@ turn per invocation.**
    heard of is registered as an agent under the `member_name` it came with; unknown and unnamed is
    the caller's own fallback id, so the stamp wins there too. No stamp and no identity is a
    refusal: there is no such speaker, and a row that names nobody is a lie.
+   **A person's member row is BORN NAMED.** When the speaker is the venue's own stamp, the venue
+   has also said what that account is called (`sender.display_name`, prism ADR-0017) and the booth
+   passes that name into the row it creates. It never looks a name up: the registry is the venue's,
+   and a copy kept here would go stale on a rename. An agent's name is its tag, for the same reason
+   — it is what the caller declared.
 
 3. **The store decides what a turn is shown, and a program is shown no transcript.**
    `GET …/members/{m}/session` is where the decision lives. For a PERSON the projection carries the
