@@ -2757,3 +2757,66 @@ async fn a_context_speaks_in_its_own_line_not_in_the_operators() {
         "the rows belong to the context: {own_rows:?}"
     );
 }
+
+/// A PERSON'S ROW IS BORN NAMED, when the venue says what the account is called. The name is the
+/// venue's (it holds the account registry) and it arrives on the envelope; the booth passes it into
+/// the member row it creates and stores nothing of its own. Without this a transcript of a person's
+/// first line is a wall of `member-<uuid>`.
+#[tokio::test]
+async fn a_persons_row_is_named_by_the_venue_not_by_the_booth() {
+    let app = axum::Router::new().route(
+        "/chat/completions",
+        axum::routing::post(|| async {
+            let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(sse))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let store_url = mem_server().await;
+    let (engine, seen) = boot(&store_url, &format!("http://{addr}")).await;
+
+    let device = "0f9a7c1e-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
+    let mut args = turn_args("what is this");
+    args.as_object_mut().unwrap().remove("channel_id");
+    Realm::emit(
+        &engine.realm,
+        None,
+        "ui:turn.submit",
+        json!({
+            "name": "ui:turn.submit",
+            "device": device,
+            "sender": { "device": device, "user": TEST_MEMBER, "display_name": "Alice" },
+            "data": args,
+        }),
+    )
+    .await
+    .unwrap();
+    for _ in 0..200 {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if !seen.all("ui:turn.delta").is_empty() && !seen.all("ui:turn.end").is_empty() {
+            break;
+        }
+    }
+
+    let store = store_url.clone();
+    let (member, rows) = tokio::task::spawn_blocking(move || {
+        let read = |path: String| -> Value {
+            let resp = ureq::get(&format!("{store}{path}")).call().unwrap();
+            serde_json::from_reader(resp.into_reader()).unwrap()
+        };
+        let member = read(format!("/members/{TEST_MEMBER}"));
+        let lines = read(format!("/members/{TEST_MEMBER}/channels?solo=1"));
+        let line = lines[0]["channel_id"].as_u64().unwrap();
+        (member, read(format!("/channels/{line}/messages")))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(member["display_name"], "Alice", "the venue's name: {member}");
+    assert_eq!(rows[0]["sender_name"], "Alice", "{rows:?}");
+}

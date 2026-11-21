@@ -716,6 +716,37 @@ asyncio.run(main())
 PAGE
     echo "--- the renderer leg: one tab, two turns ---"
     python3 "$ROOT/page.py" "$PRISM_PORT" 2 || fail "the page leg failed"
+
+    # A PERSON'S LINE IS NAMED BY THE VENUE. The page spoke as the account (the venue's stamp), and
+    # the venue is the layer holding the registry — so the member row the booth created for them
+    # carries the account's name, not a blank. Absent this, a transcript of a person's own line is
+    # `member-<uuid>` everywhere (k10r ADR-0009 §4, prism's `sender.display_name`).
+    curl -s "http://127.0.0.1:$MEM_PORT/members?name=smoke" >"$ROOT/human.json"
+    python3 - "$ROOT/human.json" "$MEM_PORT" <<'PY' || exit 1
+import json
+import sys
+import urllib.request
+
+found = json.load(open(sys.argv[1]))
+port = sys.argv[2]
+rows = [m for m in found if m["display_name"] == "smoke"]
+if len(rows) != 1:
+    raise SystemExit(f"FAIL: the person is not named once in the directory: {found}")
+if rows[0]["role"] != 0:
+    raise SystemExit(f"FAIL: the logged-in account is not a person: {rows[0]}")
+member = rows[0]["member_id"]
+lines = json.load(
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/members/{member}/channels?solo=1")
+)
+if len(lines) != 1:
+    raise SystemExit(f"FAIL: the person has no single line of their own: {lines}")
+said = json.load(
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/channels/{lines[0]['channel_id']}/messages")
+)
+if not said or said[0]["sender_name"] != "smoke":
+    raise SystemExit(f"FAIL: the person's own words are attributed to a blank: {said[:2]}")
+print(f"ok: the person reads as `smoke` in their own line ({len(said)} rows)")
+PY
 fi
 
 # RESIDENCY IS THE CARRIER'S (gravity ADR-0014 §5): this mount's runner is the one-shot

@@ -784,6 +784,20 @@ fn sender_user(envelope: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The NAME the venue gives a sender, when it has one. It is the account's own name (nickname, else
+/// login name) and it arrives already resolved, because the venue is the layer holding the account
+/// registry — an application that copied a login name out of its own store would be inventing a fact
+/// it does not own. Absent for an anonymous sender, and absent when the registry has no row for the
+/// account; both mean "nobody has told us a name" and read as the id.
+fn sender_display_name(envelope: &Value) -> Option<String> {
+    envelope
+        .get("sender")
+        .and_then(|sender| sender.get("display_name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|name| !name.is_empty())
+}
+
 /// What one turn produced.
 struct Turned {
     /// The answer that streamed. A cancelled turn's partial reply goes back to a DIRECT caller
@@ -815,7 +829,14 @@ fn run(ctx: &mut Ctx, envelope: &Value) -> anyhow::Result<Value> {
     // The store mints the turn id when the log opens; the branch hands it back here so
     // the end frames carry the same one the chunks did.
     let minted: std::cell::RefCell<Option<String>> = std::cell::RefCell::new(None);
-    match turn(ctx, args, device.as_deref(), user.as_deref(), &minted) {
+    match turn(
+        ctx,
+        args,
+        device.as_deref(),
+        user.as_deref(),
+        sender_display_name(envelope).as_deref(),
+        &minted,
+    ) {
         Ok(turned) => {
             if said {
                 // The id rides INSIDE the payload as well as on the envelope: a venue hands a
@@ -885,6 +906,11 @@ fn turn(
     args: &Value,
     device: Option<&str>,
     user: Option<&str>,
+    // What the venue says the stamped account is called, when it said anything: a person's member
+    // row is born with it. It travels as a parameter because the identity decision lives here and
+    // the envelope does not — and because naming a person is a fact the venue stated, not something
+    // this function may go looking for.
+    sender_name: Option<&str>,
     minted: &std::cell::RefCell<Option<String>>,
 ) -> anyhow::Result<Turned> {
     // THE DEPLOYMENT FACTS ARE ROWS, NOT ARGUMENTS (ADR-0007): the store, the memory scope, the
@@ -938,10 +964,19 @@ fn turn(
         ),
     };
 
+    // A PERSON'S ROW IS BORN NAMED: when the speaker is the person the venue stamped (not an agent
+    // declaring itself), the venue also told us what that account is called, and that name is the
+    // one the transcript should show. Taken from the envelope and passed through — never looked up
+    // here, because the name lives in the venue's registry, not in this memory (k10r ADR-0009 §4).
+    let stamped_name = match (user, &register_as) {
+        (Some(user), None) if user == member_id => sender_name,
+        _ => None,
+    };
+
     // WHICH conversation: the one the caller pinned, else the line that belongs to the SPEAKER.
     let channel_id = match args.get("channel_id").and_then(Value::as_u64) {
         Some(channel_id) => channel_id,
-        None => channel_of(&store_url, &member_id)?,
+        None => channel_of(&store_url, &member_id, stamped_name.as_deref())?,
     };
     // A declared identity the store has never met is registered now — after the channel, because a
     // membership is (member, channel) and the channel is what was just decided. The name is what
@@ -2569,7 +2604,12 @@ fn now_ms() -> u64 {
 /// the one that knows the rows.
 ///
 /// The app filter rides along: a deployment has its own lines and nobody else's.
-fn channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
+///
+/// `name` is what the venue said the person is called, used only when this call is the one that
+/// creates the member row — the row is born with it rather than blank. A member row that already
+/// exists keeps whatever name somebody set there: renaming is its own act, not a side effect of
+/// speaking again.
+fn channel_of(store_url: &str, member: &str, name: Option<&str>) -> anyhow::Result<u64> {
     let listed = ureq::get(&format!(
         "{store_url}/members/{member}/channels?app={GRAVITY_APP_ID}&solo=1"
     ))
@@ -2605,11 +2645,11 @@ fn channel_of(store_url: &str, member: &str) -> anyhow::Result<u64> {
     ureq::post(&format!("{store_url}/channels/{channel}/members"))
         .send_json(json!({
             "member_id": member,
-            // THE NAME IS NOT OURS TO COPY. A member row carries a `display_name` that somebody
-            // SETS (the person, or the booth that owns names); the login name lives in the venue's
-            // auth store and never crosses into this one, and echoing the id into the display
-            // column is a copy that reads as a name and is not one. Empty until somebody sets it.
-            "display_name": "",
+            // THE VENUE'S STATEMENT, OR NOTHING. A name reaches this row only when the venue put
+            // it on the envelope (it owns the account registry); otherwise the row stays empty and
+            // the reads show the id. What never happens is this side inventing a name — not the
+            // login name guessed from somewhere else, and not the uuid echoed into a name column.
+            "display_name": name.unwrap_or(""),
             "role": 0,
             "since_ms": now_ms(),
         }))
