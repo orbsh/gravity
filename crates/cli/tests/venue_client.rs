@@ -110,10 +110,10 @@ async fn serve_admin(stream: &mut TcpStream) -> anyhow::Result<()> {
     let body = json!({
         "mounts": [
             { "type": "mac.python", "alias": "mac", "language": "python", "carrier": "exec",
-              "runner": "/runners/runner_py_guest.py", "requires": "container", "encoding": "json",
+              "runner": "/runners/runner_py.py", "requires": "container", "encoding": "json",
               "registered": true, "node_connected": false },
             { "type": "srv.python", "alias": "srv", "language": "python", "carrier": "exec",
-              "runner": "/runners/runner_py_guest.py", "requires": "container", "encoding": "json",
+              "runner": "/runners/runner_py.py", "requires": "container", "encoding": "json",
               "registered": true, "node_connected": true }
         ],
         "refused": ["mount [broken.nu] (alias mac) did not register: a refusal the client repeats"]

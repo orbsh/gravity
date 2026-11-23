@@ -44,7 +44,7 @@ NU_RUNNER="$EFFECTOR_REPO/deploy/runners/runner_nu.nu"
 # The RESIDENT form (SMOKE_PY=1): the same role, loaded once by the node's embedded
 # python carrier instead of spawned per call — the one shape in which a tool call can be
 # warm (gravity ADR-0014 §5).
-PY_RUNNER="$EFFECTOR_REPO/deploy/runners/runner_py_guest.py"
+PY_RUNNER="$EFFECTOR_REPO/deploy/runners/runner_py.py"
 [ -f "$NU_RUNNER" ] || fail "no nu runner at $NU_RUNNER"
 
 MODEL_DIR=${KRYSTALLIZER_MODEL_DIR:-$HOME/.local/share/krystallizer/models/bge-small-zh-v1.5}
@@ -369,7 +369,7 @@ wait_for "$MEM_PORT" "mem-server" || exit 1
 # BEFORE a node is asked anything — the row is the contract, not the script's good manners.
 curl -sf -X POST "http://127.0.0.1:$MEM_PORT/code/37" \
     -H 'content-type: application/json' \
-    -d '{"language":"nu","description":"sum four more","parameters":"{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"number\"}},\"required\":[\"n\"]}","source":"{total: (($env.TOOLRUNNER_ARGS | from json | get n) + 3)} | to json"}' \
+    -d '{"language":"nu","description":"sum four more","parameters":"{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"number\"}},\"required\":[\"n\"]}","source":"let req = (open --raw /dev/stdin | from json)\n{total: ($req.args.n + 3)} | to json"}' \
     >"$ROOT/code.json" || fail "declaring a code row failed"
 python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["code_id"])' "$ROOT/code.json" >"$ROOT/code_id" \
     || fail "the code row answered no id: $(cat "$ROOT/code.json")"
@@ -763,7 +763,7 @@ if [ "${SMOKE_PY:-0}" = 1 ]; then
     # are another (they share a channel and a member). A per-turn key would leave 3 here, and a
     # per-call key 5 — this number is what says which one the node used.
     if [ "${SMOKE_PAGE:-0}" = 1 ]; then expected=2; else expected=1; fi
-    guests=$(pgrep -aP "$NODE_PID" | grep -c 'runner_py_guest')
+    guests=$(pgrep -aP "$NODE_PID" | grep -c 'runner_py')
     if [ "$guests" -eq "$expected" ] && [ "$runners" -eq "$expected" ]; then
         echo "ok: $guests resident guest(s) for $expected conversation(s) — one process served every call in each"
     else

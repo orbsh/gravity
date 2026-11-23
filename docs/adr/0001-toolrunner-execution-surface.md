@@ -126,16 +126,18 @@ What the wire already provides (verified against the code, not assumed):
    what puts residency within reach: python can — a guest process whose `exec`
    runs the delivered script in its own scope, where the guest's ctx helpers are
    visible — and nu cannot. So nu is the one-shot systems language
-   (`deploy/runners/runner_nu.nu`), and python is both: one-shot
-   (`deploy/runners/runner_py.py`) and the resident form
-   (`deploy/runners/runner_py_guest.py`, below). The embedded python
+   (`deploy/runners/runner_nu.nu`), and python is both shapes out of ONE file
+   (`deploy/runners/runner_py.py`, below): the carriers announce themselves in the first document they
+   send (`exec` a request with `handler`/`args`, `induction` a frame with `id`/`event` or the
+   handshake's `type`), so the runner serves whichever arrives and the deployment's vocabulary picks
+   the shape by naming the carrier. The embedded python
    carrier (pyo3, in-process CPython in the node's own process) is NOT a runner
    form: it admits no process boundary.
 
    Status: the one-shot form is landed for BOTH languages
-   (`deploy/runners/runner_nu.nu`, `deploy/runners/runner_py.py`), the resident
-   form is landed for python (`deploy/runners/runner_py_guest.py`, the
-   induction-guest protocol in JSON lines) with residency proven end to end —
+   (`deploy/runners/runner_nu.nu`, the `exec` shape of `deploy/runners/runner_py.py`), and the
+   resident form is landed for python in that same file (the induction-guest protocol in JSON lines)
+   with residency proven end to end —
    two calls through one mount, guest-scope `STATE` surviving between them —
    and the ctx bridge OUT of a remote induction guest proven with it: a
    delivered script calls a sibling mount through the host realm and gets its

@@ -131,9 +131,11 @@ fixed and hardcoded, in groups, and it carries k10r's existing tool-face names.*
    **Arguments are a JSON map, never argv.** A mount call carries ONE JSON document
    and every layer keeps it that way: gravity sends `{"code": …, "args": {...}}`,
    the carrier frames it as `{"handler": "execute", "args": …}` on stdin, and the
-   runner hands the script the same named map (both runners: `TOOLRUNNER_ARGS` is
-   that map as a JSON string, and the script answers with one JSON document on
-   stdout). There is no expansion into `--flag value`, and none should be added:
+   runner takes `code` out — it is the program, not data — and forwards the REST to the script on
+   its stdin as the same document (`{"handler": …, "args": …}`); the script answers with one JSON
+   document on stdout. The payload is never re-spelled into environment variables or argv: it is
+   already a document, and the resident form passes the same two values as `ARGS` in scope because
+   its stdin is the frame wire. There is no expansion into `--flag value`, and none should be added:
    the script is not a command LINE, it is a body delivered as data, so there is no
    shell grammar to expand into; argv is typeless, which would undo the type
    checking the arguments now get; and quoting rules would become a contract every

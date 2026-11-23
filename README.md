@@ -75,8 +75,8 @@ Two optional legs, each proving something the default cannot:
 - `SMOKE_PAGE=1` drives the same turn from a page's `/channel` socket — one tab,
   two turns, nothing but the text submitted — and counts the frames the renderer
   receives (one per emit; N copies means N connections, never a growing fan-out).
-- `SMOKE_PY=1` adds the RESIDENT leg: an `induction` python mount served by
-  effector's guest runner (`deploy/runners/runner_py_guest.py`), which the node keeps
+- `SMOKE_PY=1` adds the RESIDENT leg: an `induction` python mount served by the
+  resident shape of effector's python runner (`deploy/runners/runner_py.py`), which the node keeps
   alive across calls. One python row is called twice inside one turn and the second
   answer must be the first plus one — the row ran in a process that remembered — and
   the guest must still be exactly one live child of the node afterwards. The `nu`

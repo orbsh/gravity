@@ -96,14 +96,16 @@ binding record; no new table needed"（`aura/docs/PLAN.md` 4.10）——而今�
    所以 nu guest 只能 shell 出一个子进程，而子进程永远看不到 guest 的 ctx 作用域。
    进程内求值正是常驻的前提：python 可以——guest 进程里的 `exec` 让下发脚本跑在自己的
    作用域里，而 guest 的 ctx 辅助函数在那可见——nu 不行。于是 nu 是一次性系统语言
-   （`deploy/runners/runner_nu.nu`），python 两形皆有：一次性
-   （`deploy/runners/runner_py.py`）与常驻（`deploy/runners/runner_py_guest.py`，见下）。
+   （`deploy/runners/runner_nu.nu`），python 的两形出自**同一个文件**
+   （`deploy/runners/runner_py.py`，见下）：两个载体在各自发的第一份文档里就自我表明
+   （`exec` 发带 `handler`/`args` 的请求，`induction` 发带 `id`/`event` 或握手 `type` 的帧），
+   runner 来哪种服务哪种，形态由部署词表选载体来决定。
    嵌入式 python 载具（pyo3，进程内 CPython 跑在节点自己的进程里）**不是** runner 形态：
    它不容纳进程边界。
 
    状态：一次性形态两门语言都已落地（`deploy/runners/runner_nu.nu`、
-   `deploy/runners/runner_py.py`），常驻形态已在 python 落地
-   （`deploy/runners/runner_py_guest.py`，JSON lines 的 induction guest 协议），**驻留已端到端
+   `deploy/runners/runner_py.py` 的 `exec` 形），常驻形态已在 python 落地，就在**同一个文件**里
+   （JSON lines 的 induction guest 协议），**驻留已端到端
    证实**——同一 mount 两次调用，guest 作用域的 `STATE` 跨调用存活——并连同
    **ctx 桥出口**一起证实：下发的脚本经宿主 realm 调到兄弟 mount 并取回它的值
    （`prism/crates/prism/tests/runner_mount.rs`）。走到这一步定位并修掉了三处断点，每层一处：

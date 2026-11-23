@@ -150,8 +150,8 @@ reconstructed afterwards.
 - **Both shapes now exist and both are proven, in one script.** gravity's `nu`
   runner is the one-shot `exec` form (a process per call — the smoke asserts the
   node holds no child once the calls are done), and its python mount is the RESIDENT
-  form: effector's `deploy/runners/runner_py_guest.py`, a guest the node's
-  `induction` carrier keeps alive across calls, where a delivered row reads `ARGS`,
+  form: the resident shape of effector's `deploy/runners/runner_py.py`, a guest
+  the node's `induction` carrier keeps alive across calls, where a delivered row reads `ARGS`,
   keeps what it wants in `STATE`, and prints one JSON document. The smoke's resident
   leg calls ONE python row twice inside one turn, requires the second answer to be
   the first plus one, and requires the guest to still be ONE live child of the node —

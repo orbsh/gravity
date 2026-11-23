@@ -90,8 +90,10 @@ provider——但从来没有任何东西告诉模型有哪些工具。provider 
 
    **入参是一个 JSON map，永远不是 argv。** 一次 mount 调用只带一份 JSON 文档，每一层都保持
    这个形状：gravity 发 `{"code": …, "args": {...}}`，载体把它框成 stdin 上的
-   `{"handler": "execute", "args": …}`，runner 再把同一份具名 map 交给脚本（两个 runner 都是：
-   `TOOLRUNNER_ARGS` 就是那份 map 的 JSON 字符串，脚本在 stdout 回一份 JSON 文档）。它不会
+   `{"handler": "execute", "args": …}`，runner 把 `code` 取走（那是程序，不是数据），把剩下的部分原样转给脚本的 stdin——仍是同一份
+   文档 `{"handler": …, "args": …}`；脚本在 stdout 回一份 JSON 文档。入参绝不重新拼进环境变量或
+   argv：它本来就是一份文档，而常驻形态把同样两个值以作用域里的 `ARGS` 交给脚本，因为它的
+   stdin 是帧通道。它不会
    展开成 `--flag value`，也不该加：脚本不是一条命令行，而是以数据形式投递的一个体，没有
    shell 语法可展开；argv 是无类型的，那正好会废掉入参刚得到的类型校验；而引号规则会变成每个
    runner 各实现一遍的契约。想要命令行手感的脚本，自己解析自己那份 map。
