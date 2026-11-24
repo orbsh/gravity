@@ -74,7 +74,7 @@ logs {
 }
 KDL
 
-cat > "$ROOT/sse.py" <<PY
+cat > "$ROOT/sse.py" <<'PY'
 import json
 import os
 import sys
@@ -468,7 +468,7 @@ echo "ok: a node dialled in, and the venue publishes its mount"
 # the application's event (gravity ADR-0007 §4), gated by the auth declaration prism reads. A fresh
 # venue has no settings row, and a turn on one refuses BY NAME — so this step is what makes the
 # CLI's turn possible at all, and a bad row here fails loudly instead of leaving a plausible error.
-cat > "$ROOT/configure.py" <<PY
+cat > "$ROOT/configure.py" <<'PY'
 import asyncio
 import json
 import sys
