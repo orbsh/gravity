@@ -41,6 +41,10 @@ pub struct Request<'a> {
     /// The tool list, verbatim (the caller owns it — ADR-0004; this is transport
     /// for whatever the caller's request shape is).
     pub tools: Option<&'a Value>,
+    /// Ask the endpoint to report what the request cost (`stream_options.include_usage`).
+    /// Off unless the caller has a window to compare it against: a deployment that declares
+    /// none gains nothing from the field, and a server that predates it is not asked.
+    pub want_usage: bool,
 }
 
 /// One open stream: the decoder, its reader, and the call fragments gathered
@@ -52,6 +56,8 @@ pub struct Live {
     /// At most one envelope waiting for its turn: a stream that ends a call and
     /// sends content in the same round must not lose either.
     queued: Option<Value>,
+    /// The last stream's cost, taken off the decoder when `[DONE]` arrives.
+    usage: Option<Value>,
 }
 
 impl Live {
@@ -66,6 +72,9 @@ impl Live {
         });
         if let Some(tools) = request.tools {
             body["tools"] = tools.clone();
+        }
+        if request.want_usage {
+            body["stream_options"] = json!({ "include_usage": true });
         }
         let url = format!("{endpoint}/chat/completions");
         let mut last_err = String::new();
@@ -84,6 +93,7 @@ impl Live {
                         reader: resp.into_reader(),
                         calls: ToolCallAccumulator::new(),
                         queued: None,
+                        usage: None,
                     });
                 }
                 Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) => {
@@ -96,6 +106,12 @@ impl Live {
             }
         }
         anyhow::bail!("llm: endpoint unreachable after {CONNECT_ATTEMPTS} attempts: {last_err}")
+    }
+
+    /// What the last completed stream cost, if the endpoint reported it. Taken off the done
+    /// envelope rather than held here, so the one reader of a round boundary is the caller.
+    pub fn usage(&self) -> Option<&Value> {
+        self.usage.as_ref()
     }
 
     /// The next envelope, refilling as needed. Blocking: the pull IS the
@@ -125,14 +141,25 @@ impl Live {
                         return Ok(envelope);
                     }
                     SseEvent::Done => {
+                        // Read once, here: the usage chunk precedes `[DONE]`, and the turn reads
+                        // it from the done envelope because that is the round boundary it already
+                        // watches (the tool loop may never look at the terminal envelope of a
+                        // stream whose calls it dispatched).
+                        self.usage = self.sse.take_usage();
+                        // Cloned, not taken: the done envelope is what the turn reads, and the
+                        // field stays for a caller that asks the stream itself.
+                        let done = match self.usage.clone() {
+                            Some(usage) => json!({ "done": true, "usage": usage }),
+                            None => json!({ "done": true }),
+                        };
                         // The calls are complete even when the provider sends no
                         // trailing content — and they must arrive BEFORE the done,
                         // or the turn ends without ever dispatching them.
                         if let Some(calls) = self.calls.take() {
-                            self.queued = Some(json!({ "done": true }));
+                            self.queued = Some(done);
                             return Ok(json!({ "done": false, "item": { "tool_calls": calls } }));
                         }
-                        return Ok(json!({ "done": true }));
+                        return Ok(done);
                     }
                 }
             }

@@ -159,6 +159,10 @@ fn storage_schema() -> Value {
                         {"name": "endpoint", "ty": "Str", "width": 0, "offset": 0, "tag": 2},
                         {"name": "model", "ty": "Str", "width": 0, "offset": 0, "tag": 3},
                         {"name": "key_env", "ty": "Str", "width": 0, "offset": 0, "tag": 4},
+                        // The model's context window, as a decimal string (cold fields are
+                        // variable-length). Absent = this deployment declares none, and a turn
+                        // senses nothing — the pre-budget behaviour, unchanged.
+                        {"name": "context_window", "ty": "Str", "width": 0, "offset": 0, "tag": 5},
                     ],
                     "slots": slots.clone(),
                 },
@@ -210,11 +214,15 @@ fn read_settings(ctx: &mut Ctx) -> anyhow::Result<Settings> {
     })
 }
 
-/// The model recipe a turn uses: `endpoint` / `model` / `key_env` off the row `settings` named.
+/// The model recipe a turn uses: `endpoint` / `model` / `key_env` off the row `settings` named,
+/// plus the window that row declares (if it declares one).
 struct Recipe {
     endpoint: String,
     model: String,
     key_env: String,
+    /// `context_window` off the same row. `None` = no budget sensing: the turn sends what it has
+    /// and lets the endpoint say no, which is exactly what it did before this field existed.
+    window: Option<u64>,
 }
 
 fn read_recipe(ctx: &mut Ctx, id: u64) -> anyhow::Result<Recipe> {
@@ -230,7 +238,20 @@ fn read_recipe(ctx: &mut Ctx, id: u64) -> anyhow::Result<Recipe> {
             .map(str::to_string)
             .ok_or_else(|| anyhow::anyhow!("turn: model {id} is missing `{key}`"))
     };
-    Ok(Recipe { endpoint: text("endpoint")?, model: text("model")?, key_env: text("key_env")? })
+    let window = match row.get("context_window") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => Some(raw.trim().parse::<u64>().with_context(|| {
+            format!("turn: model {id} declares `context_window` = {raw}, which is not a number")
+        })?),
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(other) => anyhow::bail!("turn: model {id} declares a `context_window` of type {other}"),
+    };
+    Ok(Recipe {
+        endpoint: text("endpoint")?,
+        model: text("model")?,
+        key_env: text("key_env")?,
+        window,
+    })
 }
 
 /// Where a drawing turn puts its frames. One event for the whole turn: the frames carry
@@ -1073,6 +1094,10 @@ fn turn(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // Where the history block starts, so the budget gate can shorten it in place: those rows
+    // are the STORE's (the next projection hands them back), and this transcript is only what
+    // one request is going to cost.
+    let history_start = messages.len();
     for entry in history {
         // The entry is FLAT and `role` is the resolved NAME — k10r's mapping, the
         // one place a code becomes a label. `null` means a stored code that
@@ -1088,6 +1113,7 @@ fn turn(
             .to_string();
         messages.push(json!({ "role": role, "content": content }));
     }
+    let mut history_end = messages.len();
     // The prefix the compression side branch summarizes: head + summary +
     // history, WITHOUT this turn's new message (the span k10r proposed to
     // cover ends before it).
@@ -1326,6 +1352,41 @@ fn turn(
                 "content": content,
             }));
         }
+        // THE BUDGET GATE. The stream that just ended said what the request cost, so the shape of
+        // the NEXT one is decided here — after the results landed (they are what the next
+        // inference reasons over) and before anything is sent.
+        let used = pump.prompt_tokens();
+        let budget = budget_of(used, turn.recipe.window);
+        if let (Some(used), Some(window)) = (used, turn.recipe.window) {
+            eprintln!(
+                "[gravity] context {used}/{window} ({:.0}%) · {budget:?}",
+                100.0 * used as f64 / window as f64
+            );
+        }
+        match budget {
+            Budget::Free => {}
+            Budget::Compact => compact_finished_rounds(&mut messages),
+            Budget::Trim => {
+                compact_finished_rounds(&mut messages);
+                history_end = trim_history(&mut messages, history_start, history_end);
+            }
+            Budget::Ceiling => {
+                // A round the endpoint would reject is not a round. Say it as a row, CLOSE the
+                // turn with that row visible, and fail: an empty answer would read as the
+                // provider's fault, and a row left OPEN is invisible to the projection.
+                let note = format!(
+                    "context ceiling: {} of {} tokens used, the next round was not sent",
+                    used.unwrap_or(0),
+                    turn.recipe.window.unwrap_or(0)
+                );
+                let row = log.row(Role::Assistant, Kind::Text, &note)?;
+                let mut keep = vec![question];
+                keep.extend(call_rows.iter().copied());
+                keep.push(row);
+                log.close(&keep)?;
+                anyhow::bail!("turn: {note}");
+            }
+        }
         pump = Pump::open(&turn, &messages);
         let Some(reopened) = pump.next(ctx).context("turn: provider re-open failed")? else {
             return Ok(Turned {
@@ -1424,6 +1485,84 @@ fn turn(
     })
 }
 
+/// Where the transcript stands against the model's window — the one decision the turn makes
+/// about its own size.
+///
+/// The numbers are about the PRICE, not about the limit: a tiered endpoint charges by the band a
+/// request's prompt tokens fall into (`512k` inside a `1M` window is the one this was built for),
+/// so crossing the line costs on the WHOLE request, once. Compacting at the line rather than near
+/// the top is therefore the cheaper habit — and the top is only a place to stop.
+const COMPACT_AT: f64 = 0.5;
+const TRIM_AT: f64 = 0.8;
+const CEILING_AT: f64 = 0.95;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Budget {
+    /// Below the first line: send what we have.
+    Free,
+    /// At the tier line: collapse finished tool rounds (they were read when they arrived).
+    Compact,
+    /// Well into the window: also stop carrying the oldest history (the store has it).
+    Trim,
+    /// Near the top: do not send. A round the endpoint would reject is not a round.
+    Ceiling,
+}
+
+/// The decision is a pure function of two numbers on purpose: the caller has a usage record and a
+/// row field, and nothing else, and a test can state the three boundaries without a provider.
+fn budget_of(prompt_tokens: Option<u64>, window: Option<u64>) -> Budget {
+    let (Some(used), Some(window)) = (prompt_tokens, window) else {
+        return Budget::Free;
+    };
+    if window == 0 {
+        return Budget::Free;
+    }
+    let ratio = used as f64 / window as f64;
+    if ratio >= CEILING_AT {
+        Budget::Ceiling
+    } else if ratio >= TRIM_AT {
+        Budget::Trim
+    } else if ratio >= COMPACT_AT {
+        Budget::Compact
+    } else {
+        Budget::Free
+    }
+}
+
+/// The prompt tokens a stream reported, whichever spelling the endpoint used (OpenAI says
+/// `prompt_tokens`; some compatible servers also send `input_tokens`).
+fn prompt_tokens(usage: Option<&Value>) -> Option<u64> {
+    let usage = usage?;
+    usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+}
+
+/// How many history rows a trimmed transcript still carries: the tail is what the next inference
+/// is actually about, and the summary block above it stands for everything older.
+const HISTORY_KEEP: usize = 8;
+
+/// Drop the oldest history rows, leaving a line that says how many. Returns the block's new end
+/// index (the caller keeps using it — the vectors shift every time this is called).
+///
+/// Nothing is lost: those rows are the STORE's (k10r hands them back on the next projection), and
+/// this transcript is only what one request is going to cost.
+fn trim_history(messages: &mut Vec<Value>, start: usize, end: usize) -> usize {
+    if end.saturating_sub(start) <= HISTORY_KEEP + 1 {
+        return end;
+    }
+    let dropped = end - start - HISTORY_KEEP;
+    let marker = json!({
+        "role": "system",
+        "content": format!(
+            "{dropped} earlier row(s) of this conversation are not carried here; the store has them."
+        ),
+    });
+    messages.splice(start..(end - HISTORY_KEEP), std::iter::once(marker));
+    start + 1 + HISTORY_KEEP
+}
+
 /// The provider stream, off this thread (ADR-0047 stage two, for a blocking client).
 ///
 /// `Live::pull` is a blocking `read` on the provider's socket. On this thread it is the
@@ -1439,6 +1578,13 @@ fn turn(
 /// stopped.
 struct Pump {
     rx: std::sync::mpsc::Receiver<anyhow::Result<Value>>,
+    /// The last completed stream's prompt tokens, written by the worker (0 = it reported none).
+    ///
+    /// An atomic and not a lock: the budget reads exactly one integer, and a `Mutex` here would
+    /// buy a poison path for the privilege. Shared rather than messaged because the worker owns
+    /// `Live` and the turn reads this AFTER the worker's round is over — a value handed over once
+    /// at the end would have to be threaded through every envelope the turn already ignores.
+    prompt: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Pump {
@@ -1458,7 +1604,12 @@ impl Pump {
         let key_env = turn.recipe.key_env.clone();
         let messages = json!(messages);
         let tools = gravity_booth::tools::tools_array();
+        // Asked for only when there is a window to compare it against: a deployment that declares
+        // none gains nothing from `stream_options`, and asks no server to parse it.
+        let want_usage = turn.recipe.window.is_some();
         let (tx, rx) = std::sync::mpsc::channel();
+        let prompt: std::sync::Arc<std::sync::atomic::AtomicU64> = Default::default();
+        let seen = prompt.clone();
         std::thread::spawn(move || {
             let opened = gravity_core::llm::live::Live::open(&gravity_core::llm::live::Request {
                 endpoint: &endpoint,
@@ -1466,6 +1617,7 @@ impl Pump {
                 key_env: &key_env,
                 messages: &messages,
                 tools: Some(&tools),
+                want_usage,
             });
             let mut live = match opened {
                 Ok(live) => live,
@@ -1476,6 +1628,12 @@ impl Pump {
             };
             loop {
                 let out = live.pull();
+                // Copied out on every pull, not on the terminal one: the turn may stop reading
+                // before `done` (a tool round whose calls it already dispatched), and the usage
+                // chunk arrives before that envelope anyway.
+                if let Some(tokens) = prompt_tokens(live.usage()) {
+                    seen.store(tokens, std::sync::atomic::Ordering::Relaxed);
+                }
                 // An error ends the stream: the next pull would answer the same thing.
                 let fatal = out.is_err();
                 if tx.send(out).is_err() || fatal {
@@ -1483,7 +1641,16 @@ impl Pump {
                 }
             }
         });
-        Self { rx }
+        Self { rx, prompt }
+    }
+
+    /// The last completed stream's prompt tokens, if the endpoint reported them. One relaxed load:
+    /// the worker only stores, and the turn only reads after that round is over.
+    fn prompt_tokens(&self) -> Option<u64> {
+        match self.prompt.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            tokens => Some(tokens),
+        }
     }
 
     /// One envelope. `Ok(None)` = this turn was stopped while waiting, which the caller
@@ -2960,6 +3127,8 @@ fn open_branch(
             key_env: &key_env,
             messages: &messages,
             tools: None,
+            // The branch is a summarizer: its own cost is not the turn's budget input.
+            want_usage: false,
         });
         let mut live = match opened {
             Ok(live) => live,
@@ -4285,5 +4454,61 @@ mod tests {
             "a tuple that is not 8 slots is not a fact the door can take"
         );
         assert_eq!(read_review_facts(r#"{"facts": [null]}"#), None);
+    }
+
+    #[test]
+    fn the_budget_is_three_citable_boundaries() {
+        let window = Some(1_000_000);
+        // Below the tier line: nothing.
+        assert_eq!(budget_of(Some(0), window), Budget::Free);
+        assert_eq!(budget_of(Some(499_999), window), Budget::Free);
+        // 512k of a 1M window is where a tiered endpoint starts charging the higher band, so the
+        // line is INCLUSIVE: at it, the transcript collapses.
+        assert_eq!(budget_of(Some(500_000), window), Budget::Compact);
+        assert_eq!(budget_of(Some(799_999), window), Budget::Compact);
+        assert_eq!(budget_of(Some(800_000), window), Budget::Trim);
+        assert_eq!(budget_of(Some(950_000), window), Budget::Ceiling);
+        // Past the top is still the top — not a fourth state.
+        assert_eq!(budget_of(Some(5_000_000), window), Budget::Ceiling);
+    }
+
+    #[test]
+    fn no_window_or_no_usage_means_no_sensing() {
+        // A deployment that declares no window behaves exactly as it did before the field
+        // existed; so does one whose endpoint reports nothing.
+        assert_eq!(budget_of(Some(4_000_000), None), Budget::Free);
+        assert_eq!(budget_of(None, Some(1_000_000)), Budget::Free);
+        assert_eq!(budget_of(None, None), Budget::Free);
+        // A window of zero would divide by zero: it is a deployment mistake, not a ceiling.
+        assert_eq!(budget_of(Some(10), Some(0)), Budget::Free);
+    }
+
+    #[test]
+    fn trimming_history_keeps_the_tail_and_says_what_it_dropped() {
+        let mut messages: Vec<Value> = vec![json!({ "role": "system", "content": "head" })];
+        let start = messages.len();
+        for n in 0..20 {
+            messages.push(json!({ "role": "user", "content": format!("row {n}") }));
+        }
+        let end = messages.len();
+        let new_end = trim_history(&mut messages, start, end);
+        // head + one marker + the last HISTORY_KEEP rows.
+        assert_eq!(messages.len(), 1 + 1 + HISTORY_KEEP);
+        assert_eq!(new_end, messages.len());
+        assert_eq!(messages[1]["content"], "12 earlier row(s) of this conversation are not carried here; the store has them.");
+        assert_eq!(messages.last().unwrap()["content"], "row 19");
+        // Idempotent: a second pass at the new bounds drops nothing more.
+        assert_eq!(trim_history(&mut messages, start, new_end), new_end);
+        assert_eq!(messages.len(), 1 + 1 + HISTORY_KEEP);
+    }
+
+    #[test]
+    fn trimming_a_short_history_is_a_no_op() {
+        let mut messages: Vec<Value> = (0..HISTORY_KEEP + 1)
+            .map(|n| json!({ "role": "user", "content": format!("row {n}") }))
+            .collect();
+        let end = messages.len();
+        assert_eq!(trim_history(&mut messages, 0, end), end);
+        assert_eq!(messages.len(), end);
     }
 }

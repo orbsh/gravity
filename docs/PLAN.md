@@ -59,6 +59,8 @@ Design lives in the wiki (`stateless-agent-architecture.md`, `krystallizer.md`) 
 - [x] `run` for a script that belongs to no skill — 2026-11-09
 - [x] The CLI's credential for an unattended caller is a TOKEN (`venue.token_env`) — 2026-11-21, ADR-0002: the venue mints one from the account's password (`POST /admin/tokens`, login over HTTP) and the client presents it on the dial with no login frame, so a loop logs in nowhere. A config names `token_env` or `username` + `password_env`; neither is refused at first sight, and a token the venue does not know is an auth failure (exit 3), not a turn run as nobody
 
+- [x] The transcript has a BUDGET — 2026-11-25, ADR-0017: `models` gains one cold field `context_window` (a window is a property of the model, not of the deployment), the request asks for usage only when a window is declared, and the decoder hands the number to the done envelope. Three lines, each with a reason: `0.5` (the tier line — collapse finished tool rounds at the price boundary, not near the top), `0.8` (trim the oldest history rows to the last 8; the store has them), `0.95` (do not send the round: file the row, close the turn, fail with that text). It is ONE ROUND LATE by construction — usage describes the request that just ended — and that is stated in the ADR rather than estimated around. No tokenizer, no persistence (a `usage` row needs a machine kind, which is k10r's decision); the reading is one stderr line per evaluation. Verified end to end: the smoke's stub now reports usage, and the CLI's turns print `[gravity] context 2929/1048576 (0%) · Free` → `3190/…` as the transcript grows
+
 ## Deferred
 
 - A FaaS driver — after the booth path is stable; another driver of the same function, not new code

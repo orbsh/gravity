@@ -204,6 +204,29 @@ class Handler(BaseHTTPRequestHandler):
         def event(delta: dict) -> None:
             chunk(b"data: " + json.dumps({"choices": [{"index": 0, "delta": delta}]}).encode() + b"\n\n")
 
+        def finish() -> None:
+            # THE USAGE CHUNK, as an OpenAI-compatible server sends it when the request carries
+            # `stream_options.include_usage`: empty `choices`, the cost beside them. The prompt
+            # count is derived from the request that just arrived (4 bytes a token, the usual
+            # rough ratio), so it GROWS with the transcript — which is the thing the turn's
+            # budget gate reads. A fixed number would prove the plumbing and nothing else.
+            prompt = max(1, len(body) // 4)
+            chunk(
+                b"data: "
+                + json.dumps(
+                    {
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": prompt,
+                            "completion_tokens": sum(len(piece) for piece in CHUNKS),
+                        },
+                    }
+                ).encode()
+                + b"\n\n"
+            )
+            chunk(b"data: [DONE]\n\n")
+            chunk(b"")
+
         if round_index == 0:
             # A real model with the list in front of it asks for a capability
             # first: resolve_skills, the group that lists what this deployment
@@ -299,8 +322,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             for piece in CHUNKS:
                 event({"content": piece})
-            chunk(b"data: [DONE]\n\n")
-            chunk(b"")
+            finish()
             return
         elif round_index == 1:
             # The resolver's answer must have come BACK as the tool message of
@@ -323,8 +345,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             for piece in CHUNKS:
                 event({"content": piece})
-        chunk(b"data: [DONE]\n\n")
-        chunk(b"")
+        finish()
 
     def log_message(self, *args):
         pass
@@ -485,6 +506,10 @@ ROWS = [
             "endpoint": f"{SSE}/v1",
             "model": "smoke-model",
             "key_env": "SMOKE_KEY",
+            # A window, so the turn ASKS for usage and reads it (the stub reports 4 bytes a token
+            # against a transcript that grows). 1M against this transcript is `Free` all the way:
+            # the smoke proves the wiring, not the threshold.
+            "context_window": "1048576",
             "weight": 1,
             "enabled": 1,
         },
