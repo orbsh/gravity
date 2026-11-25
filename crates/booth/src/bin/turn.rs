@@ -1383,7 +1383,7 @@ fn turn(
                 let mut keep = vec![question];
                 keep.extend(call_rows.iter().copied());
                 keep.push(row);
-                log.close(&keep)?;
+                log.close(&keep, "")?;
                 anyhow::bail!("turn: {note}");
             }
         }
@@ -1455,7 +1455,25 @@ fn turn(
     let mut keep = vec![question];
     keep.extend(call_rows);
     keep.push(answer);
-    log.close(&keep)?;
+    // THE POST-VERIFICATION: the keep set is this turn's CLAIM about what it wrote, and it is
+    // checked against the channel before the books close — one read, no tokens. A missing row does
+    // NOT fail the turn (the answer already went out; failing now would tell the caller nothing
+    // true), it marks the turn's closing record as unverified instead, which is the difference
+    // between "it failed" and "it cannot be trusted".
+    let missing = log.verify(&keep)?;
+    let note = if missing.is_empty() {
+        String::new()
+    } else {
+        let named: Vec<String> = missing.iter().map(|(ts, sub)| format!("{ts}:{sub}")).collect();
+        let note = format!(
+            "unverified: {} row(s) in this turn's keep set are not in the channel ({})",
+            missing.len(),
+            named.join(", ")
+        );
+        eprintln!("[gravity] {note}");
+        note
+    };
+    log.close(&keep, &note)?;
     // The field on the left shows what the turn just did: the turn as a node, everything it
     // wrote hanging off it. A whole SNAPSHOT, because that is how a forcegraph is fed
     // (fluxen ADR 0018) — it diffs by node id, so resending is idempotent.
@@ -1561,6 +1579,31 @@ fn trim_history(messages: &mut Vec<Value>, start: usize, end: usize) -> usize {
     });
     messages.splice(start..(end - HISTORY_KEEP), std::iter::once(marker));
     start + 1 + HISTORY_KEEP
+}
+
+/// The rows a closing set CLAIMS, minus the ones the channel actually has.
+///
+/// The keep set is a claim about the world ("these rows are this turn"), and until now nothing
+/// checked it: the close was accepted on the turn's word. A row named there and absent from the
+/// channel is the cheapest possible symptom of work done on a stale premise — and finding it costs
+/// one read, no tokens.
+///
+/// A row missing from the answer is MISSING, not malformed: `/channels/{id}/messages` is k10r's
+/// history, so a row the turn wrote is in it unless the store lost it.
+fn missing_rows(rows: &[Value], keep: &[(u64, u16)]) -> Vec<(u64, u16)> {
+    let present: std::collections::BTreeSet<(u64, u16)> = rows
+        .iter()
+        .filter_map(|row| {
+            let key = row.get("key")?;
+            let ts_ms = key.get("ts_ms")?.as_u64()?;
+            let sub = key.get("sub")?.as_u64()? as u16;
+            Some((ts_ms, sub))
+        })
+        .collect();
+    keep.iter()
+        .copied()
+        .filter(|key| !present.contains(key))
+        .collect()
 }
 
 /// The provider stream, off this thread (ADR-0047 stage two, for a blocking client).
@@ -3651,7 +3694,20 @@ impl<'a> TurnLog<'a> {
     /// Close the turn: the closing record plus the records to keep. The list is
     /// what the caller asked to survive — the question, one row per successful
     /// call, the answer — and k10r purges the rest of the turn in the same write.
-    fn close(&self, keep: &[(u64, u16)]) -> anyhow::Result<()> {
+    /// Ask the channel which of the rows the closing set names are actually there. Called BEFORE
+    /// `close`, because closing is what makes the claim final — and because an OPEN row is visible
+    /// to this read (`history` is the channel, not its projection).
+    fn verify(&self, keep: &[(u64, u16)]) -> anyhow::Result<Vec<(u64, u16)>> {
+        let url = format!("{}/channels/{}/messages", self.store_url, self.channel);
+        let resp = ureq::get(&url)
+            .call()
+            .context("turn: the channel could not be read back")?;
+        let rows: Vec<Value> = serde_json::from_reader(resp.into_reader())
+            .context("turn: bad channel history")?;
+        Ok(missing_rows(&rows, keep))
+    }
+
+    fn close(&self, keep: &[(u64, u16)], note: &str) -> anyhow::Result<()> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
@@ -3677,7 +3733,9 @@ impl<'a> TurnLog<'a> {
                     "ts_ms": ts,
                     "sub": sub,
                     "role": Role::Assistant.code(),
-                    "content": "",
+                    // Where an unverified close says so: the record carries the turn's own
+                    // verdict on its claim, and "" is the ordinary case (nothing to report).
+                    "content": note,
                     "keep": keep
                         .iter()
                         .map(|(ts_ms, sub)| json!({ "ts_ms": ts_ms, "sub": sub }))
@@ -3814,11 +3872,36 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let mut buf = vec![0u8; 8192];
-                let n = stream.read(&mut buf).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                if let Some(body) = request.split("\r\n\r\n").nth(1) {
-                    record.lock().unwrap().push(body.to_string());
+                // Read to the END of the declared body, not to the end of one read: the header and
+                // the body can arrive in two packets, and a single `read` then hands this test an
+                // empty body and fails an assertion about the product — a race in the harness, not
+                // in the code it is testing (it flaked about one run in three before this loop).
+                let mut raw: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 8192];
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    let Some(end) = raw
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|at| at + 4)
+                    else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&raw[..end]).to_lowercase();
+                    let want = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if raw.len() - end >= want {
+                        let body = String::from_utf8_lossy(&raw[end..end + want]).to_string();
+                        record.lock().unwrap().push(body);
+                        break;
+                    }
                 }
                 let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n");
             }
@@ -4510,5 +4593,28 @@ mod tests {
         let end = messages.len();
         assert_eq!(trim_history(&mut messages, 0, end), end);
         assert_eq!(messages.len(), end);
+    }
+
+    #[test]
+    fn a_claim_is_checked_against_the_channel() {
+        // k10r's `/channels/{id}/messages` shape: `{key: {ts_ms, sub}, …}`. Sub is an integer on
+        // the wire and a u16 in the key; the comparison is on the pair.
+        let rows = vec![
+            json!({ "key": { "channel_id": 7, "turn_id": 1, "ts_ms": 100, "sub": 0 } }),
+            json!({ "key": { "channel_id": 7, "turn_id": 1, "ts_ms": 100, "sub": 1 } }),
+            json!({ "key": { "channel_id": 7, "turn_id": 1, "ts_ms": 250, "sub": 0 } }),
+        ];
+        // Every claimed row is there: nothing to report, and the turn closes as it always did.
+        assert!(missing_rows(&rows, &[(100, 0), (100, 1), (250, 0)]).is_empty());
+        // A row the turn believes it wrote and the channel never got: named, in order, and the
+        // turn is still allowed to close.
+        assert_eq!(missing_rows(&rows, &[(100, 0), (900, 3)]), vec![(900, 3)]);
+        // The SAME timestamp with the wrong sub is a different row, not a match on the prefix.
+        assert_eq!(missing_rows(&rows, &[(250, 1)]), vec![(250, 1)]);
+        // Rows the channel has and the claim does not name are not this function's business.
+        assert!(missing_rows(&rows, &[]).is_empty());
+        // A body that is not a key at all cannot be counted as evidence FOR the claim.
+        let noise = vec![json!({ "content": "x" }), json!({ "key": { "ts_ms": "? " } })];
+        assert_eq!(missing_rows(&noise, &[(1, 0)]), vec![(1, 0)]);
     }
 }
