@@ -1,4 +1,6 @@
-# The guest image: `gravity-turn` and `gravity-provider` plus the `gravity` CLI.
+# The guest image: `gravity-turn` plus the `gravity` CLI.
+# (`gravity-provider` is gone: gravity 4d61f2c made the provider a stream on a thread inside
+# the turn, so a second guest binary would be a second lifetime nobody needs.)
 #
 # gravity has no daemon — one turn is one process, and prism spawns it (ADR-0002
 # for the client, ADR-0004 for the tool list). So this image is not "the gravity
@@ -14,11 +16,14 @@ COPY aura/ aura/
 COPY effector/ effector/
 COPY induction/ induction/
 COPY krystallizer/ krystallizer/
+# a PATH dependency of gravity's booth: the manifest resolves it before any build step
+COPY schematic/ schematic/
 COPY gravity/ gravity/
 
-# The two guests are separate binaries by design: one speaks the turn protocol on
-# stdio and one speaks the model endpoint's SSE. A single process would have to hold
-# both lifetimes, and a stalled inference would then stall the turn's own pipes.
+# One guest binary: `gravity-turn` speaks the turn protocol on stdio and opens the model
+# endpoint itself. The provider used to be a second process so a stalled inference could not
+# stall the turn's pipes; it is a thread inside the turn now, which is why only one binary is
+# copied here.
 # Copied out of `target/` in the same step: a build harness may mount that directory
 # as an incremental cache (memory-stack/build.sh does) and a mounted directory is not
 # part of the stage's filesystem, so `COPY --from` would come up empty.
@@ -26,8 +31,7 @@ RUN cargo build --release --locked \
       --manifest-path gravity/Cargo.toml \
       -p gravity-booth --bins -p gravity-cli \
  && mkdir -p /out \
- && cp gravity/target/release/gravity-turn gravity/target/release/gravity-provider \
-       gravity/target/release/gravity /out/
+ && cp gravity/target/release/gravity-turn gravity/target/release/gravity /out/
 
 FROM debian:bookworm-slim
 
@@ -39,7 +43,6 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/gravity-turn /usr/local/bin/gravity-turn
-COPY --from=build /out/gravity-provider /usr/local/bin/gravity-provider
 COPY --from=build /out/gravity /usr/local/bin/gravity
 
 # /usr/local/bin, not /bin: the guests are looked up by name through PATH
