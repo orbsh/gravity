@@ -816,7 +816,7 @@ fn create_skill(
             Value::String(text) => text.clone(),
             other => other.to_string(),
         };
-        let plan = schedule_plan(&text).map_err(|e| e.replace("start:", "create_skill:"))?;
+        let plan = schedule_plan(&text, "create_skill")?;
         let problems = schematic::validate(&plan);
         if !problems.is_empty() {
             return Ok(json!({
@@ -1189,7 +1189,7 @@ fn start(
         .get("steps")
         .and_then(Value::as_str)
         .ok_or("start: the skill answered no `steps`")?;
-    let plan = schedule_plan(text)?;
+    let plan = schedule_plan(text, "start")?;
 
     let problems = schematic::validate(&plan);
     if !problems.is_empty() {
@@ -1313,7 +1313,7 @@ fn advance_run(
         .get("steps")
         .and_then(Value::as_str)
         .ok_or("advance: the skill answered no `steps`")?;
-    let plan = schedule_plan(text)?;
+    let plan = schedule_plan(text, "advance")?;
     let hash = plan_hash(text);
 
     let url = format!("{store_url}/runs/{scope}/{run_id}");
@@ -1407,16 +1407,13 @@ fn advance_run(
 /// ORDERED ARRAY of steps, and saying so is better than guessing at one: the two
 /// shapes mean different things (an array says "next", a plan says "when the
 /// inputs resolve"), so the refusal names the migration instead of performing it.
-fn schedule_plan(text: &str) -> Result<schematic::Plan, String> {
-    if text.trim_start().starts_with('[') {
-        return Err(
-            "start: this skill's `steps` is the old ordered list, not a plan. Re-declare it as \
-             a graph (schematic's plan form: steps + control edges) — an array says \"next\" and \
-             a plan says \"when its inputs resolve\", and only the second can be a run."
-                .to_string(),
-        );
-    }
-    schematic::plan_from_json(text).map_err(|e| format!("start: the skill's `steps` is not a plan: {e}"))
+///
+/// The refusal is the KERNEL's (`schematic::plan_from_declaration`): the shape is
+/// the model's, so the sentence lives where the model is defined and every host
+/// refuses it with the same words. What belongs to this door is the name in front
+/// — the kernel is handed text and cannot know which door read it.
+fn schedule_plan(text: &str, door: &str) -> Result<schematic::Plan, String> {
+    schematic::plan_from_declaration(text).map_err(|err| format!("{door}: {err}"))
 }
 
 /// What a code row needs before a node is asked to run it: the mount that serves
